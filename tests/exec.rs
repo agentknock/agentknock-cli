@@ -6,12 +6,17 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FilePath, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::{StatusCode, header::RETRY_AFTER},
+    response::{IntoResponse, Response as AxumResponse},
     routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -57,6 +62,13 @@ struct TestState {
     messages: ReceivedMessages,
     route_private_key: <Kem as KemTrait>::PrivateKey,
     response: Value,
+}
+
+#[derive(Clone)]
+struct RetryTestState {
+    route_private_key: <Kem as KemTrait>::PrivateKey,
+    request_attempts: Arc<AtomicUsize>,
+    completion_attempts: Arc<AtomicUsize>,
 }
 
 struct TestHome {
@@ -136,6 +148,45 @@ async fn receive_message(
     });
 
     Json(response)
+}
+
+async fn receive_message_with_retries(
+    State(state): State<RetryTestState>,
+    Path((_, request_id, part)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> AxumResponse {
+    match part.as_str() {
+        "request" => match state.request_attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => (StatusCode::SERVICE_UNAVAILABLE, [(RETRY_AFTER, "0")]).into_response(),
+            1 => Json(json!({"state": "REQUEST_PENDING"})).into_response(),
+            2 => Json(json!({"state": "REQUEST_DELIVERED"})).into_response(),
+            3 => Json(json!({
+                "state": "RESPONSE_PENDING",
+                "response": encrypt_response(
+                    &state.route_private_key,
+                    &request_id,
+                    &body,
+                    &json!({
+                        "result": "APPROVED",
+                        "environment": {"AGENTKNOCK_RETRY_TEST": "retried"},
+                    }),
+                ),
+            }))
+            .into_response(),
+            attempt => panic!("unexpected request attempt {attempt}"),
+        },
+        "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
+            1 => Json(json!({"state": "COMPLETION_PENDING"})).into_response(),
+            attempt => panic!("unexpected completion attempt {attempt}"),
+        },
+        part => panic!("unexpected message part: {part}"),
+    }
+}
+
+async fn reject_request(State(attempts): State<Arc<AtomicUsize>>) -> StatusCode {
+    attempts.fetch_add(1, Ordering::SeqCst);
+    StatusCode::BAD_REQUEST
 }
 
 fn encrypt_response(
@@ -379,6 +430,133 @@ async fn copies_denial_to_completion_without_running_command() {
             "message": "profile is not allowed for this command",
         })
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_pending_states_and_server_errors() {
+    let home = TestHome::new(0o600);
+    let request_attempts = Arc::new(AtomicUsize::new(0));
+    let completion_attempts = Arc::new(AtomicUsize::new(0));
+    let state = RetryTestState {
+        route_private_key: home.route_private_key.clone(),
+        request_attempts: request_attempts.clone(),
+        completion_attempts: completion_attempts.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(receive_message_with_retries),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args([
+            "--exec",
+            "gh-token",
+            "--",
+            "sh",
+            "-c",
+            "test \"$AGENTKNOCK_RETRY_TEST\" = retried",
+        ])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(request_attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(completion_attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_not_retry_client_errors() {
+    let home = TestHome::new(0o600);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/request",
+            post(reject_request),
+        )
+        .with_state(attempts.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(!output.status.success());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("400 Bad Request")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_network_errors() {
+    let home = TestHome::new(0o600);
+    let messages = ReceivedMessages::default();
+    let state = TestState {
+        messages: messages.clone(),
+        route_private_key: home.route_private_key.clone(),
+        response: json!({
+            "result": "APPROVED",
+            "environment": {},
+        }),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(receive_message),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        drop(connection);
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(messages.lock().unwrap().len(), 2);
 }
 
 #[test]

@@ -41,6 +41,9 @@ pub enum RequestError {
     #[error("relay request failed: {0}")]
     Relay(#[from] reqwest::Error),
 
+    #[error("relay returned unexpected HTTP status {0}")]
+    UnexpectedRelayStatus(u16),
+
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
@@ -65,6 +68,12 @@ pub enum ProtocolError {
         state: &'static str,
     },
 
+    #[error("relay returned {state} for {operation}")]
+    UnexpectedMessageState {
+        operation: &'static str,
+        state: &'static str,
+    },
+
     #[error("invalid base64 in encrypted response: {0}")]
     Base64(#[from] base64::DecodeError),
 
@@ -77,8 +86,8 @@ pub enum ProtocolError {
     #[error("response decryption failed")]
     Decryption(#[from] chacha20poly1305::aead::Error),
 
-    #[error("relay response did not contain a result")]
-    MissingResult,
+    #[error("relay response state did not include a response message")]
+    MissingResponse,
 
     #[error("approved response did not contain an environment mapping")]
     MissingEnvironment,
@@ -136,10 +145,7 @@ async fn message_exchange(
         .map_err(ProtocolError::from)?;
     let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
 
-    let response = relay
-        .request(&request)
-        .await?
-        .ok_or(ProtocolError::MissingResult)?;
+    let response = relay.request(&request).await?;
     let plaintext = session
         .open_response(response)
         .map_err(ProtocolError::from)?;
@@ -201,6 +207,12 @@ impl From<rest::Error> for RequestError {
     fn from(error: rest::Error) -> Self {
         match error {
             rest::Error::Relay(error) => Self::Relay(error),
+            rest::Error::InvalidJson(error) => Self::Protocol(ProtocolError::Json(error)),
+            rest::Error::UnexpectedStatus(status) => Self::UnexpectedRelayStatus(status),
+            rest::Error::UnexpectedState { operation, state } => {
+                Self::Protocol(ProtocolError::UnexpectedMessageState { operation, state })
+            }
+            rest::Error::MissingResponse => Self::Protocol(ProtocolError::MissingResponse),
             rest::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,
         }
     }

@@ -23,6 +23,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "hpke",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
