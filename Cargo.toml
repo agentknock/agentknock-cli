@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4.6.6", features = ["derive"] }
 hpke = { version = "0.14.0", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 reqwest = { version = "0.13.4", features = ["json"] }

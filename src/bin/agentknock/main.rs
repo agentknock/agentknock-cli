@@ -1,15 +1,22 @@
-use std::{env, error::Error, io, process::Command as ProcessCommand};
+use std::{
+    env,
+    error::Error,
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ulid::Ulid;
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
 const RELAY_URL: &str = "https://relay.agentknock.dev/";
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
-const ROUTE_ID: &str = "placeholder-route";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -89,6 +96,16 @@ impl Cli {
     }
 }
 
+#[derive(Deserialize)]
+struct Pairing {
+    route_id: String,
+    pairing_id: String,
+    #[serde(deserialize_with = "deserialize_base64")]
+    pairing_psk: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_base64")]
+    route_key: Vec<u8>,
+}
+
 #[derive(Deserialize, Serialize)]
 struct EmptyMessage {}
 
@@ -96,13 +113,61 @@ struct EmptyMessage {}
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().into_operation() {
         Operation::Exec { names: _, command } => {
-            message_exchange(&relay_url()?).await?;
+            let pairing = read_pairing()?;
+            message_exchange(&relay_url()?, &pairing.route_id).await?;
             exec(command)?;
         }
         Operation::StartPairing(_) | Operation::FinishPairing => {}
     }
 
     Ok(())
+}
+
+fn read_pairing() -> Result<Pairing, Box<dyn Error>> {
+    let home = env::var_os("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    read_pairing_from(&PathBuf::from(home).join(".agentknock/pairing.json"))
+}
+
+fn read_pairing_from(path: &Path) -> Result<Pairing, Box<dyn Error>> {
+    let file = File::open(path)?;
+
+    #[cfg(unix)]
+    {
+        let mode = file.metadata()?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} must have mode 0600, found {mode:04o}", path.display()),
+            )
+            .into());
+        }
+    }
+
+    let pairing: Pairing = serde_json::from_reader(file)?;
+    if pairing.route_id.is_empty()
+        || pairing.pairing_id.is_empty()
+        || pairing.pairing_psk.is_empty()
+        || pairing.route_key.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} contains an empty field", path.display()),
+        )
+        .into());
+    }
+
+    Ok(pairing)
+}
+
+fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(serde::de::Error::custom)
 }
 
 fn relay_url() -> Result<String, env::VarError> {
@@ -112,10 +177,10 @@ fn relay_url() -> Result<String, env::VarError> {
     }
 }
 
-async fn message_exchange(relay_url: &str) -> Result<(), reqwest::Error> {
+async fn message_exchange(relay_url: &str, route_id: &str) -> Result<(), reqwest::Error> {
     let client = reqwest::Client::new();
     let message_url = format!(
-        "{}/v1/route/{ROUTE_ID}/msg/{}",
+        "{}/v1/route/{route_id}/msg/{}",
         relay_url.trim_end_matches('/'),
         Ulid::generate()
     );
