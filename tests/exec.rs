@@ -365,7 +365,7 @@ async fn copies_denial_to_completion_without_running_command() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("request denied (PolicyDenied): profile is not allowed for this command")
+            .contains("request denied (POLICY_DENIED): profile is not allowed for this command")
     );
 
     let messages = messages.lock().unwrap();
