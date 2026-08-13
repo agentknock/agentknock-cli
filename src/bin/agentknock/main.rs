@@ -1,4 +1,7 @@
+use std::error::Error;
+
 use clap::{Args, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -15,8 +18,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
+    /// Send a JSON message to an HTTP endpoint.
+    Post(PostArgs),
+
     /// Run a command with credentials supplied by AgentKnock.
     Run(RunArgs),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+struct PostArgs {
+    /// HTTP endpoint that receives the message.
+    url: String,
+
+    /// Message to send.
+    message: String,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -26,8 +41,39 @@ struct RunArgs {
     command: Vec<String>,
 }
 
-fn main() {
-    let _cli = Cli::parse();
+#[derive(Serialize)]
+struct PostRequest<'a> {
+    message: &'a str,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PostResponse {
+    echoed_message: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    match Cli::parse().command {
+        Command::Post(args) => post(args).await,
+        Command::Run(_) => Ok(()),
+    }
+}
+
+async fn post(args: PostArgs) -> Result<(), Box<dyn Error>> {
+    let response = reqwest::Client::new()
+        .post(args.url)
+        .json(&PostRequest {
+            message: &args.message,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<PostResponse>()
+        .await?;
+
+    println!("{}", serde_json::to_string(&response)?);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -35,6 +81,18 @@ mod tests {
     use clap::{Parser, error::ErrorKind};
 
     use super::{Cli, Command};
+
+    #[test]
+    fn parses_post_command() {
+        let cli = Cli::try_parse_from(["agentknock", "post", "http://127.0.0.1/message", "hello"])
+            .unwrap();
+
+        let Command::Post(post) = cli.command else {
+            panic!("expected post command");
+        };
+        assert_eq!(post.url, "http://127.0.0.1/message");
+        assert_eq!(post.message, "hello");
+    }
 
     #[test]
     fn parses_command_and_arguments_after_delimiter() {
@@ -48,7 +106,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Run(run) = cli.command;
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
         assert_eq!(
             run.command,
             ["sh", "-c", "printf '%s' \"$TOKEN\""]
