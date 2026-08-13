@@ -43,7 +43,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     let messages = ReceivedMessages::default();
     let app = Router::new()
         .route(
-            "/route/{route_id}/msg/{request_id}/{part}",
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
             post(receive_message),
         )
         .with_state(messages.clone());

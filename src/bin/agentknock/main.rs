@@ -115,7 +115,7 @@ fn relay_url() -> Result<String, env::VarError> {
 async fn message_exchange(relay_url: &str) -> Result<(), reqwest::Error> {
     let client = reqwest::Client::new();
     let message_url = format!(
-        "{}/route/{ROUTE_ID}/msg/{}",
+        "{}/v1/route/{ROUTE_ID}/msg/{}",
         relay_url.trim_end_matches('/'),
         Ulid::generate()
     );
