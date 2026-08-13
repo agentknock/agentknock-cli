@@ -89,8 +89,6 @@ impl Session {
         self.state = SessionState::CompletionSealed;
 
         Ok(Completion {
-            pairing_id: self.pairing_id.clone(),
-            key: BASE64_STANDARD.encode(&self.encapped_key),
             ciphertext: BASE64_STANDARD.encode(ciphertext),
         })
     }
@@ -140,8 +138,6 @@ pub(crate) struct Response {
 
 #[derive(Serialize)]
 pub(crate) struct Completion {
-    pairing_id: String,
-    key: String,
     ciphertext: String,
 }
 

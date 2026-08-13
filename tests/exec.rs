@@ -315,10 +315,10 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     assert_eq!(messages[1].part, "complete");
     assert_eq!(messages[1].body["request"], *request);
     let completion = &messages[1].body["completion"];
-    assert_eq!(completion.as_object().unwrap().len(), 3);
+    assert_eq!(completion.as_object().unwrap().len(), 1);
     assert!(completion.get("version").is_none());
-    assert_eq!(completion["pairing_id"], PAIRING_ID);
-    assert_eq!(completion["key"], request["key"]);
+    assert!(completion.get("pairing_id").is_none());
+    assert!(completion.get("key").is_none());
     assert_eq!(messages[0].request_id, messages[1].request_id);
 
     let (request_plaintext, completion_plaintext) =
