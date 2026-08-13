@@ -10,6 +10,7 @@ reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+ulid = "3.0.0"
 
 [dev-dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }

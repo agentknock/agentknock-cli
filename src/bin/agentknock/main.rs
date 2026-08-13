@@ -1,10 +1,15 @@
-use std::{error::Error, io, process::Command as ProcessCommand};
+use std::{env, error::Error, io, process::Command as ProcessCommand};
 
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+const RELAY_URL: &str = "https://relay.agentknock.dev/";
+const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
+const ROUTE_ID: &str = "placeholder-route";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -16,7 +21,7 @@ use std::os::unix::process::CommandExt;
         ArgGroup::new("command")
             .required(true)
             .multiple(false)
-            .args(["exec", "post", "start_pairing", "finish_pairing"])
+            .args(["exec", "start_pairing", "finish_pairing"])
     )
 )]
 struct Cli {
@@ -43,15 +48,6 @@ struct Cli {
     #[arg(long)]
     finish_pairing: bool,
 
-    /// Send a JSON message to an HTTP endpoint.
-    #[arg(
-        long,
-        action = ArgAction::Set,
-        num_args = 2,
-        value_names = ["URL", "MESSAGE"]
-    )]
-    post: Option<Vec<String>>,
-
     /// Command and arguments to run.
     #[arg(
         last = true,
@@ -63,36 +59,82 @@ struct Cli {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct PostArgs {
-    url: String,
-    message: String,
+enum Operation {
+    Exec {
+        names: Vec<String>,
+        command: Vec<String>,
+    },
+    StartPairing(String),
+    FinishPairing,
 }
 
-#[derive(Serialize)]
-struct PostRequest<'a> {
-    message: &'a str,
+impl Cli {
+    fn into_operation(self) -> Operation {
+        if let Some(names) = self.exec {
+            return Operation::Exec {
+                names,
+                command: self.command_to_run,
+            };
+        }
+
+        if let Some(address_name) = self.start_pairing {
+            return Operation::StartPairing(address_name);
+        }
+
+        if self.finish_pairing {
+            return Operation::FinishPairing;
+        }
+
+        unreachable!("clap requires exactly one operation")
+    }
 }
 
 #[derive(Deserialize, Serialize)]
-struct PostResponse {
-    echoed_message: String,
-}
+struct EmptyMessage {}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
-
-    match (cli.exec, cli.post, cli.start_pairing, cli.finish_pairing) {
-        (Some(_), None, None, false) => exec(cli.command_to_run)?,
-        (None, Some(post_args), None, false) => {
-            let [url, message] = post_args
-                .try_into()
-                .expect("clap requires exactly two arguments for --post");
-            post(PostArgs { url, message }).await?;
+    match Cli::parse().into_operation() {
+        Operation::Exec { names: _, command } => {
+            message_exchange(&relay_url()?).await?;
+            exec(command)?;
         }
-        (None, None, Some(_), false) | (None, None, None, true) => {}
-        _ => unreachable!("clap requires exactly one command"),
+        Operation::StartPairing(_) | Operation::FinishPairing => {}
     }
+
+    Ok(())
+}
+
+fn relay_url() -> Result<String, env::VarError> {
+    match env::var(TEST_RELAY_URL_ENV) {
+        Err(env::VarError::NotPresent) => Ok(RELAY_URL.to_owned()),
+        relay_url => relay_url,
+    }
+}
+
+async fn message_exchange(relay_url: &str) -> Result<(), reqwest::Error> {
+    let client = reqwest::Client::new();
+    let message_url = format!(
+        "{}/route/{ROUTE_ID}/msg/{}",
+        relay_url.trim_end_matches('/'),
+        Ulid::generate()
+    );
+
+    post_empty_message(&client, &format!("{message_url}/request")).await?;
+    post_empty_message(&client, &format!("{message_url}/complete")).await?;
+
+    Ok(())
+}
+
+async fn post_empty_message(client: &reqwest::Client, url: &str) -> Result<(), reqwest::Error> {
+    client
+        .post(url)
+        .json(&EmptyMessage {})
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<EmptyMessage>()
+        .await?;
 
     Ok(())
 }
@@ -111,40 +153,11 @@ fn exec(_command: Vec<String>) -> io::Result<()> {
     ))
 }
 
-async fn post(args: PostArgs) -> Result<(), Box<dyn Error>> {
-    let response = reqwest::Client::new()
-        .post(args.url)
-        .json(&PostRequest {
-            message: &args.message,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<PostResponse>()
-        .await?;
-
-    println!("{}", serde_json::to_string(&response)?);
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::Cli;
-
-    #[test]
-    fn parses_post_command() {
-        let cli =
-            Cli::try_parse_from(["agentknock", "--post", "http://127.0.0.1/message", "hello"])
-                .unwrap();
-
-        assert_eq!(
-            cli.post,
-            Some(vec!["http://127.0.0.1/message".into(), "hello".into()])
-        );
-    }
+    use super::{Cli, Operation};
 
     #[test]
     fn parses_exec_command() {
@@ -160,14 +173,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cli.exec,
-            Some(vec!["gh-token".into(), "cf-wrangler".into()])
-        );
-        assert_eq!(
-            cli.command_to_run,
-            ["sh", "-c", "printf '%s' \"$TOKEN\""]
-                .map(String::from)
-                .to_vec()
+            cli.into_operation(),
+            Operation::Exec {
+                names: vec!["gh-token".into(), "cf-wrangler".into()],
+                command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
+                    .map(String::from)
+                    .to_vec(),
+            }
         );
     }
 
@@ -176,14 +188,17 @@ mod tests {
         let cli =
             Cli::try_parse_from(["agentknock", "--start-pairing", "pairing-address-name"]).unwrap();
 
-        assert_eq!(cli.start_pairing.as_deref(), Some("pairing-address-name"));
+        assert_eq!(
+            cli.into_operation(),
+            Operation::StartPairing("pairing-address-name".into())
+        );
     }
 
     #[test]
     fn parses_finish_pairing_command() {
         let cli = Cli::try_parse_from(["agentknock", "--finish-pairing"]).unwrap();
 
-        assert!(cli.finish_pairing);
+        assert_eq!(cli.into_operation(), Operation::FinishPairing);
     }
 
     #[test]
