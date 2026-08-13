@@ -56,6 +56,7 @@ type ReceivedMessages = Arc<Mutex<Vec<ReceivedMessage>>>;
 struct TestState {
     messages: ReceivedMessages,
     route_private_key: <Kem as KemTrait>::PrivateKey,
+    response: Value,
 }
 
 struct TestHome {
@@ -114,7 +115,12 @@ async fn receive_message(
     let response = match part.as_str() {
         "request" => json!({
             "state": "RESPONSE_DELIVERED",
-            "response": encrypt_response(&state.route_private_key, &request_id, &body)
+            "response": encrypt_response(
+                &state.route_private_key,
+                &request_id,
+                &body,
+                &state.response,
+            )
         }),
         "complete" => json!({
             "state": "COMPLETION_DELIVERED"
@@ -136,6 +142,7 @@ fn encrypt_response(
     route_private_key: &<Kem as KemTrait>::PrivateKey,
     request_id: &str,
     body: &Value,
+    response: &Value,
 ) -> Value {
     let request = &body["request"];
     let key = BASE64_STANDARD
@@ -177,7 +184,7 @@ fn encrypt_response(
     let ciphertext = cipher
         .encrypt(
             &response_nonce,
-            serde_json::to_vec(&json!({})).unwrap().as_ref(),
+            serde_json::to_vec(response).unwrap().as_ref(),
         )
         .unwrap();
 
@@ -194,6 +201,13 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     let state = TestState {
         messages: messages.clone(),
         route_private_key: home.route_private_key.clone(),
+        response: json!({
+            "result": "APPROVED",
+            "environment": {
+                "AGENTKNOCK_TEST_ONE": "first secret value",
+                "AGENTKNOCK_TEST_TWO": "second secret value",
+            }
+        }),
     };
     let app = Router::new()
         .route(
@@ -209,12 +223,14 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
 
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .args([
+            "--reason",
+            "needed verbatim: $TOKEN, \"quotes\"",
             "--exec",
             "gh-token,cf-wrangler",
             "--",
             "sh",
             "-c",
-            "printf '%s' \"$$\"",
+            "test \"$AGENTKNOCK_TEST_ONE\" = 'first secret value' && test \"$AGENTKNOCK_TEST_TWO\" = 'second secret value' && printf '%s' \"$$\"",
         ])
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("HOME", home.path())
@@ -254,6 +270,30 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     assert_eq!(completion["key"], request["key"]);
     assert_eq!(messages[0].request_id, messages[1].request_id);
 
+    let (request_plaintext, completion_plaintext) =
+        decrypt_messages(&home.route_private_key, &messages);
+    assert_eq!(
+        request_plaintext,
+        json!({
+            "profiles": ["gh-token", "cf-wrangler"],
+            "operation": "exec",
+            "command": "sh",
+            "arguments": [
+                "-c",
+                "test \"$AGENTKNOCK_TEST_ONE\" = 'first secret value' && test \"$AGENTKNOCK_TEST_TWO\" = 'second secret value' && printf '%s' \"$$\""
+            ],
+            "reason": "needed verbatim: $TOKEN, \"quotes\"",
+        })
+    );
+    assert_eq!(completion_plaintext, json!({"result": "APPROVED"}));
+}
+
+fn decrypt_messages(
+    route_private_key: &<Kem as KemTrait>::PrivateKey,
+    messages: &[ReceivedMessage],
+) -> (Value, Value) {
+    let request = &messages[0].body["request"];
+    let completion = &messages[1].body["completion"];
     let key = BASE64_STANDARD
         .decode(request["key"].as_str().unwrap())
         .unwrap();
@@ -271,20 +311,73 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     let psk = PskBundle::new(&PAIRING_PSK, &pairing_id).unwrap();
     let mut receiver_context = setup_receiver::<Aead, Kdf, Kem>(
         &OpModeR::Psk(psk),
-        &home.route_private_key,
+        route_private_key,
         &encapped_key,
         &info,
     )
     .unwrap();
-    let plaintext = receiver_context.open(&ciphertext, b"").unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&plaintext).unwrap(),
-        json!({})
-    );
+    let request_plaintext = receiver_context.open(&ciphertext, b"").unwrap();
     let completion_plaintext = receiver_context.open(&completion_ciphertext, b"").unwrap();
+
+    (
+        serde_json::from_slice(&request_plaintext).unwrap(),
+        serde_json::from_slice(&completion_plaintext).unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copies_denial_to_completion_without_running_command() {
+    let home = TestHome::new(0o600);
+    let messages = ReceivedMessages::default();
+    let state = TestState {
+        messages: messages.clone(),
+        route_private_key: home.route_private_key.clone(),
+        response: json!({
+            "result": "DENIED",
+            "reason": "POLICY_DENIED",
+            "message": "profile is not allowed for this command",
+        }),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(receive_message),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "sh", "-c", "printf command-ran"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "denied command was executed");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("request denied (PolicyDenied): profile is not allowed for this command")
+    );
+
+    let messages = messages.lock().unwrap();
+    assert_eq!(messages.len(), 2);
+    let (_, completion) = decrypt_messages(&home.route_private_key, &messages);
     assert_eq!(
-        serde_json::from_slice::<Value>(&completion_plaintext).unwrap(),
-        json!({})
+        completion,
+        json!({
+            "result": "DENIED",
+            "reason": "POLICY_DENIED",
+            "message": "profile is not allowed for this command",
+        })
     );
 }
 

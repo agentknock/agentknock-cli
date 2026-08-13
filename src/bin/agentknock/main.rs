@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     error::Error,
     fmt,
@@ -53,16 +54,25 @@ type ResponseNonce = AeadNonce<ResponseAead>;
     )
 )]
 struct Cli {
-    /// Run a command with credentials supplied by AgentKnock.
+    /// Run a command with profiles supplied by AgentKnock.
     #[arg(
         long,
         action = ArgAction::Set,
         value_delimiter = ',',
-        value_name = "CREDENTIAL",
+        value_name = "PROFILE",
         value_parser = NonEmptyStringValueParser::new(),
         requires = "command_to_run"
     )]
     exec: Option<Vec<String>>,
+
+    /// Explain why the requested profiles are needed.
+    #[arg(
+        long,
+        value_name = "REASON",
+        value_parser = NonEmptyStringValueParser::new(),
+        requires = "exec"
+    )]
+    reason: Option<String>,
 
     /// Start pairing with an AgentKnock service.
     #[arg(
@@ -89,7 +99,8 @@ struct Cli {
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
     Exec {
-        names: Vec<String>,
+        profiles: Vec<String>,
+        reason: Option<String>,
         command: Vec<String>,
     },
     StartPairing(String),
@@ -98,9 +109,10 @@ enum Operation {
 
 impl Cli {
     fn into_operation(self) -> Operation {
-        if let Some(names) = self.exec {
+        if let Some(profiles) = self.exec {
             return Operation::Exec {
-                names,
+                profiles,
+                reason: self.reason,
                 command: self.command_to_run,
             };
         }
@@ -127,8 +139,51 @@ struct Pairing {
     route_key: <Kem as KemTrait>::PublicKey,
 }
 
+#[derive(Serialize)]
+struct RequestContents<'a> {
+    profiles: &'a [String],
+    operation: &'static str,
+    command: &'a str,
+    arguments: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
 #[derive(Deserialize, Serialize)]
-struct Placeholder {}
+#[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RequestResult {
+    Approved {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        environment: Option<BTreeMap<String, String>>,
+    },
+    Denied {
+        reason: DenialReason,
+        message: String,
+    },
+    Aborted {
+        reason: AbortReason,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum DenialReason {
+    UserDenied,
+    PolicyDenied,
+    InvalidRequest,
+    Other,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum AbortReason {
+    Cancelled,
+    TimedOut,
+    InvalidResponse,
+    ClientError,
+    Other,
+}
 
 #[derive(Serialize)]
 struct Request {
@@ -224,10 +279,22 @@ enum MessageState {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().into_operation() {
-        Operation::Exec { names: _, command } => {
+        Operation::Exec {
+            profiles,
+            reason,
+            command,
+        } => {
             let pairing = read_pairing()?;
-            message_exchange(&relay_url()?, &pairing).await?;
-            exec(command)?;
+            let (program, arguments) = command.split_first().expect("command is required");
+            let request_contents = RequestContents {
+                profiles: &profiles,
+                operation: "exec",
+                command: program,
+                arguments,
+                reason: reason.as_deref(),
+            };
+            let environment = message_exchange(&relay_url()?, &pairing, &request_contents).await?;
+            exec(command, environment)?;
         }
         Operation::StartPairing(_) | Operation::FinishPairing => {}
     }
@@ -293,7 +360,11 @@ fn relay_url() -> Result<String, env::VarError> {
     }
 }
 
-async fn message_exchange(relay_url: &str, pairing: &Pairing) -> Result<(), Box<dyn Error>> {
+async fn message_exchange(
+    relay_url: &str,
+    pairing: &Pairing,
+    request_contents: &RequestContents<'_>,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
     let client = reqwest::Client::new();
     let request_id = Ulid::generate();
     let message_url = format!(
@@ -311,7 +382,7 @@ async fn message_exchange(relay_url: &str, pairing: &Pairing) -> Result<(), Box<
     let psk = PskBundle::new(&pairing.pairing_psk, &pairing_id)?;
     let (encapped_key, mut sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &pairing.route_key, &info)?;
-    let ciphertext = sender_context.seal(&serde_json::to_vec(&Placeholder {})?, b"")?;
+    let ciphertext = sender_context.seal(&serde_json::to_vec(request_contents)?, b"")?;
     let encapped_key = encapped_key.to_bytes();
     let request = Request {
         version: "1",
@@ -327,15 +398,54 @@ async fn message_exchange(relay_url: &str, pairing: &Pairing) -> Result<(), Box<
     )
     .await?;
     let _request_state = request_response.state;
-    if let Some(response) = request_response.response {
-        let _response = decrypt_response(&sender_context, &encapped_key, response)?;
-    }
+    let response = request_response.response.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "relay response did not contain a result",
+        )
+    })?;
+    let result = decrypt_response(&sender_context, &encapped_key, response)?;
+    let (completion_result, exchange_result) = match result {
+        RequestResult::Approved {
+            environment: Some(environment),
+        } => (
+            RequestResult::Approved { environment: None },
+            Ok(environment),
+        ),
+        RequestResult::Approved { environment: None } => {
+            let message = "approved response did not contain an environment mapping".to_owned();
+            (
+                RequestResult::Aborted {
+                    reason: AbortReason::InvalidResponse,
+                    message: message.clone(),
+                },
+                Err(io::Error::new(io::ErrorKind::InvalidData, message)),
+            )
+        }
+        RequestResult::Denied { reason, message } => {
+            let error = io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("request denied ({reason:?}): {message}"),
+            );
+            (RequestResult::Denied { reason, message }, Err(error))
+        }
+        RequestResult::Aborted { .. } => {
+            let message = "received an ABORTED result in a response".to_owned();
+            (
+                RequestResult::Aborted {
+                    reason: AbortReason::InvalidResponse,
+                    message: message.clone(),
+                },
+                Err(io::Error::new(io::ErrorKind::InvalidData, message)),
+            )
+        }
+    };
 
     let completion = Completion {
         pairing_id: pairing.pairing_id.to_string(),
         key: request.key.clone(),
         ciphertext: BASE64_STANDARD
-            .encode(sender_context.seal(&serde_json::to_vec(&Placeholder {})?, b"")?),
+            .encode(sender_context.seal(&serde_json::to_vec(&completion_result)?, b"")?),
     };
     let completion_response: CompletionResponse = post_message(
         &client,
@@ -348,14 +458,14 @@ async fn message_exchange(relay_url: &str, pairing: &Pairing) -> Result<(), Box<
     .await?;
     let _completion_state = completion_response.state;
 
-    Ok(())
+    Ok(exchange_result?)
 }
 
 fn decrypt_response(
     sender_context: &AeadCtxS<Aead, Kdf, Kem>,
     encapped_key: &[u8],
     response: Response,
-) -> Result<Placeholder, Box<dyn Error>> {
+) -> Result<RequestResult, Box<dyn Error>> {
     let nonce = BASE64_STANDARD.decode(response.nonce)?;
     let ciphertext = BASE64_STANDARD.decode(response.ciphertext)?;
     let mut salt = Vec::with_capacity(encapped_key.len() + nonce.len());
@@ -395,13 +505,16 @@ where
 }
 
 #[cfg(unix)]
-fn exec(command: Vec<String>) -> io::Result<()> {
+fn exec(command: Vec<String>, environment: BTreeMap<String, String>) -> io::Result<()> {
     let (program, arguments) = command.split_first().expect("command is required");
-    Err(ProcessCommand::new(program).args(arguments).exec())
+    Err(ProcessCommand::new(program)
+        .args(arguments)
+        .envs(environment)
+        .exec())
 }
 
 #[cfg(not(unix))]
-fn exec(_command: Vec<String>) -> io::Result<()> {
+fn exec(_command: Vec<String>, _environment: BTreeMap<String, String>) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "exec is only supported on Unix",
@@ -420,6 +533,8 @@ mod tests {
             "agentknock",
             "--exec",
             "gh-token,cf-wrangler",
+            "--reason",
+            "needed by the deployment agent",
             "--",
             "sh",
             "-c",
@@ -430,7 +545,8 @@ mod tests {
         assert_eq!(
             cli.into_operation(),
             Operation::Exec {
-                names: vec!["gh-token".into(), "cf-wrangler".into()],
+                profiles: vec!["gh-token".into(), "cf-wrangler".into()],
+                reason: Some("needed by the deployment agent".into()),
                 command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
                     .map(String::from)
                     .to_vec(),
