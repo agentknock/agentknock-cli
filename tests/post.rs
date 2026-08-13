@@ -30,7 +30,7 @@ async fn posts_and_receives_json() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .args([
-            "post",
+            "--post",
             &format!("http://{address}/message"),
             "hello from the client",
         ])
