@@ -45,6 +45,9 @@ pub enum RequestError {
     #[error("relay returned unexpected HTTP status {0}")]
     UnexpectedRelayStatus(u16),
 
+    #[error("relay remained unavailable after {failures} consecutive failures")]
+    RelayUnavailable { failures: usize },
+
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
@@ -157,7 +160,22 @@ async fn message_exchange(
         .map_err(ProtocolError::from)?;
     let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
 
-    let response = relay.request(&request).await?;
+    let response = match relay.request(&request).await {
+        Ok(response) => response,
+        Err(error) => {
+            let abort_reason = abort_reason(&error);
+            let error = RequestError::from(error);
+            try_complete_aborted(
+                &mut session,
+                &relay,
+                &request,
+                abort_reason,
+                error.to_string(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let plaintext = session
         .open_response(response)
         .map_err(ProtocolError::from)?;
@@ -204,6 +222,36 @@ async fn message_exchange(
     exchange_result
 }
 
+fn abort_reason(error: &rest::Error) -> AbortReason {
+    match error {
+        rest::Error::RetriesExhausted { .. } => AbortReason::TimedOut,
+        rest::Error::Relay(error)
+            if error
+                .status()
+                .is_some_and(|status| status.is_client_error()) =>
+        {
+            AbortReason::ClientError
+        }
+        _ => AbortReason::InvalidResponse,
+    }
+}
+
+async fn try_complete_aborted(
+    session: &mut Session,
+    relay: &Relay,
+    request: &crypto::Request,
+    reason: AbortReason,
+    message: String,
+) {
+    let Ok(plaintext) = serde_json::to_vec(&RequestResult::Aborted { reason, message }) else {
+        return;
+    };
+    let Ok(completion) = session.seal_completion(&plaintext) else {
+        return;
+    };
+    let _ = relay.complete(request, &completion).await;
+}
+
 impl From<crypto::Error> for ProtocolError {
     fn from(error: crypto::Error) -> Self {
         match error {
@@ -225,6 +273,7 @@ impl From<rest::Error> for RequestError {
             rest::Error::Relay(error) => Self::Relay(error),
             rest::Error::InvalidJson(error) => Self::Protocol(ProtocolError::Json(error)),
             rest::Error::UnexpectedStatus(status) => Self::UnexpectedRelayStatus(status),
+            rest::Error::RetriesExhausted { failures } => Self::RelayUnavailable { failures },
             rest::Error::UnexpectedState { operation, state } => {
                 Self::Protocol(ProtocolError::UnexpectedMessageState { operation, state })
             }

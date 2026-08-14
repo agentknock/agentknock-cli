@@ -3,11 +3,14 @@ use std::{env, time::Duration};
 use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 const RELAY_URL: &str = "https://relay.agentknock.dev/";
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_CONSECUTIVE_FAILURE_DURATION: Duration = Duration::from_secs(2 * 60);
+const MAX_CONSECUTIVE_FAILURES: usize = 10;
 
 pub(crate) struct Relay {
     client: reqwest::Client,
@@ -27,7 +30,9 @@ impl Relay {
         );
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .build()?,
             message_url,
         })
     }
@@ -86,18 +91,33 @@ impl Relay {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        let mut failures = 0;
+        let failure_deadline = Instant::now() + MAX_CONSECUTIVE_FAILURE_DURATION;
         loop {
-            let response = match self.client.post(url).json(body).send().await {
+            let timeout = HTTP_REQUEST_TIMEOUT
+                .min(failure_deadline.saturating_duration_since(Instant::now()));
+            if timeout.is_zero() {
+                return Err(retries_exhausted(failures));
+            }
+            let response = match self
+                .client
+                .post(url)
+                .timeout(timeout)
+                .json(body)
+                .send()
+                .await
+            {
                 Ok(response) => response,
                 Err(_) => {
-                    sleep(RETRY_DELAY).await;
+                    retry_failure(&mut failures, failure_deadline, RETRY_DELAY).await?;
                     continue;
                 }
             };
             let status = response.status();
 
             if status.is_server_error() {
-                sleep(retry_after(&response).unwrap_or(RETRY_DELAY)).await;
+                let delay = retry_after(&response).unwrap_or(RETRY_DELAY);
+                retry_failure(&mut failures, failure_deadline, delay).await?;
                 continue;
             }
             if status.is_client_error() {
@@ -114,13 +134,37 @@ impl Relay {
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    sleep(RETRY_DELAY).await;
+                    retry_failure(&mut failures, failure_deadline, RETRY_DELAY).await?;
                     continue;
                 }
             };
             return serde_json::from_slice(&bytes).map_err(Error::InvalidJson);
         }
     }
+}
+
+async fn retry_failure(
+    failures: &mut usize,
+    deadline: Instant,
+    delay: Duration,
+) -> Result<(), Error> {
+    *failures += 1;
+    if *failures >= MAX_CONSECUTIVE_FAILURES {
+        return Err(retries_exhausted(*failures));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(retries_exhausted(*failures));
+    }
+    sleep(delay.min(remaining)).await;
+    if Instant::now() >= deadline {
+        return Err(retries_exhausted(*failures));
+    }
+    Ok(())
+}
+
+fn retries_exhausted(failures: usize) -> Error {
+    Error::RetriesExhausted { failures }
 }
 
 fn retry_after(response: &reqwest::Response) -> Option<Duration> {
@@ -206,6 +250,9 @@ pub(crate) enum Error {
 
     #[error("relay response state did not include a response message")]
     MissingResponse,
+
+    #[error("relay remained unavailable after {failures} consecutive failures")]
+    RetriesExhausted { failures: usize },
 
     #[error("{TEST_RELAY_URL_ENV} is not valid UTF-8")]
     InvalidTestRelayUrl,

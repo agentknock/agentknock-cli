@@ -72,6 +72,13 @@ struct RetryTestState {
     completion_attempts: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct FailedRequestState {
+    messages: ReceivedMessages,
+    request_attempts: Arc<AtomicUsize>,
+    completion_attempts: Arc<AtomicUsize>,
+}
+
 struct TestHome {
     path: PathBuf,
     route_private_key: <Kem as KemTrait>::PrivateKey,
@@ -172,10 +179,11 @@ async fn receive_message_with_retries(
 ) -> AxumResponse {
     match part.as_str() {
         "request" => match state.request_attempts.fetch_add(1, Ordering::SeqCst) {
-            0 => (StatusCode::SERVICE_UNAVAILABLE, [(RETRY_AFTER, "0")]).into_response(),
-            1 => Json(json!({"state": "REQUEST_PENDING"})).into_response(),
-            2 => Json(json!({"state": "REQUEST_DELIVERED"})).into_response(),
-            3 => Json(json!({
+            0..=8 | 10..=18 => {
+                (StatusCode::SERVICE_UNAVAILABLE, [(RETRY_AFTER, "0")]).into_response()
+            }
+            9 => Json(json!({"state": "REQUEST_PENDING"})).into_response(),
+            19 => Json(json!({
                 "state": "RESPONSE_PENDING",
                 "response": encrypt_response(
                     &state.route_private_key,
@@ -199,9 +207,49 @@ async fn receive_message_with_retries(
     }
 }
 
-async fn reject_request(State(attempts): State<Arc<AtomicUsize>>) -> StatusCode {
-    attempts.fetch_add(1, Ordering::SeqCst);
+async fn reject_message(
+    State(state): State<FailedRequestState>,
+    Path((route_id, request_id, part)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    match part.as_str() {
+        "request" => &state.request_attempts,
+        "complete" => &state.completion_attempts,
+        part => panic!("unexpected message part: {part}"),
+    }
+    .fetch_add(1, Ordering::SeqCst);
+    state.messages.lock().unwrap().push(ReceivedMessage {
+        route_id,
+        request_id,
+        part,
+        body,
+    });
     StatusCode::BAD_REQUEST
+}
+
+async fn exhaust_request_retries(
+    State(state): State<FailedRequestState>,
+    Path((route_id, request_id, part)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> AxumResponse {
+    state.messages.lock().unwrap().push(ReceivedMessage {
+        route_id,
+        request_id,
+        part: part.clone(),
+        body,
+    });
+    match part.as_str() {
+        "request" => {
+            state.request_attempts.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::SERVICE_UNAVAILABLE, [(RETRY_AFTER, "0")]).into_response()
+        }
+        "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
+            1 => Json(json!({"state": "COMPLETION_DELIVERED"})).into_response(),
+            attempt => panic!("unexpected completion attempt {attempt}"),
+        },
+        part => panic!("unexpected message part: {part}"),
+    }
 }
 
 async fn return_invalid_encrypted_response(
@@ -466,6 +514,23 @@ fn decrypt_messages(
     )
 }
 
+fn decrypt_completion(
+    route_private_key: &<Kem as KemTrait>::PrivateKey,
+    messages: &[ReceivedMessage],
+) -> Value {
+    let request = messages
+        .iter()
+        .find(|message| message.part == "request")
+        .unwrap()
+        .clone();
+    let completion = messages
+        .iter()
+        .find(|message| message.part == "complete")
+        .unwrap()
+        .clone();
+    decrypt_messages(route_private_key, &[request, completion]).1
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copies_denial_to_completion_without_running_command() {
     let home = TestHome::new(0o600);
@@ -566,20 +631,27 @@ async fn retries_pending_states_and_server_errors() {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(request_attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(request_attempts.load(Ordering::SeqCst), 20);
     assert_eq!(completion_attempts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn does_not_retry_client_errors() {
     let home = TestHome::new(0o600);
-    let attempts = Arc::new(AtomicUsize::new(0));
+    let messages = ReceivedMessages::default();
+    let request_attempts = Arc::new(AtomicUsize::new(0));
+    let completion_attempts = Arc::new(AtomicUsize::new(0));
+    let state = FailedRequestState {
+        messages: messages.clone(),
+        request_attempts: request_attempts.clone(),
+        completion_attempts: completion_attempts.clone(),
+    };
     let app = Router::new()
         .route(
-            "/v1/route/{route_id}/msg/{request_id}/request",
-            post(reject_request),
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(reject_message),
         )
-        .with_state(attempts.clone());
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -597,11 +669,70 @@ async fn does_not_retry_client_errors() {
     let _ = server.await;
 
     assert!(!output.status.success());
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(request_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(completion_attempts.load(Ordering::SeqCst), 1);
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("400 Bad Request")
+    );
+    let messages = messages.lock().unwrap();
+    let completion = decrypt_completion(&home.route_private_key, &messages);
+    assert_eq!(completion["result"], "ABORTED");
+    assert_eq!(completion["reason"], "CLIENT_ERROR");
+    assert!(completion["message"].as_str().unwrap().contains("400"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborts_after_consecutive_server_errors() {
+    let home = TestHome::new(0o600);
+    let messages = ReceivedMessages::default();
+    let request_attempts = Arc::new(AtomicUsize::new(0));
+    let completion_attempts = Arc::new(AtomicUsize::new(0));
+    let state = FailedRequestState {
+        messages: messages.clone(),
+        request_attempts: request_attempts.clone(),
+        completion_attempts: completion_attempts.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(exhaust_request_retries),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(!output.status.success());
+    assert_eq!(request_attempts.load(Ordering::SeqCst), 10);
+    assert_eq!(completion_attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("after 10 consecutive failures")
+    );
+    let messages = messages.lock().unwrap();
+    let completion = decrypt_completion(&home.route_private_key, &messages);
+    assert_eq!(completion["result"], "ABORTED");
+    assert_eq!(completion["reason"], "TIMED_OUT");
+    assert!(
+        completion["message"]
+            .as_str()
+            .unwrap()
+            .contains("after 10 consecutive failures")
     );
 }
 
