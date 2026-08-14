@@ -112,13 +112,13 @@ impl TestHome {
         &self.path
     }
 
-    fn set_rotation(&self, rotation: &Value) {
+    fn set_rotation_key(&self, rotation_key: &str) {
         let path = self.path.join(".agentknock/pairing.json");
         let mut pairing: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         pairing
             .as_object_mut()
             .unwrap()
-            .insert("rotation".into(), rotation.clone());
+            .insert("rotation_key".into(), rotation_key.into());
         fs::write(path, serde_json::to_vec(&pairing).unwrap()).unwrap();
     }
 }
@@ -280,11 +280,8 @@ fn encrypt_response(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exchanges_messages_then_replaces_itself_with_command() {
     let home = TestHome::new(0o600);
-    let rotation = json!({
-        "key": "cm90YXRpb24ga2V5",
-        "ciphertext": "cm90YXRpb24gY2lwaGVydGV4dA==",
-    });
-    home.set_rotation(&rotation);
+    let rotation_key = "cm90YXRpb24ga2V5";
+    home.set_rotation_key(rotation_key);
     let messages = ReceivedMessages::default();
     let state = TestState {
         messages: messages.clone(),
@@ -348,7 +345,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     let request = &messages[0].body["request"];
     assert_eq!(request["version"], "1");
     assert_eq!(request["pairing_id"], PAIRING_ID);
-    assert_eq!(request["rotation"], rotation);
+    assert_eq!(request["rotation_key"], rotation_key);
     assert_eq!(messages[1].route_id, ROUTE_ID);
     assert_eq!(messages[1].part, "complete");
     assert_eq!(messages[1].body["request"], *request);
@@ -362,7 +359,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     let pairing: Value =
         serde_json::from_slice(&fs::read(home.path().join(".agentknock/pairing.json")).unwrap())
             .unwrap();
-    assert!(pairing.get("rotation").is_none());
+    assert!(pairing.get("rotation_key").is_none());
 
     let (request_plaintext, completion_plaintext) =
         decrypt_messages(&home.route_private_key, &messages);
@@ -384,13 +381,10 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn keeps_rotation_when_response_cannot_be_decrypted() {
+async fn keeps_rotation_key_when_response_cannot_be_decrypted() {
     let home = TestHome::new(0o600);
-    let rotation = json!({
-        "key": "cm90YXRpb24ga2V5",
-        "ciphertext": "cm90YXRpb24gY2lwaGVydGV4dA==",
-    });
-    home.set_rotation(&rotation);
+    let rotation_key = "cm90YXRpb24ga2V5";
+    home.set_rotation_key(rotation_key);
     let messages = ReceivedMessages::default();
     let app = Router::new()
         .route(
@@ -422,12 +416,12 @@ async fn keeps_rotation_when_response_cannot_be_decrypted() {
     );
     let messages = messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].body["request"]["rotation"], rotation);
+    assert_eq!(messages[0].body["request"]["rotation_key"], rotation_key);
     drop(messages);
     let pairing: Value =
         serde_json::from_slice(&fs::read(home.path().join(".agentknock/pairing.json")).unwrap())
             .unwrap();
-    assert_eq!(pairing["rotation"], rotation);
+    assert_eq!(pairing["rotation_key"], rotation_key);
 }
 
 fn decrypt_messages(

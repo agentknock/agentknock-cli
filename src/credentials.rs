@@ -5,7 +5,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    config::{ConfigurationError, Pairing, clear_rotation, read_pairing},
+    config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
     rest::{self, Relay},
 };
@@ -156,8 +156,8 @@ async fn message_exchange(
     let plaintext = session
         .open_response(response)
         .map_err(ProtocolError::from)?;
-    if let Some(rotation) = pairing.rotation() {
-        clear_rotation(rotation)?;
+    if let Some(rotation_key) = pairing.rotation_key() {
+        clear_rotation_key(rotation_key)?;
     }
     let result: RequestResult = serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
     let (completion_result, exchange_result) = match result {

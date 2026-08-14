@@ -503,7 +503,7 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         assert_eq!(messages[2].route_id, ROUTE_ID);
         assert_eq!(messages[2].part, "request");
         assert_ne!(messages[2].request_id, messages[0].request_id);
-        assert!(messages[2].body["request"].get("rotation").is_none());
+        assert!(messages[2].body["request"].get("rotation_key").is_none());
         assert_eq!(messages[3].route_id, ROUTE_ID);
         assert_eq!(messages[3].request_id, messages[2].request_id);
         assert_eq!(messages[3].part, "complete");

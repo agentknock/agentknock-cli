@@ -14,7 +14,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::config::{Identifier, Pairing, PendingPairing, Rotation};
+use crate::config::{Identifier, Pairing, PendingPairing};
 
 const BASE_DERIVATION_SALT: &[u8] = b"agentknock-v1";
 const ROUTE_DERIVATION_INFO: &[u8] = b"agentknock-v1 route";
@@ -35,7 +35,7 @@ type ResponseNonce = AeadNonce<ResponseAead>;
 pub(crate) struct Session {
     pairing_id: String,
     encapped_key: Vec<u8>,
-    rotation: Option<Rotation>,
+    rotation_key: Option<String>,
     sender_context: AeadCtxS<Aead, Kdf, Kem>,
     state: SessionState,
 }
@@ -53,7 +53,7 @@ impl Session {
         Ok(Self {
             pairing_id: pairing.pairing_id(),
             encapped_key,
-            rotation: pairing.rotation().cloned(),
+            rotation_key: pairing.rotation_key().map(str::to_owned),
             sender_context,
             state: SessionState::Ready,
         })
@@ -69,7 +69,7 @@ impl Session {
             pairing_id: self.pairing_id.clone(),
             key: BASE64_STANDARD.encode(&self.encapped_key),
             ciphertext: BASE64_STANDARD.encode(ciphertext),
-            rotation: self.rotation.clone(),
+            rotation_key: self.rotation_key.clone(),
         })
     }
 
@@ -194,7 +194,7 @@ pub(crate) struct Request {
     key: String,
     ciphertext: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rotation: Option<Rotation>,
+    rotation_key: Option<String>,
 }
 
 #[derive(Deserialize)]

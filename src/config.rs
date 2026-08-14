@@ -25,17 +25,11 @@ pub(crate) struct Pairing {
     #[serde(deserialize_with = "deserialize_base64")]
     route_key: Vec<u8>,
     #[serde(default)]
-    rotation: Option<Rotation>,
+    rotation_key: Option<String>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct Identifier(u128);
-
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct Rotation {
-    key: String,
-    ciphertext: String,
-}
 
 pub(crate) struct PendingPairing {
     route_id: Identifier,
@@ -69,8 +63,8 @@ impl Pairing {
         &self.route_key
     }
 
-    pub(crate) fn rotation(&self) -> Option<&Rotation> {
-        self.rotation.as_ref()
+    pub(crate) fn rotation_key(&self) -> Option<&str> {
+        self.rotation_key.as_deref()
     }
 }
 
@@ -247,23 +241,18 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
     sync_directory(&directory, &directory_path)
 }
 
-pub(crate) fn clear_rotation(rotation: &Rotation) -> Result<(), ConfigurationError> {
+pub(crate) fn clear_rotation_key(rotation_key: &str) -> Result<(), ConfigurationError> {
     let pairing_path = pairing_path()?;
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
     let (path, mut pairing) = read_pairing_file()?;
-    let expected =
-        serde_json::to_value(rotation).map_err(|source| ConfigurationError::Invalid {
-            path: path.clone(),
-            source,
-        })?;
-    if pairing.get("rotation") != Some(&expected) {
+    if pairing.get("rotation_key").and_then(Value::as_str) != Some(rotation_key) {
         return Ok(());
     }
     pairing
         .as_object_mut()
         .expect("pairing is a JSON object")
-        .remove("rotation");
+        .remove("rotation_key");
     write_pairing_file(&path, &pairing)?;
     sync_directory(&directory, directory_path)
 }
