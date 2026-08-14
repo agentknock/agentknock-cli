@@ -27,28 +27,28 @@ const SAS_DECIMAL_MODULUS: u64 = 1_000_000_000_000;
 type Aead = ChaCha20Poly1305;
 type Kdf = HkdfSha256;
 type Kem = X25519HkdfSha256;
+type SenderContext = AeadCtxS<Aead, Kdf, Kem>;
 type ResponseAead = <Aead as HpkeAeadTrait>::AeadImpl;
 type ExporterSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 type ResponseKey = AeadKey<ResponseAead>;
 type ResponseNonce = AeadNonce<ResponseAead>;
 
+pub(crate) struct PskRotation {
+    pub(crate) pairing_psk: Vec<u8>,
+    pub(crate) rotation_key: String,
+}
+
 pub(crate) struct Session {
     pairing_id: String,
     encapped_key: Vec<u8>,
     rotation_key: Option<String>,
-    sender_context: AeadCtxS<Aead, Kdf, Kem>,
+    sender_context: SenderContext,
     state: SessionState,
 }
 
 impl Session {
     pub(crate) fn new(pairing: &Pairing, request_id: &Ulid) -> Result<Self, Error> {
-        let route_key = <Kem as KemTrait>::PublicKey::from_bytes(pairing.route_key())?;
-        let pairing_id = pairing.pairing_id_bytes();
-        let info = [pairing.route_id_bytes(), pairing_id, request_id.to_bytes()].concat();
-        let psk = PskBundle::new(pairing.pairing_psk(), &pairing_id)?;
-        let (encapped_key, sender_context) =
-            setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &route_key, &info)?;
-        let encapped_key = encapped_key.to_bytes().to_vec();
+        let (encapped_key, sender_context) = setup_pairing_sender(pairing, request_id.to_bytes())?;
 
         Ok(Self {
             pairing_id: pairing.pairing_id(),
@@ -112,6 +112,30 @@ impl Session {
             })
         }
     }
+}
+
+pub(crate) fn derive_psk_rotation(pairing: &Pairing) -> Result<PskRotation, Error> {
+    let (encapped_key, sender_context) = setup_pairing_sender(pairing, [0; 16])?;
+    let mut pairing_psk = ExporterSecret::default();
+    sender_context.export(PSK_EXPORT_CONTEXT, &mut pairing_psk)?;
+
+    Ok(PskRotation {
+        pairing_psk: pairing_psk.to_vec(),
+        rotation_key: BASE64_STANDARD.encode(encapped_key),
+    })
+}
+
+fn setup_pairing_sender(
+    pairing: &Pairing,
+    request_id: [u8; 16],
+) -> Result<(Vec<u8>, SenderContext), Error> {
+    let route_key = <Kem as KemTrait>::PublicKey::from_bytes(pairing.route_key())?;
+    let pairing_id = pairing.pairing_id_bytes();
+    let info = [pairing.route_id_bytes(), pairing_id, request_id].concat();
+    let psk = PskBundle::new(pairing.pairing_psk(), &pairing_id)?;
+    let (encapped_key, sender_context) =
+        setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &route_key, &info)?;
+    Ok((encapped_key.to_bytes().to_vec(), sender_context))
 }
 
 pub(crate) fn seal_pairing(

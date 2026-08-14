@@ -38,6 +38,14 @@ pub(crate) struct PendingPairing {
     route_key: Vec<u8>,
 }
 
+pub(crate) struct LockedPairing {
+    path: PathBuf,
+    directory_path: PathBuf,
+    directory: File,
+    contents: Value,
+    pairing: Pairing,
+}
+
 impl Pairing {
     pub(crate) fn route_id(&self) -> String {
         self.route_id.to_string()
@@ -164,6 +172,9 @@ pub enum ConfigurationError {
 
     #[error("no pending pairing exists in {path}")]
     NoPendingPairing { path: PathBuf },
+
+    #[error("pairing in {path} already has a pending PSK rotation")]
+    RotationPending { path: PathBuf },
 }
 
 pub(crate) fn read_pairing() -> Result<Pairing, ConfigurationError> {
@@ -257,6 +268,50 @@ pub(crate) fn clear_rotation_key(rotation_key: &str) -> Result<(), Configuration
     sync_directory(&directory, directory_path)
 }
 
+pub(crate) fn lock_pairing_for_rotation(path: &Path) -> Result<LockedPairing, ConfigurationError> {
+    let directory_path = path.parent().expect("pairing path has a parent");
+    let directory = lock_directory(directory_path)?;
+    let contents = read_pairing_value(path)?;
+    let pairing = parse_pairing(path, contents.clone())?;
+    if pairing.rotation_key.is_some() {
+        return Err(ConfigurationError::RotationPending {
+            path: path.to_owned(),
+        });
+    }
+
+    Ok(LockedPairing {
+        path: path.to_owned(),
+        directory_path: directory_path.to_owned(),
+        directory,
+        contents,
+        pairing,
+    })
+}
+
+impl LockedPairing {
+    pub(crate) fn pairing(&self) -> &Pairing {
+        &self.pairing
+    }
+
+    pub(crate) fn write_rotation(
+        mut self,
+        pairing_psk: &[u8],
+        rotation_key: &str,
+    ) -> Result<(), ConfigurationError> {
+        let pairing = self
+            .contents
+            .as_object_mut()
+            .expect("pairing configuration is a JSON object");
+        pairing.insert(
+            "pairing_psk".into(),
+            BASE64_STANDARD.encode(pairing_psk).into(),
+        );
+        pairing.insert("rotation_key".into(), rotation_key.into());
+        write_pairing_file(&self.path, &self.contents)?;
+        sync_directory(&self.directory, &self.directory_path)
+    }
+}
+
 pub(crate) fn finish_pending_pairing() -> Result<(), ConfigurationError> {
     let pairing_path = pairing_path()?;
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
@@ -279,7 +334,7 @@ pub(crate) fn abort_pending_pairing() -> Result<(), ConfigurationError> {
     sync_directory(&directory, directory_path)
 }
 
-fn pairing_path() -> Result<PathBuf, ConfigurationError> {
+pub(crate) fn pairing_path() -> Result<PathBuf, ConfigurationError> {
     let home = env::var_os("HOME").ok_or(ConfigurationError::HomeNotSet)?;
     Ok(PathBuf::from(home).join(".agentknock/pairing.json"))
 }
@@ -295,20 +350,32 @@ fn read_pending_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
 
 fn read_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
     let path = pairing_path()?;
-    let file = match File::open(&path) {
+    let pairing = read_pairing_value(&path)?;
+    Ok((path, pairing))
+}
+
+fn read_pairing_value(path: &Path) -> Result<Value, ConfigurationError> {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(ConfigurationError::NoPendingPairing { path });
+            return Err(ConfigurationError::NoPendingPairing {
+                path: path.to_owned(),
+            });
         }
-        Err(source) => return Err(ConfigurationError::Access { path, source }),
+        Err(source) => {
+            return Err(ConfigurationError::Access {
+                path: path.to_owned(),
+                source,
+            });
+        }
     };
-    validate_permissions(&file, &path)?;
+    validate_permissions(&file, path)?;
     let pairing: Value =
         serde_json::from_reader(file).map_err(|source| ConfigurationError::Invalid {
-            path: path.clone(),
+            path: path.to_owned(),
             source,
         })?;
-    Ok((path, pairing))
+    Ok(pairing)
 }
 
 fn write_pairing_file(path: &Path, pairing: &Value) -> Result<(), ConfigurationError> {
@@ -369,11 +436,23 @@ fn read_pairing_from(path: &Path) -> Result<Pairing, ConfigurationError> {
 
     validate_permissions(&file, path)?;
 
-    let pairing: Pairing =
-        serde_json::from_reader(file).map_err(|source| ConfigurationError::Invalid {
+    let pairing = serde_json::from_reader(file).map_err(|source| ConfigurationError::Invalid {
+        path: path.to_owned(),
+        source,
+    })?;
+    validate_pairing(path, pairing)
+}
+
+fn parse_pairing(path: &Path, contents: Value) -> Result<Pairing, ConfigurationError> {
+    let pairing =
+        serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
             path: path.to_owned(),
             source,
         })?;
+    validate_pairing(path, pairing)
+}
+
+fn validate_pairing(path: &Path, pairing: Pairing) -> Result<Pairing, ConfigurationError> {
     if pairing.pending {
         return Err(ConfigurationError::PairingPending {
             path: path.to_owned(),
