@@ -243,7 +243,7 @@ where
     P: FnMut(CredentialRequestProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = serde_json::to_vec(request_contents).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(request_contents).map_err(ProtocolError::from)?;
     let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
     let request = session
         .seal_request(&plaintext)
@@ -326,7 +326,7 @@ where
         ),
     };
 
-    let plaintext = serde_json::to_vec(&completion_result).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&completion_result).map_err(ProtocolError::from)?;
     let completion = session
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
@@ -366,7 +366,7 @@ fn seal_aborted(
     reason: AbortReason,
     message: String,
 ) -> Option<crypto::Completion> {
-    let Ok(plaintext) = serde_json::to_vec(&RequestResult::Aborted { reason, message }) else {
+    let Ok(plaintext) = crate::protocol::encode(&RequestResult::Aborted { reason, message }) else {
         return None;
     };
     session.seal_completion(&plaintext).ok()

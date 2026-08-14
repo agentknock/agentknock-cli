@@ -84,7 +84,7 @@ where
         machine_id: read_trimmed("/etc/machine-id"),
         os_version: os_version(),
     };
-    let plaintext = serde_json::to_vec(&contents).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&contents).map_err(ProtocolError::from)?;
     let (completion, pairing, sas) =
         seal_pairing(route_id, &request_id, response, &client_random, &plaintext)
             .map_err(ProtocolError::from)?;
@@ -106,7 +106,7 @@ where
     progress(PairingProgress::Preparing);
     let pairing = read_pending_pairing()?;
     let request_id = Ulid::generate();
-    let plaintext = serde_json::to_vec(&FinishPairingRequest {
+    let plaintext = crate::protocol::encode(&FinishPairingRequest {
         method: "FinishPairing",
     })
     .map_err(ProtocolError::from)?;
@@ -135,7 +135,7 @@ where
     }
 
     let plaintext =
-        serde_json::to_vec(&FinishPairingResult::Accepted).map_err(ProtocolError::from)?;
+        crate::protocol::encode(&FinishPairingResult::Accepted).map_err(ProtocolError::from)?;
     let completion = session
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
@@ -183,8 +183,8 @@ where
     P: FnMut(PairingProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext =
-        serde_json::to_vec(&UnpairRequest { method: "Unpair" }).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&UnpairRequest { method: "Unpair" })
+        .map_err(ProtocolError::from)?;
     let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
     let request = session
         .seal_request(&plaintext)
@@ -204,7 +204,7 @@ where
         .open_response(response)
         .map_err(ProtocolError::from)?;
     serde_json::from_slice::<EmptyMessage>(&plaintext).map_err(ProtocolError::from)?;
-    let plaintext = serde_json::to_vec(&EmptyMessage {}).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(ProtocolError::from)?;
     let completion = session
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;

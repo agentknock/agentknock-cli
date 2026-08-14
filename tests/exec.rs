@@ -631,9 +631,16 @@ fn decrypt_messages(
     let completion_plaintext = receiver_context.open(&completion_ciphertext, b"").unwrap();
 
     (
-        serde_json::from_slice(&request_plaintext).unwrap(),
-        serde_json::from_slice(&completion_plaintext).unwrap(),
+        decode_client_message(&request_plaintext),
+        decode_client_message(&completion_plaintext),
     )
+}
+
+fn decode_client_message(plaintext: &[u8]) -> Value {
+    let mut message: Value = serde_json::from_slice(plaintext).unwrap();
+    assert_eq!(message["cli_version"], env!("CARGO_PKG_VERSION"));
+    message.as_object_mut().unwrap().remove("cli_version");
+    message
 }
 
 fn decrypt_completion(

@@ -277,8 +277,17 @@ async fn lists_profile_metadata_without_values() {
             "}\n",
         )
     );
-    assert_eq!(*request.lock().unwrap(), Some(json!({"method": "List"})));
-    assert_eq!(*completion.lock().unwrap(), Some(json!({})));
+    assert_eq!(
+        *request.lock().unwrap(),
+        Some(json!({
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "method": "List",
+        }))
+    );
+    assert_eq!(
+        *completion.lock().unwrap(),
+        Some(json!({"cli_version": env!("CARGO_PKG_VERSION")}))
+    );
 }
 
 #[test]

@@ -50,7 +50,7 @@ where
     let pairing = read_pairing()?;
     let request_id = Ulid::generate();
     let plaintext =
-        serde_json::to_vec(&ListRequest { method: "List" }).map_err(ProtocolError::from)?;
+        crate::protocol::encode(&ListRequest { method: "List" }).map_err(ProtocolError::from)?;
     let mut session = Session::new(&pairing, &request_id).map_err(ProtocolError::from)?;
     let request = session
         .seal_request(&plaintext)
@@ -74,8 +74,9 @@ where
         clear_rotation_key(rotation_key)?;
     }
     let response: ListResponse = serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(ProtocolError::from)?;
     let completion = session
-        .seal_completion(b"{}")
+        .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
     relay.complete(&request, &completion).await?;
     progress(ProfileListProgress::Completed);
@@ -100,6 +101,9 @@ impl fmt::Display for ValueSource {
 struct ListRequest {
     method: &'static str,
 }
+
+#[derive(Serialize)]
+struct EmptyMessage {}
 
 #[derive(Deserialize)]
 struct ListResponse {

@@ -479,6 +479,7 @@ async fn starts_and_finishes_pairing_message_exchanges() {
     {
         let contents = contents.lock().unwrap();
         let contents = contents.as_ref().unwrap();
+        assert_eq!(contents["cli_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             BASE64_STANDARD
                 .decode(contents["client_random"].as_str().unwrap())
@@ -562,11 +563,17 @@ async fn starts_and_finishes_pairing_message_exchanges() {
     );
     assert_eq!(
         *finish_request.lock().unwrap(),
-        Some(json!({"method": "FinishPairing"}))
+        Some(json!({
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "method": "FinishPairing",
+        }))
     );
     assert_eq!(
         *finish_completion.lock().unwrap(),
-        Some(json!({"result": "ACCEPTED"}))
+        Some(json!({
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "result": "ACCEPTED",
+        }))
     );
     {
         let messages = messages.lock().unwrap();
@@ -684,7 +691,10 @@ async fn leaves_rejected_pairing_pending() {
     assert_eq!(pairing["pending"], true);
     assert_eq!(
         *finish_request.lock().unwrap(),
-        Some(json!({"method": "FinishPairing"}))
+        Some(json!({
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "method": "FinishPairing",
+        }))
     );
     assert_eq!(*finish_completion.lock().unwrap(), None);
     let messages = messages.lock().unwrap();
@@ -750,9 +760,15 @@ async fn unpairs_after_an_authenticated_response() {
     assert!(!pairing_path.exists());
     assert_eq!(
         *unpair_request.lock().unwrap(),
-        Some(json!({"method": "Unpair"}))
+        Some(json!({
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "method": "Unpair",
+        }))
     );
-    assert_eq!(*unpair_completion.lock().unwrap(), Some(json!({})));
+    assert_eq!(
+        *unpair_completion.lock().unwrap(),
+        Some(json!({"cli_version": env!("CARGO_PKG_VERSION")}))
+    );
     let messages = messages.lock().unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].part, "request");

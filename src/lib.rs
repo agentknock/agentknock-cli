@@ -3,6 +3,7 @@ mod credentials;
 mod crypto;
 mod pairing;
 mod profiles;
+mod protocol;
 mod rest;
 
 pub use config::ConfigurationError;
