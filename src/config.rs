@@ -23,10 +23,18 @@ pub(crate) struct Pairing {
     pairing_psk: Vec<u8>,
     #[serde(deserialize_with = "deserialize_base64")]
     route_key: Vec<u8>,
+    #[serde(default)]
+    rotation: Option<Rotation>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct Identifier(u128);
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct Rotation {
+    key: String,
+    ciphertext: String,
+}
 
 pub(crate) struct PendingPairing {
     route_id: Identifier,
@@ -58,6 +66,10 @@ impl Pairing {
 
     pub(crate) fn route_key(&self) -> &[u8] {
         &self.route_key
+    }
+
+    pub(crate) fn rotation(&self) -> Option<&Rotation> {
+        self.rotation.as_ref()
     }
 }
 
@@ -223,28 +235,30 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
         .map_err(|source| ConfigurationError::Access { path, source })
 }
 
+pub(crate) fn clear_rotation(rotation: &Rotation) -> Result<(), ConfigurationError> {
+    let (path, mut pairing) = read_pairing_file()?;
+    let expected =
+        serde_json::to_value(rotation).map_err(|source| ConfigurationError::Invalid {
+            path: path.clone(),
+            source,
+        })?;
+    if pairing.get("rotation") != Some(&expected) {
+        return Ok(());
+    }
+    pairing
+        .as_object_mut()
+        .expect("pairing is a JSON object")
+        .remove("rotation");
+    write_pairing_file(&path, &pairing)
+}
+
 pub(crate) fn finish_pending_pairing() -> Result<(), ConfigurationError> {
     let (path, mut pairing) = read_pending_pairing_file()?;
     pairing
         .as_object_mut()
         .expect("pending pairing is a JSON object")
         .remove("pending");
-    let contents =
-        serde_json::to_vec_pretty(&pairing).map_err(|source| ConfigurationError::Invalid {
-            path: path.clone(),
-            source,
-        })?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .map_err(|source| ConfigurationError::Access {
-            path: path.clone(),
-            source,
-        })?;
-    file.write_all(&contents)
-        .and_then(|()| file.write_all(b"\n"))
-        .map_err(|source| ConfigurationError::Access { path, source })
+    write_pairing_file(&path, &pairing)
 }
 
 pub(crate) fn abort_pending_pairing() -> Result<(), ConfigurationError> {
@@ -258,6 +272,15 @@ fn pairing_path() -> Result<PathBuf, ConfigurationError> {
 }
 
 fn read_pending_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
+    let (path, pairing) = read_pairing_file()?;
+    if pairing.get("pending") != Some(&Value::Bool(true)) {
+        return Err(ConfigurationError::NoPendingPairing { path });
+    }
+
+    Ok((path, pairing))
+}
+
+fn read_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
     let path = pairing_path()?;
     let file = match File::open(&path) {
         Ok(file) => file,
@@ -272,11 +295,29 @@ fn read_pending_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
             path: path.clone(),
             source,
         })?;
-    if pairing.get("pending") != Some(&Value::Bool(true)) {
-        return Err(ConfigurationError::NoPendingPairing { path });
-    }
-
     Ok((path, pairing))
+}
+
+fn write_pairing_file(path: &Path, pairing: &Value) -> Result<(), ConfigurationError> {
+    let contents =
+        serde_json::to_vec_pretty(pairing).map_err(|source| ConfigurationError::Invalid {
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| ConfigurationError::Access {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.write_all(&contents)
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|source| ConfigurationError::Access {
+            path: path.to_owned(),
+            source,
+        })
 }
 
 fn read_pairing_from(path: &Path) -> Result<Pairing, ConfigurationError> {

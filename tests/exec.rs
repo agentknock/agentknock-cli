@@ -111,6 +111,16 @@ impl TestHome {
     fn path(&self) -> &FilePath {
         &self.path
     }
+
+    fn set_rotation(&self, rotation: &Value) {
+        let path = self.path.join(".agentknock/pairing.json");
+        let mut pairing: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        pairing
+            .as_object_mut()
+            .unwrap()
+            .insert("rotation".into(), rotation.clone());
+        fs::write(path, serde_json::to_vec(&pairing).unwrap()).unwrap();
+    }
 }
 
 impl Drop for TestHome {
@@ -189,6 +199,28 @@ async fn reject_request(State(attempts): State<Arc<AtomicUsize>>) -> StatusCode 
     StatusCode::BAD_REQUEST
 }
 
+async fn return_invalid_encrypted_response(
+    State(messages): State<ReceivedMessages>,
+    Path((route_id, request_id, part)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(part, "request");
+    messages.lock().unwrap().push(ReceivedMessage {
+        route_id,
+        request_id,
+        part,
+        body,
+    });
+
+    Json(json!({
+        "state": "RESPONSE_DELIVERED",
+        "response": {
+            "nonce": BASE64_STANDARD.encode([0; 32]),
+            "ciphertext": BASE64_STANDARD.encode([0; 16]),
+        },
+    }))
+}
+
 fn encrypt_response(
     route_private_key: &<Kem as KemTrait>::PrivateKey,
     request_id: &str,
@@ -248,6 +280,11 @@ fn encrypt_response(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exchanges_messages_then_replaces_itself_with_command() {
     let home = TestHome::new(0o600);
+    let rotation = json!({
+        "key": "cm90YXRpb24ga2V5",
+        "ciphertext": "cm90YXRpb24gY2lwaGVydGV4dA==",
+    });
+    home.set_rotation(&rotation);
     let messages = ReceivedMessages::default();
     let state = TestState {
         messages: messages.clone(),
@@ -311,6 +348,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     let request = &messages[0].body["request"];
     assert_eq!(request["version"], "1");
     assert_eq!(request["pairing_id"], PAIRING_ID);
+    assert_eq!(request["rotation"], rotation);
     assert_eq!(messages[1].route_id, ROUTE_ID);
     assert_eq!(messages[1].part, "complete");
     assert_eq!(messages[1].body["request"], *request);
@@ -320,6 +358,11 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     assert!(completion.get("pairing_id").is_none());
     assert!(completion.get("key").is_none());
     assert_eq!(messages[0].request_id, messages[1].request_id);
+
+    let pairing: Value =
+        serde_json::from_slice(&fs::read(home.path().join(".agentknock/pairing.json")).unwrap())
+            .unwrap();
+    assert!(pairing.get("rotation").is_none());
 
     let (request_plaintext, completion_plaintext) =
         decrypt_messages(&home.route_private_key, &messages);
@@ -338,6 +381,53 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
         })
     );
     assert_eq!(completion_plaintext, json!({"result": "APPROVED"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeps_rotation_when_response_cannot_be_decrypted() {
+    let home = TestHome::new(0o600);
+    let rotation = json!({
+        "key": "cm90YXRpb24ga2V5",
+        "ciphertext": "cm90YXRpb24gY2lwaGVydGV4dA==",
+    });
+    home.set_rotation(&rotation);
+    let messages = ReceivedMessages::default();
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(return_invalid_encrypted_response),
+        )
+        .with_state(messages.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("response decryption failed")
+    );
+    let messages = messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body["request"]["rotation"], rotation);
+    drop(messages);
+    let pairing: Value =
+        serde_json::from_slice(&fs::read(home.path().join(".agentknock/pairing.json")).unwrap())
+            .unwrap();
+    assert_eq!(pairing["rotation"], rotation);
 }
 
 fn decrypt_messages(
