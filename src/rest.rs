@@ -51,14 +51,6 @@ impl Relay {
         })
     }
 
-    pub(crate) async fn request<B, R>(&self, request: &B) -> Result<R, Error>
-    where
-        B: Serialize + ?Sized,
-        R: DeserializeOwned,
-    {
-        self.request_with_state(request, |_| {}).await
-    }
-
     pub(crate) async fn request_with_state<B, R, F>(
         &self,
         request: &B,

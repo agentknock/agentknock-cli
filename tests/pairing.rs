@@ -375,15 +375,32 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stderr.is_empty());
+    let sas = sas.lock().unwrap().as_ref().unwrap().trim().to_owned();
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        *sas.lock().unwrap().as_ref().unwrap()
+        format!(
+            "AgentKnock started the pairing process.\n\
+             Verification code:\n\
+             {sas}\n\
+             Suggested action: Compare the verification code with the code on the phone.\n\
+             Suggested action: If the codes match, approve the pairing on the phone.\n\
+             Suggested action: After approval, run this command:\n\
+             agentknock --finish-pairing\n"
+        )
     );
     assert!(!repeated_start.status.success());
-    assert!(
-        String::from_utf8(repeated_start.stderr)
-            .unwrap()
-            .contains("already exists")
+    assert!(repeated_start.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(repeated_start.stderr).unwrap(),
+        concat!(
+            "Pairing is already in progress.\n",
+            "Suggested action: Approve the pairing on the phone.\n",
+            "Suggested action: After approval, run this command:\n",
+            "agentknock --finish-pairing\n",
+            "Suggested action: To abort the pending pairing, run this command:\n",
+            "agentknock --abort-pairing\n",
+        )
     );
     {
         let start_messages = messages.lock().unwrap();
@@ -469,10 +486,15 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("is still pending")
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "AGENTKNOCK: Pairing is in progress. The command did not start.\n",
+            "AGENTKNOCK: Suggested action: Approve the pairing on the phone.\n",
+            "AGENTKNOCK: Suggested action: After approval, run this command:\n",
+            "AGENTKNOCK: agentknock --finish-pairing\n",
+            "AGENTKNOCK: Suggested action: Run the original command again.\n",
+        )
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
@@ -486,6 +508,11 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "AgentKnock finished pairing. AgentKnock is ready to provide credentials.\n"
+    );
+    assert!(output.stderr.is_empty());
     let active_pairing: Value = serde_json::from_slice(&fs::read(&pairing_path).unwrap()).unwrap();
     let mut expected_pairing = pairing;
     expected_pairing.as_object_mut().unwrap().remove("pending");
@@ -515,6 +542,34 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         assert_eq!(messages[3].body["request"], messages[2].body["request"]);
     }
 
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--start-pairing", "yup-its-free"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "AgentKnock is already paired and ready to provide credentials.\n",
+            "AgentKnock did not change the existing pairing.\n",
+        )
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .arg("--abort-pairing")
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "Pairing is active. The --abort-pairing option does not remove the active pairing.\n",
+            "AgentKnock did not change the active pairing.\n",
+        )
+    );
+
     server.abort();
     let _ = server.await;
 
@@ -524,10 +579,9 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("no pending pairing exists")
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Pairing is complete. AgentKnock is ready to provide credentials.\n"
     );
 }
 
@@ -575,10 +629,16 @@ async fn leaves_rejected_pairing_pending() {
     let _ = server.await;
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("pairing was rejected")
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "The phone rejected the pairing. AgentKnock kept the pending pairing.\n",
+            "Suggested action: Review the pairing request on the phone.\n",
+            "Suggested action: To send the finish request again, run this command:\n",
+            "agentknock --finish-pairing\n",
+            "Suggested action: To abort the pending pairing, run this command:\n",
+            "agentknock --abort-pairing\n",
+        )
     );
     let pairing: Value = serde_json::from_slice(&fs::read(pairing_path).unwrap()).unwrap();
     assert_eq!(pairing["pending"], true);
@@ -612,6 +672,11 @@ fn aborts_pending_pairing_without_removing_directory() {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "AgentKnock aborted the pending pairing. AgentKnock is not paired.\n"
+    );
+    assert!(output.stderr.is_empty());
     assert!(!pairing_path.exists());
     assert!(directory.is_dir());
 
@@ -621,10 +686,25 @@ fn aborts_pending_pairing_without_removing_directory() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("no pending pairing exists")
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "AgentKnock has no pairing to abort.\n"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .arg("--finish-pairing")
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "No pairing is in progress.\n",
+            "Suggested action: Get a pairing address.\n",
+            "Suggested action: Run this command:\n",
+            "agentknock --start-pairing <PAIRING_ADDRESS>\n",
+        )
     );
 }
 

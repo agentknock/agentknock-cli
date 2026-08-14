@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fmt, fs, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
@@ -16,12 +16,47 @@ use crate::{
         PairingResponse, Session, derive_pairing_commitment, derive_psk_rotation, derive_route_id,
         generate_client_random, seal_pairing,
     },
-    rest::Relay,
+    rest::{Relay, RequestState},
 };
 
 const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
-pub async fn start_pairing(address: &str) -> Result<(), RequestError> {
+pub struct PairingSas(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairingProgress {
+    Preparing,
+    WaitingForDelivery,
+    WaitingForResponse,
+    Completing,
+    Completed,
+}
+
+impl fmt::Display for PairingSas {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sas = self.0;
+        write!(
+            formatter,
+            "{:04} {:04} {:04}",
+            sas / 100_000_000,
+            sas / 10_000 % 10_000,
+            sas % 10_000,
+        )
+    }
+}
+
+pub async fn start_pairing(address: &str) -> Result<PairingSas, RequestError> {
+    start_pairing_with_progress(address, |_| {}).await
+}
+
+pub async fn start_pairing_with_progress<P>(
+    address: &str,
+    mut progress: P,
+) -> Result<PairingSas, RequestError>
+where
+    P: FnMut(PairingProgress),
+{
+    progress(PairingProgress::Preparing);
     ensure_pairing_absent()?;
     let client_random = generate_client_random().map_err(ProtocolError::from)?;
     let commitment = derive_pairing_commitment(address).map_err(ProtocolError::from)?;
@@ -32,7 +67,16 @@ pub async fn start_pairing(address: &str) -> Result<(), RequestError> {
         version: 1,
         commitment: BASE64_STANDARD.encode(commitment),
     };
-    let response: PairingResponse = relay.request(&request).await?;
+    progress(PairingProgress::WaitingForDelivery);
+    let response: PairingResponse = relay
+        .request_with_state(&request, |state| {
+            progress(match state {
+                RequestState::Pending => PairingProgress::WaitingForDelivery,
+                RequestState::Delivered => PairingProgress::WaitingForResponse,
+            });
+        })
+        .await?;
+    progress(PairingProgress::Completing);
     let contents = PairingContents {
         client_random: BASE64_STANDARD.encode(&client_random),
         hostname: read_trimmed("/etc/hostname"),
@@ -46,12 +90,19 @@ pub async fn start_pairing(address: &str) -> Result<(), RequestError> {
     write_pending_pairing(&pairing)?;
 
     relay.complete(&request, &completion).await?;
-    println!("{}", format_sas(sas));
-
-    Ok(())
+    progress(PairingProgress::Completed);
+    Ok(PairingSas(sas))
 }
 
 pub async fn finish_pairing() -> Result<(), RequestError> {
+    finish_pairing_with_progress(|_| {}).await
+}
+
+pub async fn finish_pairing_with_progress<P>(mut progress: P) -> Result<(), RequestError>
+where
+    P: FnMut(PairingProgress),
+{
+    progress(PairingProgress::Preparing);
     let pairing = read_pending_pairing()?;
     let request_id = Ulid::generate();
     let plaintext = serde_json::to_vec(&FinishPairingRequest {
@@ -63,7 +114,16 @@ pub async fn finish_pairing() -> Result<(), RequestError> {
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
     let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
-    let response = relay.request(&request).await?;
+    progress(PairingProgress::WaitingForDelivery);
+    let response = relay
+        .request_with_state(&request, |state| {
+            progress(match state {
+                RequestState::Pending => PairingProgress::WaitingForDelivery,
+                RequestState::Delivered => PairingProgress::WaitingForResponse,
+            });
+        })
+        .await?;
+    progress(PairingProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(ProtocolError::from)?;
@@ -80,6 +140,7 @@ pub async fn finish_pairing() -> Result<(), RequestError> {
         .map_err(ProtocolError::from)?;
     finish_pending_pairing()?;
     relay.complete(&request, &completion).await?;
+    progress(PairingProgress::Completed);
 
     Ok(())
 }
@@ -130,13 +191,9 @@ pub enum RotationError {
     Protocol(#[from] ProtocolError),
 }
 
+#[cfg(test)]
 fn format_sas(sas: u64) -> String {
-    format!(
-        "{:04} {:04} {:04}",
-        sas / 100_000_000,
-        sas / 10_000 % 10_000,
-        sas % 10_000,
-    )
+    PairingSas(sas).to_string()
 }
 
 #[derive(Serialize)]

@@ -647,10 +647,13 @@ async fn copies_denial_to_completion_without_running_command() {
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty(), "denied command was executed");
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("request denied (POLICY_DENIED): profile is not allowed for this command")
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        concat!(
+            "AGENTKNOCK: The policy denied the credentials request: profile is not allowed for this command\n",
+            "AGENTKNOCK: The command did not start.\n",
+        )
     );
 
     let messages = messages.lock().unwrap();
@@ -714,13 +717,17 @@ async fn retries_pending_states_and_server_errors() {
     assert_eq!(request_attempts.load(Ordering::SeqCst), 20);
     assert_eq!(completion_attempts.load(Ordering::SeqCst), 2);
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("AGENTKNOCK: Credentials request waiting for delivery to phone.\n"));
-    assert!(stderr.contains("AGENTKNOCK: Credentials response received; completing request.\n"));
-    assert!(stderr.contains("AGENTKNOCK: Credentials request completed.\n"));
-    assert!(stderr.contains("AGENTKNOCK: Environment variables received:\n"));
+    assert!(stderr.contains(
+        "AGENTKNOCK: AgentKnock waits for the phone to receive the credentials request.\n"
+    ));
+    assert!(stderr.contains(
+        "AGENTKNOCK: AgentKnock received the credentials response. AgentKnock completes the request.\n"
+    ));
+    assert!(stderr.contains("AGENTKNOCK: AgentKnock completed the credentials request.\n"));
+    assert!(stderr.contains("AGENTKNOCK: AgentKnock received these environment variables:\n"));
     assert!(stderr.contains("AGENTKNOCK: - AGENTKNOCK_RETRY_TEST\n"));
     assert!(!stderr.contains("retried"));
-    assert!(stderr.ends_with("AGENTKNOCK: Executing command: sh.\n"));
+    assert!(stderr.ends_with("AGENTKNOCK: AgentKnock executes the command: sh.\n"));
     assert!(stderr.lines().all(|line| line.starts_with("AGENTKNOCK: ")));
 }
 
@@ -811,7 +818,7 @@ async fn aborts_after_consecutive_server_errors() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("after 10 consecutive failures")
+            .contains("after 10 consecutive errors")
     );
     let messages = messages.lock().unwrap();
     let completion = decrypt_completion(&home.route_private_key, &messages);
@@ -1039,7 +1046,33 @@ fn rejects_pairing_file_with_insecure_permissions() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.starts_with("AGENTKNOCK: "));
-    assert!(stderr.contains("must have mode 0600, found 0644"));
+    assert!(stderr.contains("has mode 0644. Mode 0600 is required"));
+    assert!(stderr.contains("AGENTKNOCK: chmod 600 "));
+}
+
+#[test]
+fn explains_how_to_pair_before_exec() {
+    let home = TestHome::new(0o600);
+    fs::remove_file(home.path().join(".agentknock/pairing.json")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "AGENTKNOCK: AgentKnock is not paired. The command did not start.\n",
+            "AGENTKNOCK: Suggested action: Get a pairing address.\n",
+            "AGENTKNOCK: Suggested action: Run this command:\n",
+            "AGENTKNOCK: agentknock --start-pairing <PAIRING_ADDRESS>\n",
+            "AGENTKNOCK: Suggested action: Complete pairing.\n",
+            "AGENTKNOCK: Suggested action: Run the original command again.\n",
+        )
+    );
 }
 
 #[test]
@@ -1068,6 +1101,6 @@ fn verbose_reports_immediate_progress_with_prefixed_lines() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("AGENTKNOCK: Preparing credentials request.\n"));
+    assert!(stderr.contains("AGENTKNOCK: AgentKnock prepares the credentials request.\n"));
     assert!(stderr.lines().all(|line| line.starts_with("AGENTKNOCK: ")));
 }

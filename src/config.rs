@@ -176,8 +176,11 @@ pub enum ConfigurationError {
     #[error("pairing configuration {path} already exists")]
     PairingExists { path: PathBuf },
 
-    #[error("no pending pairing exists in {path}")]
-    NoPendingPairing { path: PathBuf },
+    #[error("no pairing configuration exists at {path}")]
+    NoPairing { path: PathBuf },
+
+    #[error("pairing in {path} is already active")]
+    PairingNotPending { path: PathBuf },
 
     #[error("pairing in {path} already has a pending PSK rotation")]
     RotationPending { path: PathBuf },
@@ -211,9 +214,19 @@ pub(crate) fn ensure_pairing_absent() -> Result<(), ConfigurationError> {
 fn ensure_pairing_path_absent(path: &Path) -> Result<(), ConfigurationError> {
     match path.try_exists() {
         Ok(false) => Ok(()),
-        Ok(true) => Err(ConfigurationError::PairingExists {
-            path: path.to_owned(),
-        }),
+        Ok(true) => {
+            let pairing = read_pairing_value(path)?;
+            if pairing.get("pending") == Some(&Value::Bool(true)) {
+                Err(ConfigurationError::PairingPending {
+                    path: path.to_owned(),
+                })
+            } else {
+                parse_pairing(path, pairing)?;
+                Err(ConfigurationError::PairingExists {
+                    path: path.to_owned(),
+                })
+            }
+        }
         Err(source) => Err(ConfigurationError::Access {
             path: path.to_owned(),
             source,
@@ -376,7 +389,7 @@ pub(crate) fn pairing_path() -> Result<PathBuf, ConfigurationError> {
 fn read_pending_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
     let (path, pairing) = read_pairing_file()?;
     if pairing.get("pending") != Some(&Value::Bool(true)) {
-        return Err(ConfigurationError::NoPendingPairing { path });
+        return Err(ConfigurationError::PairingNotPending { path });
     }
 
     Ok((path, pairing))
@@ -392,7 +405,7 @@ fn read_pairing_value(path: &Path) -> Result<Value, ConfigurationError> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(ConfigurationError::NoPendingPairing {
+            return Err(ConfigurationError::NoPairing {
                 path: path.to_owned(),
             });
         }
@@ -463,10 +476,20 @@ fn sync_directory(directory: &File, path: &Path) -> Result<(), ConfigurationErro
 }
 
 pub(crate) fn read_pairing_from(path: &Path) -> Result<Pairing, ConfigurationError> {
-    let file = File::open(path).map_err(|source| ConfigurationError::Access {
-        path: path.to_owned(),
-        source,
-    })?;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigurationError::NoPairing {
+                path: path.to_owned(),
+            });
+        }
+        Err(source) => {
+            return Err(ConfigurationError::Access {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
 
     validate_permissions(&file, path)?;
 
