@@ -1,20 +1,26 @@
 use std::{
+    cell::Cell,
     error::Error,
     io,
     process::{Command as ProcessCommand, ExitCode},
+    rc::Rc,
+    time::Duration,
 };
 
 use agentknock::{
-    CredentialRequest, Credentials, RequestOperation, abort_pairing, finish_pairing, start_pairing,
+    CredentialRequest, CredentialRequestProgress, Credentials, RequestOperation, abort_pairing,
+    finish_pairing, start_pairing,
 };
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 
 #[cfg(not(unix))]
 use agentknock::request_credentials;
 #[cfg(unix)]
-use agentknock::request_credentials_until_cancelled;
+use agentknock::request_credentials_with_progress;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+const REQUEST_STATUS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -30,6 +36,14 @@ use std::os::unix::process::CommandExt;
     )
 )]
 struct Cli {
+    /// Suppress all AgentKnock runtime output.
+    #[arg(long, conflicts_with = "verbose", requires = "exec")]
+    quiet: bool,
+
+    /// Report credential request state changes immediately.
+    #[arg(long, conflicts_with = "quiet", requires = "exec")]
+    verbose: bool,
+
     /// Run a command with profiles supplied by AgentKnock.
     #[arg(
         long,
@@ -88,6 +102,13 @@ enum Operation {
     AbortPairing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputMode {
+    Normal,
+    Quiet,
+    Verbose,
+}
+
 fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
     if !address.is_empty()
         && address
@@ -101,6 +122,16 @@ fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
 }
 
 impl Cli {
+    fn output_mode(&self) -> OutputMode {
+        if self.quiet {
+            OutputMode::Quiet
+        } else if self.verbose {
+            OutputMode::Verbose
+        } else {
+            OutputMode::Normal
+        }
+    }
+
     fn into_operation(self) -> Operation {
         if let Some(profiles) = self.exec {
             return Operation::Exec {
@@ -128,17 +159,21 @@ impl Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match run().await {
+    let cli = Cli::parse();
+    let output = cli.output_mode();
+    match run(cli.into_operation(), output).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("agentknock: {error}");
+            if output != OutputMode::Quiet {
+                print_message(&error);
+            }
             ExitCode::FAILURE
         }
     }
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
-    match Cli::parse().into_operation() {
+async fn run(operation: Operation, output: OutputMode) -> Result<(), Box<dyn Error>> {
+    match operation {
         Operation::Exec {
             profiles,
             reason,
@@ -154,21 +189,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 reason: reason.as_deref(),
             };
             #[cfg(unix)]
-            let credentials = {
-                use tokio::signal::unix::{SignalKind, signal};
-
-                let mut interrupt = signal(SignalKind::interrupt())?;
-                let mut terminate = signal(SignalKind::terminate())?;
-                request_credentials_until_cancelled(request, async move {
-                    tokio::select! {
-                        _ = interrupt.recv() => {}
-                        _ = terminate.recv() => {}
-                    }
-                })
-                .await?
-            };
+            let credentials = request_exec_credentials(request, output).await?;
             #[cfg(not(unix))]
             let credentials = request_credentials(request).await?;
+            if output == OutputMode::Verbose {
+                print_received_environment(&credentials);
+                print_message(format_args!("Executing command: {program}."));
+            }
             exec(command, credentials)?;
         }
         Operation::StartPairing(address) => start_pairing(&address).await?,
@@ -177,6 +204,92 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn request_exec_credentials(
+    request: CredentialRequest<'_>,
+    output: OutputMode,
+) -> Result<Credentials, Box<dyn Error>> {
+    use tokio::{
+        signal::unix::{SignalKind, signal},
+        time::{Instant, sleep},
+    };
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let current_progress = Rc::new(Cell::new(None));
+    let observed_progress = Rc::clone(&current_progress);
+    let request = request_credentials_with_progress(
+        request,
+        async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        },
+        move |progress| {
+            let changed = observed_progress.replace(Some(progress)) != Some(progress);
+            if changed && output == OutputMode::Verbose {
+                print_progress(progress);
+            }
+        },
+    );
+    tokio::pin!(request);
+    let heartbeat = sleep(REQUEST_STATUS_INTERVAL);
+    tokio::pin!(heartbeat);
+
+    loop {
+        tokio::select! {
+            biased;
+            result = request.as_mut() => return result.map_err(Into::into),
+            _ = heartbeat.as_mut(), if output != OutputMode::Quiet => {
+                if let Some(progress) = current_progress.get() {
+                    print_progress(progress);
+                }
+                heartbeat.as_mut().reset(Instant::now() + REQUEST_STATUS_INTERVAL);
+            }
+        }
+    }
+}
+
+fn print_progress(progress: CredentialRequestProgress) {
+    print_message(progress_message(progress));
+}
+
+fn print_received_environment(credentials: &Credentials) {
+    let mut names = credentials.environment_variable_names().peekable();
+    if names.peek().is_none() {
+        print_message("No environment variables received.");
+        return;
+    }
+
+    print_message("Environment variables received:");
+    for name in names {
+        print_message(format_args!("- {name}"));
+    }
+}
+
+fn progress_message(progress: CredentialRequestProgress) -> &'static str {
+    match progress {
+        CredentialRequestProgress::Preparing => "Preparing credentials request.",
+        CredentialRequestProgress::WaitingForDelivery => {
+            "Credentials request waiting for delivery to phone."
+        }
+        CredentialRequestProgress::WaitingForResponse => {
+            "Credentials request delivered; waiting for response from phone."
+        }
+        CredentialRequestProgress::Completing => {
+            "Credentials response received; completing request."
+        }
+        CredentialRequestProgress::Completed => "Credentials request completed.",
+    }
+}
+
+fn print_message(message: impl std::fmt::Display) {
+    for line in message.to_string().lines() {
+        eprintln!("AGENTKNOCK: {line}");
+    }
 }
 
 #[cfg(unix)]
@@ -200,7 +313,7 @@ fn exec(_command: Vec<String>, _credentials: Credentials) -> io::Result<()> {
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Operation};
+    use super::{Cli, Operation, OutputMode, progress_message};
 
     #[test]
     fn parses_exec_command() {
@@ -226,6 +339,56 @@ mod tests {
                     .map(String::from)
                     .to_vec(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_output_modes() {
+        let normal =
+            Cli::try_parse_from(["agentknock", "--exec", "profile", "--", "true"]).unwrap();
+        let quiet =
+            Cli::try_parse_from(["agentknock", "--quiet", "--exec", "profile", "--", "true"])
+                .unwrap();
+        let verbose =
+            Cli::try_parse_from(["agentknock", "--verbose", "--exec", "profile", "--", "true"])
+                .unwrap();
+
+        assert_eq!(normal.output_mode(), OutputMode::Normal);
+        assert_eq!(quiet.output_mode(), OutputMode::Quiet);
+        assert_eq!(verbose.output_mode(), OutputMode::Verbose);
+    }
+
+    #[test]
+    fn rejects_quiet_and_verbose_together() {
+        let error = Cli::try_parse_from([
+            "agentknock",
+            "--quiet",
+            "--verbose",
+            "--exec",
+            "profile",
+            "--",
+            "true",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn describes_credential_request_progress() {
+        use agentknock::CredentialRequestProgress::*;
+
+        assert_eq!(
+            progress_message(WaitingForDelivery),
+            "Credentials request waiting for delivery to phone."
+        );
+        assert_eq!(
+            progress_message(WaitingForResponse),
+            "Credentials request delivered; waiting for response from phone."
+        );
+        assert_eq!(
+            progress_message(Completing),
+            "Credentials response received; completing request."
         );
     }
 

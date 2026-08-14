@@ -14,7 +14,7 @@ use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
     pairing::{RotationError, maybe_rotate_psk},
-    rest::{self, Relay},
+    rest::{self, Relay, RequestState},
 };
 
 pub struct CredentialRequest<'a> {
@@ -34,7 +34,20 @@ pub struct Credentials {
     environment: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialRequestProgress {
+    Preparing,
+    WaitingForDelivery,
+    WaitingForResponse,
+    Completing,
+    Completed,
+}
+
 impl Credentials {
+    pub fn environment_variable_names(&self) -> impl Iterator<Item = &str> {
+        self.environment.keys().map(String::as_str)
+    }
+
     pub fn into_environment(self) -> BTreeMap<String, String> {
         self.environment
     }
@@ -138,7 +151,7 @@ impl fmt::Display for DenialReason {
 pub async fn request_credentials(
     request: CredentialRequest<'_>,
 ) -> Result<Credentials, RequestError> {
-    request_credentials_until_cancelled(request, std::future::pending()).await
+    request_credentials_with_progress(request, std::future::pending(), |_| {}).await
 }
 
 pub async fn request_credentials_until_cancelled<C>(
@@ -148,7 +161,20 @@ pub async fn request_credentials_until_cancelled<C>(
 where
     C: Future<Output = ()>,
 {
+    request_credentials_with_progress(request, cancellation, |_| {}).await
+}
+
+pub async fn request_credentials_with_progress<C, P>(
+    request: CredentialRequest<'_>,
+    cancellation: C,
+    mut progress: P,
+) -> Result<Credentials, RequestError>
+where
+    C: Future<Output = ()>,
+    P: FnMut(CredentialRequestProgress),
+{
     tokio::pin!(cancellation);
+    progress(CredentialRequestProgress::Preparing);
     maybe_rotate_psk().map_err(|error| match error {
         RotationError::Configuration(error) => RequestError::Configuration(error),
         RotationError::Protocol(error) => RequestError::Protocol(error),
@@ -165,16 +191,24 @@ where
         },
     };
 
-    message_exchange(&pairing, &request_contents, cancellation.as_mut()).await
+    message_exchange(
+        &pairing,
+        &request_contents,
+        cancellation.as_mut(),
+        &mut progress,
+    )
+    .await
 }
 
-async fn message_exchange<C>(
+async fn message_exchange<C, P>(
     pairing: &Pairing,
     request_contents: &RequestContents<'_>,
     mut cancellation: Pin<&mut C>,
+    progress: &mut P,
 ) -> Result<Credentials, RequestError>
 where
     C: Future<Output = ()> + ?Sized,
+    P: FnMut(CredentialRequestProgress),
 {
     let request_id = Ulid::generate();
     let plaintext = serde_json::to_vec(request_contents).map_err(ProtocolError::from)?;
@@ -185,6 +219,7 @@ where
     let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
 
     let request_started = AtomicBool::new(false);
+    progress(CredentialRequestProgress::WaitingForDelivery);
     let response = match tokio::select! {
         biased;
         _ = cancellation.as_mut() => {
@@ -195,7 +230,12 @@ where
         }
         response = async {
             request_started.store(true, Ordering::Relaxed);
-            relay.request(&request).await
+            relay.request_with_state(&request, |state| {
+                progress(match state {
+                    RequestState::Pending => CredentialRequestProgress::WaitingForDelivery,
+                    RequestState::Delivered => CredentialRequestProgress::WaitingForResponse,
+                });
+            }).await
         } => response,
     } {
         Ok(response) => response,
@@ -216,6 +256,7 @@ where
             return Err(error);
         }
     };
+    progress(CredentialRequestProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(ProtocolError::from)?;
@@ -262,6 +303,7 @@ where
         _ = cancellation.as_mut() => true,
         result = relay.complete(&request, &completion) => {
             result?;
+            progress(CredentialRequestProgress::Completed);
             false
         }
     };

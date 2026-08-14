@@ -56,13 +56,27 @@ impl Relay {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        self.request_with_state(request, |_| {}).await
+    }
+
+    pub(crate) async fn request_with_state<B, R, F>(
+        &self,
+        request: &B,
+        mut state_changed: F,
+    ) -> Result<R, Error>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+        F: FnMut(RequestState),
+    {
         let url = format!("{}/request", self.message_url);
         let body = RequestMessage { request };
 
         loop {
             let response: RequestResponse<R> = self.post(&url, &body, NORMAL_RETRY_POLICY).await?;
             match response.state {
-                MessageState::RequestPending | MessageState::RequestDelivered => {}
+                MessageState::RequestPending => state_changed(RequestState::Pending),
+                MessageState::RequestDelivered => state_changed(RequestState::Delivered),
                 MessageState::ResponsePending | MessageState::ResponseDelivered => {
                     return response.response.ok_or(Error::MissingResponse);
                 }
@@ -202,6 +216,11 @@ impl Relay {
             return serde_json::from_slice(&bytes).map_err(Error::InvalidJson);
         }
     }
+}
+
+pub(crate) enum RequestState {
+    Pending,
+    Delivered,
 }
 
 async fn retry_failure(

@@ -464,6 +464,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         child_id.to_string()
@@ -689,6 +690,7 @@ async fn retries_pending_states_and_server_errors() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .args([
+            "--verbose",
             "--exec",
             "gh-token",
             "--",
@@ -711,6 +713,15 @@ async fn retries_pending_states_and_server_errors() {
     );
     assert_eq!(request_attempts.load(Ordering::SeqCst), 20);
     assert_eq!(completion_attempts.load(Ordering::SeqCst), 2);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("AGENTKNOCK: Credentials request waiting for delivery to phone.\n"));
+    assert!(stderr.contains("AGENTKNOCK: Credentials response received; completing request.\n"));
+    assert!(stderr.contains("AGENTKNOCK: Credentials request completed.\n"));
+    assert!(stderr.contains("AGENTKNOCK: Environment variables received:\n"));
+    assert!(stderr.contains("AGENTKNOCK: - AGENTKNOCK_RETRY_TEST\n"));
+    assert!(!stderr.contains("retried"));
+    assert!(stderr.ends_with("AGENTKNOCK: Executing command: sh.\n"));
+    assert!(stderr.lines().all(|line| line.starts_with("AGENTKNOCK: ")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1026,9 +1037,37 @@ fn rejects_pairing_file_with_insecure_permissions() {
         .unwrap();
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("must have mode 0600, found 0644")
-    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("AGENTKNOCK: "));
+    assert!(stderr.contains("must have mode 0600, found 0644"));
+}
+
+#[test]
+fn quiet_suppresses_agentknock_errors() {
+    let home = TestHome::new(0o644);
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--quiet", "--exec", "gh-token", "--", "true"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn verbose_reports_immediate_progress_with_prefixed_lines() {
+    let home = TestHome::new(0o644);
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--verbose", "--exec", "gh-token", "--", "true"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("AGENTKNOCK: Preparing credentials request.\n"));
+    assert!(stderr.lines().all(|line| line.starts_with("AGENTKNOCK: ")));
 }
