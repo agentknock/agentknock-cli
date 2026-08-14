@@ -80,6 +80,8 @@ where
     progress(PairingProgress::Completing);
     let contents = PairingContents {
         client_random: BASE64_STANDARD.encode(&client_random),
+        platform: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
         hostname: read_trimmed("/etc/hostname"),
         machine_id: read_trimmed("/etc/machine-id"),
         os_version: os_version(),
@@ -301,6 +303,8 @@ enum FinishPairingResult {
 #[derive(Serialize)]
 struct PairingContents {
     client_random: String,
+    platform: &'static str,
+    architecture: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -480,6 +480,8 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         let contents = contents.lock().unwrap();
         let contents = contents.as_ref().unwrap();
         assert_eq!(contents["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(contents["platform"], env::consts::OS);
+        assert_eq!(contents["architecture"], env::consts::ARCH);
         assert_eq!(
             BASE64_STANDARD
                 .decode(contents["client_random"].as_str().unwrap())
