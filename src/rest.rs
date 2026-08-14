@@ -205,7 +205,13 @@ impl Relay {
                     continue;
                 }
             };
-            return serde_json::from_slice(&bytes).map_err(Error::InvalidJson);
+            return match serde_json::from_slice(&bytes).map_err(Error::InvalidJson)? {
+                PostResponse::Message(response) => Ok(response),
+                PostResponse::Error(error) => Err(Error::Unauthenticated {
+                    code: error.error,
+                    message: error.message,
+                }),
+            };
         }
     }
 }
@@ -280,6 +286,20 @@ struct CompletionResponse {
     state: MessageState,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PostResponse<R> {
+    // Fail closed if a response contains both the error and message forms.
+    Error(UnauthenticatedError),
+    Message(R),
+}
+
+#[derive(Deserialize)]
+struct UnauthenticatedError {
+    error: String,
+    message: String,
+}
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum MessageState {
@@ -323,6 +343,9 @@ pub(crate) enum Error {
 
     #[error("relay response state did not include a response message")]
     MissingResponse,
+
+    #[error("received unauthenticated error {code}: {message:?}")]
+    Unauthenticated { code: String, message: String },
 
     #[error("relay remained unavailable after {failures} consecutive failures")]
     RetriesExhausted { failures: usize },

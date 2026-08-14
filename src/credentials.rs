@@ -83,6 +83,9 @@ pub enum RequestError {
     #[error("relay remained unavailable after {failures} consecutive failures")]
     RelayUnavailable { failures: usize },
 
+    #[error("received unauthenticated error {code}: {message:?}")]
+    Unauthenticated { code: String, message: String },
+
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
@@ -405,6 +408,9 @@ impl From<rest::Error> for RequestError {
             rest::Error::InvalidJson(error) => Self::Protocol(ProtocolError::Json(error)),
             rest::Error::UnexpectedStatus(status) => Self::UnexpectedRelayStatus(status),
             rest::Error::RetriesExhausted { failures } => Self::RelayUnavailable { failures },
+            rest::Error::Unauthenticated { code, message } => {
+                Self::Unauthenticated { code, message }
+            }
             rest::Error::UnexpectedState { operation, state } => {
                 Self::Protocol(ProtocolError::UnexpectedMessageState { operation, state })
             }
