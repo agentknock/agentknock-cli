@@ -1,10 +1,11 @@
 use std::{
     env, fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Write as _},
     path::{Path, PathBuf},
 };
 
+use atomic_write_file::AtomicWriteFile;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -190,21 +191,31 @@ pub(crate) fn read_pending_pairing() -> Result<Pairing, ConfigurationError> {
 }
 
 pub(crate) fn ensure_pairing_absent() -> Result<(), ConfigurationError> {
-    let path = pairing_path()?;
+    ensure_pairing_path_absent(&pairing_path()?)
+}
+
+fn ensure_pairing_path_absent(path: &Path) -> Result<(), ConfigurationError> {
     match path.try_exists() {
         Ok(false) => Ok(()),
-        Ok(true) => Err(ConfigurationError::PairingExists { path }),
-        Err(source) => Err(ConfigurationError::Access { path, source }),
+        Ok(true) => Err(ConfigurationError::PairingExists {
+            path: path.to_owned(),
+        }),
+        Err(source) => Err(ConfigurationError::Access {
+            path: path.to_owned(),
+            source,
+        }),
     }
 }
 
 pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), ConfigurationError> {
     let path = pairing_path()?;
-    let directory = path.parent().expect("pairing path has a parent").to_owned();
-    fs::create_dir_all(&directory).map_err(|source| ConfigurationError::Access {
-        path: directory.clone(),
+    let directory_path = path.parent().expect("pairing path has a parent").to_owned();
+    fs::create_dir_all(&directory_path).map_err(|source| ConfigurationError::Access {
+        path: directory_path.clone(),
         source,
     })?;
+    let directory = lock_directory(&directory_path)?;
+    ensure_pairing_path_absent(&path)?;
     let contents = serde_json::to_vec_pretty(&PendingPairingFile {
         pending: true,
         route_id: pairing.route_id,
@@ -216,26 +227,30 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
         path: path.clone(),
         source,
     })?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    let mut options = AtomicWriteFile::options();
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(&path).map_err(|source| {
-        if source.kind() == io::ErrorKind::AlreadyExists {
-            ConfigurationError::PairingExists { path: path.clone() }
-        } else {
-            ConfigurationError::Access {
-                path: path.clone(),
-                source,
-            }
-        }
-    })?;
+    let mut file = options
+        .open(&path)
+        .map_err(|source| ConfigurationError::Access {
+            path: path.clone(),
+            source,
+        })?;
     file.write_all(&contents)
         .and_then(|()| file.write_all(b"\n"))
-        .map_err(|source| ConfigurationError::Access { path, source })
+        .map_err(|source| ConfigurationError::Access {
+            path: path.clone(),
+            source,
+        })?;
+    file.commit()
+        .map_err(|source| ConfigurationError::Access { path, source })?;
+    sync_directory(&directory, &directory_path)
 }
 
 pub(crate) fn clear_rotation(rotation: &Rotation) -> Result<(), ConfigurationError> {
+    let pairing_path = pairing_path()?;
+    let directory_path = pairing_path.parent().expect("pairing path has a parent");
+    let directory = lock_directory(directory_path)?;
     let (path, mut pairing) = read_pairing_file()?;
     let expected =
         serde_json::to_value(rotation).map_err(|source| ConfigurationError::Invalid {
@@ -249,21 +264,30 @@ pub(crate) fn clear_rotation(rotation: &Rotation) -> Result<(), ConfigurationErr
         .as_object_mut()
         .expect("pairing is a JSON object")
         .remove("rotation");
-    write_pairing_file(&path, &pairing)
+    write_pairing_file(&path, &pairing)?;
+    sync_directory(&directory, directory_path)
 }
 
 pub(crate) fn finish_pending_pairing() -> Result<(), ConfigurationError> {
+    let pairing_path = pairing_path()?;
+    let directory_path = pairing_path.parent().expect("pairing path has a parent");
+    let directory = lock_directory(directory_path)?;
     let (path, mut pairing) = read_pending_pairing_file()?;
     pairing
         .as_object_mut()
         .expect("pending pairing is a JSON object")
         .remove("pending");
-    write_pairing_file(&path, &pairing)
+    write_pairing_file(&path, &pairing)?;
+    sync_directory(&directory, directory_path)
 }
 
 pub(crate) fn abort_pending_pairing() -> Result<(), ConfigurationError> {
+    let pairing_path = pairing_path()?;
+    let directory_path = pairing_path.parent().expect("pairing path has a parent");
+    let directory = lock_directory(directory_path)?;
     let (path, _) = read_pending_pairing_file()?;
-    fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })
+    fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })?;
+    sync_directory(&directory, directory_path)
 }
 
 fn pairing_path() -> Result<PathBuf, ConfigurationError> {
@@ -304,9 +328,10 @@ fn write_pairing_file(path: &Path, pairing: &Value) -> Result<(), ConfigurationE
             path: path.to_owned(),
             source,
         })?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
+    let mut options = AtomicWriteFile::options();
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(path)
         .map_err(|source| ConfigurationError::Access {
             path: path.to_owned(),
@@ -314,6 +339,33 @@ fn write_pairing_file(path: &Path, pairing: &Value) -> Result<(), ConfigurationE
         })?;
     file.write_all(&contents)
         .and_then(|()| file.write_all(b"\n"))
+        .map_err(|source| ConfigurationError::Access {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.commit().map_err(|source| ConfigurationError::Access {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn lock_directory(path: &Path) -> Result<File, ConfigurationError> {
+    let directory = File::open(path).map_err(|source| ConfigurationError::Access {
+        path: path.to_owned(),
+        source,
+    })?;
+    directory
+        .lock()
+        .map_err(|source| ConfigurationError::Access {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(directory)
+}
+
+fn sync_directory(directory: &File, path: &Path) -> Result<(), ConfigurationError> {
+    directory
+        .sync_all()
         .map_err(|source| ConfigurationError::Access {
             path: path.to_owned(),
             source,
