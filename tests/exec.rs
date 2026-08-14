@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -76,6 +76,20 @@ struct RetryTestState {
 struct FailedRequestState {
     messages: ReceivedMessages,
     request_attempts: Arc<AtomicUsize>,
+    completion_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct SignalTestState {
+    messages: ReceivedMessages,
+    request_attempts: Arc<AtomicUsize>,
+    completion_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct SignalAfterResponseState {
+    messages: ReceivedMessages,
+    route_private_key: <Kem as KemTrait>::PrivateKey,
     completion_attempts: Arc<AtomicUsize>,
 }
 
@@ -250,6 +264,70 @@ async fn exhaust_request_retries(
         },
         part => panic!("unexpected message part: {part}"),
     }
+}
+
+async fn wait_for_signal(
+    State(state): State<SignalTestState>,
+    Path((route_id, request_id, part)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> AxumResponse {
+    state.messages.lock().unwrap().push(ReceivedMessage {
+        route_id,
+        request_id,
+        part: part.clone(),
+        body,
+    });
+
+    match part.as_str() {
+        "request" => match state.request_attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => Json(json!({"state": "REQUEST_PENDING"})).into_response(),
+            1 => std::future::pending().await,
+            attempt => panic!("unexpected request attempt {attempt}"),
+        },
+        "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
+            1 => Json(json!({"state": "COMPLETION_DELIVERED"})).into_response(),
+            attempt => panic!("unexpected completion attempt {attempt}"),
+        },
+        part => panic!("unexpected message part: {part}"),
+    }
+}
+
+async fn wait_for_signal_after_response(
+    State(state): State<SignalAfterResponseState>,
+    Path((route_id, request_id, part)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> AxumResponse {
+    let response = match part.as_str() {
+        "request" => Json(json!({
+            "state": "RESPONSE_DELIVERED",
+            "response": encrypt_response(
+                &state.route_private_key,
+                &request_id,
+                &body,
+                &json!({
+                    "result": "APPROVED",
+                    "environment": {},
+                }),
+            ),
+        }))
+        .into_response(),
+        "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => std::future::pending().await,
+            1 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
+            2 => Json(json!({"state": "COMPLETION_DELIVERED"})).into_response(),
+            attempt => panic!("unexpected completion attempt {attempt}"),
+        },
+        part => panic!("unexpected message part: {part}"),
+    };
+
+    state.messages.lock().unwrap().push(ReceivedMessage {
+        route_id,
+        request_id,
+        part,
+        body,
+    });
+    response
 }
 
 async fn return_invalid_encrypted_response(
@@ -733,6 +811,164 @@ async fn aborts_after_consecutive_server_errors() {
             .as_str()
             .unwrap()
             .contains("after 10 consecutive failures")
+    );
+}
+
+async fn assert_signal_aborts_credential_request(signal: &str) {
+    let home = TestHome::new(0o600);
+    let messages = ReceivedMessages::default();
+    let request_attempts = Arc::new(AtomicUsize::new(0));
+    let completion_attempts = Arc::new(AtomicUsize::new(0));
+    let state = SignalTestState {
+        messages: messages.clone(),
+        request_attempts: request_attempts.clone(),
+        completion_attempts: completion_attempts.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(wait_for_signal),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    for _ in 0..100 {
+        if request_attempts.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if request_attempts.load(Ordering::SeqCst) != 2 {
+        let _ = child.kill();
+        panic!("credential request did not reach the relay");
+    }
+    let status = Command::new("kill")
+        .args([signal, &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut exit_status = None;
+    for _ in 0..700 {
+        if let Some(status) = child.try_wait().unwrap() {
+            exit_status = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = exit_status.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("agentknock did not exit after receiving {signal}");
+    });
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(!status.success());
+    assert_eq!(completion_attempts.load(Ordering::SeqCst), 2);
+    let messages = messages.lock().unwrap();
+    assert_eq!(
+        decrypt_completion(&home.route_private_key, &messages),
+        json!({
+            "result": "ABORTED",
+            "reason": "CANCELLED",
+            "message": "credential request interrupted",
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigint_aborts_an_outstanding_credential_request() {
+    assert_signal_aborts_credential_request("-INT").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_aborts_an_outstanding_credential_request() {
+    assert_signal_aborts_credential_request("-TERM").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_after_response_finishes_the_existing_completion_without_execing() {
+    let home = TestHome::new(0o600);
+    let messages = ReceivedMessages::default();
+    let completion_attempts = Arc::new(AtomicUsize::new(0));
+    let state = SignalAfterResponseState {
+        messages: messages.clone(),
+        route_private_key: home.route_private_key.clone(),
+        completion_attempts: completion_attempts.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(wait_for_signal_after_response),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--exec", "gh-token", "--", "true"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    for _ in 0..100 {
+        if completion_attempts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if completion_attempts.load(Ordering::SeqCst) != 1 {
+        let _ = child.kill();
+        panic!("credential response did not reach completion delivery");
+    }
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut exit_status = None;
+    for _ in 0..700 {
+        if let Some(status) = child.try_wait().unwrap() {
+            exit_status = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = exit_status.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("agentknock did not exit after receiving SIGINT");
+    });
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(!status.success(), "requested command was executed");
+    assert_eq!(completion_attempts.load(Ordering::SeqCst), 3);
+    let messages = messages.lock().unwrap();
+    assert_eq!(
+        decrypt_completion(&home.route_private_key, &messages),
+        json!({"result": "APPROVED"})
     );
 }
 

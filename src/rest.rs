@@ -7,10 +7,26 @@ use tokio::time::{Instant, sleep};
 
 const RELAY_URL: &str = "https://relay.agentknock.dev/";
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
-const RETRY_DELAY: Duration = Duration::from_secs(1);
-const MAX_CONSECUTIVE_FAILURE_DURATION: Duration = Duration::from_secs(2 * 60);
-const MAX_CONSECUTIVE_FAILURES: usize = 10;
+const NORMAL_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    request_timeout: Duration::from_secs(40),
+    retry_delay: Duration::from_secs(1),
+    failure_timeout: Duration::from_secs(2 * 60),
+    maximum_failures: 10,
+};
+const BRIEF_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    request_timeout: Duration::from_secs(2),
+    retry_delay: Duration::from_millis(250),
+    failure_timeout: Duration::from_secs(5),
+    maximum_failures: 2,
+};
+
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    request_timeout: Duration,
+    retry_delay: Duration,
+    failure_timeout: Duration,
+    maximum_failures: usize,
+}
 
 pub(crate) struct Relay {
     client: reqwest::Client,
@@ -30,9 +46,7 @@ impl Relay {
         );
 
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(HTTP_REQUEST_TIMEOUT)
-                .build()?,
+            client: reqwest::Client::new(),
             message_url,
         })
     }
@@ -46,7 +60,7 @@ impl Relay {
         let body = RequestMessage { request };
 
         loop {
-            let response: RequestResponse<R> = self.post(&url, &body).await?;
+            let response: RequestResponse<R> = self.post(&url, &body, NORMAL_RETRY_POLICY).await?;
             match response.state {
                 MessageState::RequestPending | MessageState::RequestDelivered => {}
                 MessageState::ResponsePending | MessageState::ResponseDelivered => {
@@ -67,6 +81,33 @@ impl Relay {
         B: Serialize + ?Sized,
         C: Serialize + ?Sized,
     {
+        self.complete_with_policy(request, completion, NORMAL_RETRY_POLICY)
+            .await
+    }
+
+    pub(crate) async fn complete_briefly<B, C>(
+        &self,
+        request: &B,
+        completion: &C,
+    ) -> Result<(), Error>
+    where
+        B: Serialize + ?Sized,
+        C: Serialize + ?Sized,
+    {
+        self.complete_with_policy(request, completion, BRIEF_RETRY_POLICY)
+            .await
+    }
+
+    async fn complete_with_policy<B, C>(
+        &self,
+        request: &B,
+        completion: &C,
+        retry_policy: RetryPolicy,
+    ) -> Result<(), Error>
+    where
+        B: Serialize + ?Sized,
+        C: Serialize + ?Sized,
+    {
         let response: CompletionResponse = self
             .post(
                 &format!("{}/complete", self.message_url),
@@ -74,6 +115,7 @@ impl Relay {
                     request,
                     completion,
                 },
+                retry_policy,
             )
             .await?;
 
@@ -86,15 +128,16 @@ impl Relay {
         }
     }
 
-    async fn post<B, R>(&self, url: &str, body: &B) -> Result<R, Error>
+    async fn post<B, R>(&self, url: &str, body: &B, retry_policy: RetryPolicy) -> Result<R, Error>
     where
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
         let mut failures = 0;
-        let failure_deadline = Instant::now() + MAX_CONSECUTIVE_FAILURE_DURATION;
+        let failure_deadline = Instant::now() + retry_policy.failure_timeout;
         loop {
-            let timeout = HTTP_REQUEST_TIMEOUT
+            let timeout = retry_policy
+                .request_timeout
                 .min(failure_deadline.saturating_duration_since(Instant::now()));
             if timeout.is_zero() {
                 return Err(retries_exhausted(failures));
@@ -109,15 +152,27 @@ impl Relay {
             {
                 Ok(response) => response,
                 Err(_) => {
-                    retry_failure(&mut failures, failure_deadline, RETRY_DELAY).await?;
+                    retry_failure(
+                        &mut failures,
+                        failure_deadline,
+                        retry_policy.retry_delay,
+                        retry_policy.maximum_failures,
+                    )
+                    .await?;
                     continue;
                 }
             };
             let status = response.status();
 
             if status.is_server_error() {
-                let delay = retry_after(&response).unwrap_or(RETRY_DELAY);
-                retry_failure(&mut failures, failure_deadline, delay).await?;
+                let delay = retry_after(&response).unwrap_or(retry_policy.retry_delay);
+                retry_failure(
+                    &mut failures,
+                    failure_deadline,
+                    delay,
+                    retry_policy.maximum_failures,
+                )
+                .await?;
                 continue;
             }
             if status.is_client_error() {
@@ -134,7 +189,13 @@ impl Relay {
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    retry_failure(&mut failures, failure_deadline, RETRY_DELAY).await?;
+                    retry_failure(
+                        &mut failures,
+                        failure_deadline,
+                        retry_policy.retry_delay,
+                        retry_policy.maximum_failures,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -147,9 +208,10 @@ async fn retry_failure(
     failures: &mut usize,
     deadline: Instant,
     delay: Duration,
+    maximum_failures: usize,
 ) -> Result<(), Error> {
     *failures += 1;
-    if *failures >= MAX_CONSECUTIVE_FAILURES {
+    if *failures >= maximum_failures {
         return Err(retries_exhausted(*failures));
     }
     let remaining = deadline.saturating_duration_since(Instant::now());

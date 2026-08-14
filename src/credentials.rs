@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -59,6 +65,9 @@ pub enum RequestError {
 
     #[error("pairing was rejected")]
     PairingRejected,
+
+    #[error("credential request interrupted")]
+    Interrupted,
 
     #[error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8")]
     InvalidTestRelayUrl,
@@ -129,6 +138,17 @@ impl fmt::Display for DenialReason {
 pub async fn request_credentials(
     request: CredentialRequest<'_>,
 ) -> Result<Credentials, RequestError> {
+    request_credentials_until_cancelled(request, std::future::pending()).await
+}
+
+pub async fn request_credentials_until_cancelled<C>(
+    request: CredentialRequest<'_>,
+    cancellation: C,
+) -> Result<Credentials, RequestError>
+where
+    C: Future<Output = ()>,
+{
+    tokio::pin!(cancellation);
     maybe_rotate_psk().map_err(|error| match error {
         RotationError::Configuration(error) => RequestError::Configuration(error),
         RotationError::Protocol(error) => RequestError::Protocol(error),
@@ -145,13 +165,17 @@ pub async fn request_credentials(
         },
     };
 
-    message_exchange(&pairing, &request_contents).await
+    message_exchange(&pairing, &request_contents, cancellation.as_mut()).await
 }
 
-async fn message_exchange(
+async fn message_exchange<C>(
     pairing: &Pairing,
     request_contents: &RequestContents<'_>,
-) -> Result<Credentials, RequestError> {
+    mut cancellation: Pin<&mut C>,
+) -> Result<Credentials, RequestError>
+where
+    C: Future<Output = ()> + ?Sized,
+{
     let request_id = Ulid::generate();
     let plaintext = serde_json::to_vec(request_contents).map_err(ProtocolError::from)?;
     let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
@@ -160,19 +184,35 @@ async fn message_exchange(
         .map_err(ProtocolError::from)?;
     let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
 
-    let response = match relay.request(&request).await {
+    let request_started = AtomicBool::new(false);
+    let response = match tokio::select! {
+        biased;
+        _ = cancellation.as_mut() => {
+            if request_started.load(Ordering::Relaxed) {
+                complete_cancelled(&mut session, &relay, &request).await;
+            }
+            return Err(RequestError::Interrupted);
+        }
+        response = async {
+            request_started.store(true, Ordering::Relaxed);
+            relay.request(&request).await
+        } => response,
+    } {
         Ok(response) => response,
         Err(error) => {
             let abort_reason = abort_reason(&error);
             let error = RequestError::from(error);
-            try_complete_aborted(
-                &mut session,
-                &relay,
-                &request,
-                abort_reason,
-                error.to_string(),
-            )
-            .await;
+            let completion = seal_aborted(&mut session, abort_reason, error.to_string());
+            if let Some(completion) = completion {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.as_mut() => {
+                        let _ = relay.complete_briefly(&request, &completion).await;
+                        return Err(RequestError::Interrupted);
+                    }
+                    _ = relay.complete(&request, &completion) => {}
+                }
+            }
             return Err(error);
         }
     };
@@ -217,7 +257,18 @@ async fn message_exchange(
     let completion = session
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
-    relay.complete(&request, &completion).await?;
+    let interrupted = tokio::select! {
+        biased;
+        _ = cancellation.as_mut() => true,
+        result = relay.complete(&request, &completion) => {
+            result?;
+            false
+        }
+    };
+    if interrupted {
+        let _ = relay.complete_briefly(&request, &completion).await;
+        return Err(RequestError::Interrupted);
+    }
 
     exchange_result
 }
@@ -236,20 +287,26 @@ fn abort_reason(error: &rest::Error) -> AbortReason {
     }
 }
 
-async fn try_complete_aborted(
+fn seal_aborted(
     session: &mut Session,
-    relay: &Relay,
-    request: &crypto::Request,
     reason: AbortReason,
     message: String,
-) {
+) -> Option<crypto::Completion> {
     let Ok(plaintext) = serde_json::to_vec(&RequestResult::Aborted { reason, message }) else {
+        return None;
+    };
+    session.seal_completion(&plaintext).ok()
+}
+
+async fn complete_cancelled(session: &mut Session, relay: &Relay, request: &crypto::Request) {
+    let Some(completion) = seal_aborted(
+        session,
+        AbortReason::Cancelled,
+        RequestError::Interrupted.to_string(),
+    ) else {
         return;
     };
-    let Ok(completion) = session.seal_completion(&plaintext) else {
-        return;
-    };
-    let _ = relay.complete(request, &completion).await;
+    let _ = relay.complete_briefly(request, &completion).await;
 }
 
 impl From<crypto::Error> for ProtocolError {

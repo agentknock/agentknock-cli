@@ -5,11 +5,14 @@ use std::{
 };
 
 use agentknock::{
-    CredentialRequest, Credentials, RequestOperation, abort_pairing, finish_pairing,
-    request_credentials, start_pairing,
+    CredentialRequest, Credentials, RequestOperation, abort_pairing, finish_pairing, start_pairing,
 };
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 
+#[cfg(not(unix))]
+use agentknock::request_credentials;
+#[cfg(unix)]
+use agentknock::request_credentials_until_cancelled;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -142,15 +145,30 @@ async fn run() -> Result<(), Box<dyn Error>> {
             command,
         } => {
             let (program, arguments) = command.split_first().expect("command is required");
-            let credentials = request_credentials(CredentialRequest {
+            let request = CredentialRequest {
                 profiles: &profiles,
                 operation: RequestOperation::Exec {
                     command: program,
                     arguments,
                 },
                 reason: reason.as_deref(),
-            })
-            .await?;
+            };
+            #[cfg(unix)]
+            let credentials = {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                let mut interrupt = signal(SignalKind::interrupt())?;
+                let mut terminate = signal(SignalKind::terminate())?;
+                request_credentials_until_cancelled(request, async move {
+                    tokio::select! {
+                        _ = interrupt.recv() => {}
+                        _ = terminate.recv() => {}
+                    }
+                })
+                .await?
+            };
+            #[cfg(not(unix))]
+            let credentials = request_credentials(request).await?;
             exec(command, credentials)?;
         }
         Operation::StartPairing(address) => start_pairing(&address).await?,
