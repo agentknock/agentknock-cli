@@ -7,6 +7,7 @@ use ulid::Ulid;
 use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
+    pairing::{RotationError, maybe_rotate_psk},
     rest::{self, Relay},
 };
 
@@ -125,6 +126,10 @@ impl fmt::Display for DenialReason {
 pub async fn request_credentials(
     request: CredentialRequest<'_>,
 ) -> Result<Credentials, RequestError> {
+    maybe_rotate_psk().map_err(|error| match error {
+        RotationError::Configuration(error) => RequestError::Configuration(error),
+        RotationError::Protocol(error) => RequestError::Protocol(error),
+    })?;
     let pairing = read_pairing()?;
     let request_contents = match request.operation {
         RequestOperation::Exec { command, arguments } => RequestContents {

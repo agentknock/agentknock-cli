@@ -10,6 +10,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -96,6 +97,10 @@ impl TestHome {
                 "pairing_id": PAIRING_ID,
                 "pairing_psk": BASE64_STANDARD.encode(PAIRING_PSK),
                 "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+                "rotated_at": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
             }),
         )
         .unwrap();

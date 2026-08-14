@@ -9,4 +9,6 @@ pub use credentials::{
     CredentialRequest, Credentials, DenialReason, ProtocolError, RequestError, RequestOperation,
     request_credentials,
 };
-pub use pairing::{RotationError, abort_pairing, finish_pairing, rotate_psk, start_pairing};
+pub use pairing::{
+    RotationError, abort_pairing, finish_pairing, maybe_rotate_psk, rotate_psk, start_pairing,
+};

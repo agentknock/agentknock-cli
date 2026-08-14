@@ -8,8 +8,9 @@ use ulid::Ulid;
 use crate::{
     ConfigurationError, ProtocolError, RequestError,
     config::{
-        abort_pending_pairing, ensure_pairing_absent, finish_pending_pairing,
-        lock_pairing_for_rotation, pairing_path, read_pending_pairing, write_pending_pairing,
+        LockedPairing, abort_pending_pairing, current_timestamp, ensure_pairing_absent,
+        finish_pending_pairing, lock_pairing_for_rotation, lock_pairing_if_rotated_before,
+        pairing_path, read_pairing_from, read_pending_pairing, write_pending_pairing,
     },
     crypto::{
         PairingResponse, Session, derive_pairing_commitment, derive_psk_rotation, derive_route_id,
@@ -17,6 +18,8 @@ use crate::{
     },
     rest::Relay,
 };
+
+const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
 pub async fn start_pairing(address: &str) -> Result<(), RequestError> {
     ensure_pairing_absent()?;
@@ -86,13 +89,35 @@ pub fn abort_pairing() -> Result<(), ConfigurationError> {
 }
 
 pub fn rotate_psk() -> Result<(), RotationError> {
-    rotate_psk_at(&pairing_path()?)
+    rotate_psk_at(&pairing_path()?, current_timestamp()?)
 }
 
-fn rotate_psk_at(path: &Path) -> Result<(), RotationError> {
+fn rotate_psk_at(path: &Path, rotated_at: u64) -> Result<(), RotationError> {
     let pairing = lock_pairing_for_rotation(path)?;
+    rotate_locked(pairing, rotated_at)
+}
+
+pub fn maybe_rotate_psk() -> Result<bool, RotationError> {
+    maybe_rotate_psk_at(&pairing_path()?, current_timestamp()?)
+}
+
+fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RotationError> {
+    let rotated_before = now.saturating_sub(PSK_ROTATION_INTERVAL_SECONDS);
+    let pairing = read_pairing_from(path)?;
+    if pairing.rotation_key().is_some() || !pairing.rotated_before(rotated_before) {
+        return Ok(false);
+    }
+
+    let Some(pairing) = lock_pairing_if_rotated_before(path, rotated_before)? else {
+        return Ok(false);
+    };
+    rotate_locked(pairing, now)?;
+    Ok(true)
+}
+
+fn rotate_locked(pairing: LockedPairing, rotated_at: u64) -> Result<(), RotationError> {
     let rotation = derive_psk_rotation(pairing.pairing()).map_err(ProtocolError::from)?;
-    pairing.write_rotation(&rotation.pairing_psk, &rotation.rotation_key)?;
+    pairing.write_rotation(&rotation.pairing_psk, &rotation.rotation_key, rotated_at)?;
     Ok(())
 }
 
@@ -189,7 +214,7 @@ mod tests {
     use ulid::Ulid;
 
     #[cfg(unix)]
-    use super::{RotationError, rotate_psk_at};
+    use super::{PSK_ROTATION_INTERVAL_SECONDS, RotationError, maybe_rotate_psk_at, rotate_psk_at};
     #[cfg(unix)]
     use crate::ConfigurationError;
 
@@ -210,6 +235,7 @@ mod tests {
         const PAIRING_ID: &str = "ffeeddccbbaa99887766554433221100";
         const OLD_PSK: [u8; 32] = [0x42; 32];
         const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
+        const NOW: u64 = 2_000_000_000;
 
         let directory = TestDirectory::new();
         let path = directory.path.join("pairing.json");
@@ -227,16 +253,35 @@ mod tests {
                 "pairing_id": PAIRING_ID,
                 "pairing_psk": BASE64_STANDARD.encode(OLD_PSK),
                 "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+                "rotated_at": NOW - PSK_ROTATION_INTERVAL_SECONDS,
             }),
         )
         .unwrap();
         file.write_all(b"\n").unwrap();
         drop(file);
 
-        rotate_psk_at(&path).unwrap();
+        assert!(!maybe_rotate_psk_at(&path, NOW).unwrap());
+        assert!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap())
+                .unwrap()
+                .get("rotation_key")
+                .is_none()
+        );
+
+        let first_path = path.clone();
+        let second_path = path.clone();
+        let first = std::thread::spawn(move || maybe_rotate_psk_at(&first_path, NOW + 1));
+        let second = std::thread::spawn(move || maybe_rotate_psk_at(&second_path, NOW + 1));
+        let mut results = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+        results.sort_unstable();
+        assert_eq!(results, [false, true]);
 
         let contents = fs::read(&path).unwrap();
         let pairing: Value = serde_json::from_slice(&contents).unwrap();
+        assert_eq!(pairing["rotated_at"], NOW + 1);
         let rotation_key = BASE64_STANDARD
             .decode(pairing["rotation_key"].as_str().unwrap())
             .unwrap();
@@ -268,7 +313,7 @@ mod tests {
         );
 
         assert!(matches!(
-            rotate_psk_at(&path),
+            rotate_psk_at(&path, NOW + 2),
             Err(RotationError::Configuration(
                 ConfigurationError::RotationPending { .. }
             ))

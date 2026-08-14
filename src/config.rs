@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, Write as _},
     path::{Path, PathBuf},
+    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 use atomic_write_file::AtomicWriteFile;
@@ -24,6 +25,7 @@ pub(crate) struct Pairing {
     pairing_psk: Vec<u8>,
     #[serde(deserialize_with = "deserialize_base64")]
     route_key: Vec<u8>,
+    rotated_at: u64,
     #[serde(default)]
     rotation_key: Option<String>,
 }
@@ -73,6 +75,10 @@ impl Pairing {
 
     pub(crate) fn rotation_key(&self) -> Option<&str> {
         self.rotation_key.as_deref()
+    }
+
+    pub(crate) fn rotated_before(&self, timestamp: u64) -> bool {
+        self.rotated_at < timestamp
     }
 }
 
@@ -175,6 +181,9 @@ pub enum ConfigurationError {
 
     #[error("pairing in {path} already has a pending PSK rotation")]
     RotationPending { path: PathBuf },
+
+    #[error("system clock is before the Unix epoch: {0}")]
+    InvalidSystemTime(#[from] SystemTimeError),
 }
 
 pub(crate) fn read_pairing() -> Result<Pairing, ConfigurationError> {
@@ -221,12 +230,14 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
     })?;
     let directory = lock_directory(&directory_path)?;
     ensure_pairing_path_absent(&path)?;
+    let rotated_at = current_timestamp()?;
     let contents = serde_json::to_vec_pretty(&PendingPairingFile {
         pending: true,
         route_id: pairing.route_id,
         pairing_id: pairing.pairing_id,
         pairing_psk: &pairing.pairing_psk,
         route_key: &pairing.route_key,
+        rotated_at,
     })
     .map_err(|source| ConfigurationError::Invalid {
         path: path.clone(),
@@ -269,15 +280,36 @@ pub(crate) fn clear_rotation_key(rotation_key: &str) -> Result<(), Configuration
 }
 
 pub(crate) fn lock_pairing_for_rotation(path: &Path) -> Result<LockedPairing, ConfigurationError> {
-    let directory_path = path.parent().expect("pairing path has a parent");
-    let directory = lock_directory(directory_path)?;
-    let contents = read_pairing_value(path)?;
-    let pairing = parse_pairing(path, contents.clone())?;
-    if pairing.rotation_key.is_some() {
+    let pairing = lock_pairing(path)?;
+    if pairing.pairing.rotation_key.is_some() {
         return Err(ConfigurationError::RotationPending {
             path: path.to_owned(),
         });
     }
+
+    Ok(pairing)
+}
+
+pub(crate) fn lock_pairing_if_rotated_before(
+    path: &Path,
+    timestamp: u64,
+) -> Result<Option<LockedPairing>, ConfigurationError> {
+    let pairing = lock_pairing(path)?;
+    if pairing.pairing.rotation_key.is_some() {
+        return Ok(None);
+    }
+    if !pairing.pairing.rotated_before(timestamp) {
+        return Ok(None);
+    }
+
+    Ok(Some(pairing))
+}
+
+fn lock_pairing(path: &Path) -> Result<LockedPairing, ConfigurationError> {
+    let directory_path = path.parent().expect("pairing path has a parent");
+    let directory = lock_directory(directory_path)?;
+    let contents = read_pairing_value(path)?;
+    let pairing = parse_pairing(path, contents.clone())?;
 
     Ok(LockedPairing {
         path: path.to_owned(),
@@ -297,6 +329,7 @@ impl LockedPairing {
         mut self,
         pairing_psk: &[u8],
         rotation_key: &str,
+        rotated_at: u64,
     ) -> Result<(), ConfigurationError> {
         let pairing = self
             .contents
@@ -307,6 +340,7 @@ impl LockedPairing {
             BASE64_STANDARD.encode(pairing_psk).into(),
         );
         pairing.insert("rotation_key".into(), rotation_key.into());
+        pairing.insert("rotated_at".into(), rotated_at.into());
         write_pairing_file(&self.path, &self.contents)?;
         sync_directory(&self.directory, &self.directory_path)
     }
@@ -428,7 +462,7 @@ fn sync_directory(directory: &File, path: &Path) -> Result<(), ConfigurationErro
         })
 }
 
-fn read_pairing_from(path: &Path) -> Result<Pairing, ConfigurationError> {
+pub(crate) fn read_pairing_from(path: &Path) -> Result<Pairing, ConfigurationError> {
     let file = File::open(path).map_err(|source| ConfigurationError::Access {
         path: path.to_owned(),
         source,
@@ -509,6 +543,11 @@ struct PendingPairingFile<'a> {
     pairing_psk: &'a [u8],
     #[serde(serialize_with = "serialize_base64")]
     route_key: &'a [u8],
+    rotated_at: u64,
+}
+
+pub(crate) fn current_timestamp() -> Result<u64, ConfigurationError> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
 fn serialize_base64<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>

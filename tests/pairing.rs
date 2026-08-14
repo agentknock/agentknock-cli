@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -98,6 +99,7 @@ impl TestHome {
                 "pairing_id": PAIRING_ID,
                 "pairing_psk": BASE64_STANDARD.encode(pairing_psk),
                 "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+                "rotated_at": 1_700_000_000,
             }))
             .unwrap(),
         )
@@ -352,12 +354,14 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         axum::serve(listener, app).await.unwrap();
     });
 
+    let before_pairing = unix_timestamp();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .args(["--start-pairing", "yup-its-free"])
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
         .env("HOME", home.path())
         .output()
         .unwrap();
+    let after_pairing = unix_timestamp();
 
     let repeated_start = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .args(["--start-pairing", "yup-its-free"])
@@ -451,6 +455,7 @@ async fn starts_and_finishes_pairing_message_exchanges() {
     assert_eq!(pairing["route_id"], ROUTE_ID);
     assert_eq!(pairing["pairing_id"], PAIRING_ID);
     assert_eq!(pairing["route_key"], encoded_route_key);
+    assert!((before_pairing..=after_pairing).contains(&pairing["rotated_at"].as_u64().unwrap()));
     assert_eq!(
         BASE64_STANDARD
             .decode(pairing["pairing_psk"].as_str().unwrap())
@@ -621,4 +626,11 @@ fn aborts_pending_pairing_without_removing_directory() {
             .unwrap()
             .contains("no pending pairing exists")
     );
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }

@@ -350,6 +350,7 @@ mod tests {
             "pairing_id": "ffeeddccbbaa99887766554433221100",
             "pairing_psk": BASE64_STANDARD.encode([0x42; 32]),
             "route_key": BASE64_STANDARD.encode(route_key.to_bytes()),
+            "rotated_at": 1_700_000_000,
         }))
         .unwrap();
 
