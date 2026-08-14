@@ -171,9 +171,7 @@ async fn receive_message(
                 &state.response,
             )
         }),
-        "complete" => json!({
-            "state": "COMPLETION_DELIVERED"
-        }),
+        "complete" => json!({}),
         part => panic!("unexpected message part: {part}"),
     };
 
@@ -215,11 +213,7 @@ async fn receive_message_with_retries(
         },
         "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
             0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
-            1 => (
-                StatusCode::ACCEPTED,
-                Json(json!({"state": "COMPLETION_PENDING"})),
-            )
-                .into_response(),
+            1 => (StatusCode::ACCEPTED, Json(json!({}))).into_response(),
             attempt => panic!("unexpected completion attempt {attempt}"),
         },
         part => panic!("unexpected message part: {part}"),
@@ -287,7 +281,7 @@ async fn exhaust_request_retries(
         }
         "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
             0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
-            1 => Json(json!({"state": "COMPLETION_DELIVERED"})).into_response(),
+            1 => Json(json!({})).into_response(),
             attempt => panic!("unexpected completion attempt {attempt}"),
         },
         part => panic!("unexpected message part: {part}"),
@@ -314,7 +308,7 @@ async fn wait_for_signal(
         },
         "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
             0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
-            1 => Json(json!({"state": "COMPLETION_DELIVERED"})).into_response(),
+            1 => Json(json!({})).into_response(),
             attempt => panic!("unexpected completion attempt {attempt}"),
         },
         part => panic!("unexpected message part: {part}"),
@@ -343,7 +337,7 @@ async fn wait_for_signal_after_response(
         "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
             0 => std::future::pending().await,
             1 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
-            2 => Json(json!({"state": "COMPLETION_DELIVERED"})).into_response(),
+            2 => Json(json!({})).into_response(),
             attempt => panic!("unexpected completion attempt {attempt}"),
         },
         part => panic!("unexpected message part: {part}"),

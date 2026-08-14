@@ -219,7 +219,7 @@ async fn receive_message(
                 sas % 10_000,
             ));
 
-            json!({"state": "COMPLETION_DELIVERED"})
+            json!({})
         }
         "complete" => {
             let pairing_psk = state.pairing_psk.lock().unwrap().clone().unwrap();
@@ -232,7 +232,7 @@ async fn receive_message(
             );
             *state.finish_completion.lock().unwrap() = Some(completion);
 
-            json!({"state": "COMPLETION_DELIVERED"})
+            json!({})
         }
         part => panic!("unexpected message part: {part}"),
     };

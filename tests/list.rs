@@ -143,7 +143,7 @@ async fn receive_message(
                 .unwrap();
             let plaintext = receiver_context.open(&ciphertext, b"").unwrap();
             *state.completion.lock().unwrap() = Some(serde_json::from_slice(&plaintext).unwrap());
-            Json(json!({"state": "COMPLETION_DELIVERED"}))
+            Json(json!({}))
         }
         part => panic!("unexpected message part: {part}"),
     }

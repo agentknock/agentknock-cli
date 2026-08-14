@@ -116,12 +116,6 @@ pub enum ProtocolError {
         state: &'static str,
     },
 
-    #[error("relay returned {state} for {operation}")]
-    UnexpectedMessageState {
-        operation: &'static str,
-        state: &'static str,
-    },
-
     #[error("invalid base64 in encrypted response: {0}")]
     Base64(#[from] base64::DecodeError),
 
@@ -410,9 +404,6 @@ impl From<rest::Error> for RequestError {
             rest::Error::RetriesExhausted { failures } => Self::RelayUnavailable { failures },
             rest::Error::Unauthenticated { code, message } => {
                 Self::Unauthenticated { code, message }
-            }
-            rest::Error::UnexpectedState { operation, state } => {
-                Self::Protocol(ProtocolError::UnexpectedMessageState { operation, state })
             }
             rest::Error::MissingResponse => Self::Protocol(ProtocolError::MissingResponse),
             rest::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,

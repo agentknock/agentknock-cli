@@ -74,12 +74,6 @@ impl Relay {
                 MessageState::ResponsePending | MessageState::ResponseDelivered => {
                     return response.response.ok_or(Error::MissingResponse);
                 }
-                state => {
-                    return Err(Error::UnexpectedState {
-                        operation: "request",
-                        state: state.name(),
-                    });
-                }
             }
         }
     }
@@ -116,7 +110,7 @@ impl Relay {
         B: Serialize + ?Sized,
         C: Serialize + ?Sized,
     {
-        let response: CompletionResponse = self
+        let _: CompletionResponse = self
             .post(
                 &format!("{}/complete", self.message_url),
                 &CompletionMessage {
@@ -128,13 +122,7 @@ impl Relay {
             )
             .await?;
 
-        match response.state {
-            MessageState::CompletionPending | MessageState::CompletionDelivered => Ok(()),
-            state => Err(Error::UnexpectedState {
-                operation: "completion",
-                state: state.name(),
-            }),
-        }
+        Ok(())
     }
 
     async fn post<B, R>(
@@ -291,9 +279,8 @@ struct CompletionMessage<'a, B: ?Sized, C: ?Sized> {
 }
 
 #[derive(Deserialize)]
-struct CompletionResponse {
-    state: MessageState,
-}
+#[serde(deny_unknown_fields)]
+struct CompletionResponse {}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -316,21 +303,6 @@ enum MessageState {
     RequestDelivered,
     ResponsePending,
     ResponseDelivered,
-    CompletionPending,
-    CompletionDelivered,
-}
-
-impl MessageState {
-    fn name(self) -> &'static str {
-        match self {
-            Self::RequestPending => "REQUEST_PENDING",
-            Self::RequestDelivered => "REQUEST_DELIVERED",
-            Self::ResponsePending => "RESPONSE_PENDING",
-            Self::ResponseDelivered => "RESPONSE_DELIVERED",
-            Self::CompletionPending => "COMPLETION_PENDING",
-            Self::CompletionDelivered => "COMPLETION_DELIVERED",
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -343,12 +315,6 @@ pub(crate) enum Error {
 
     #[error("relay returned unexpected HTTP status {0}")]
     UnexpectedStatus(u16),
-
-    #[error("relay returned {state} for {operation}")]
-    UnexpectedState {
-        operation: &'static str,
-        state: &'static str,
-    },
 
     #[error("relay response state did not include a response message")]
     MissingResponse,
