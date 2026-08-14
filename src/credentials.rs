@@ -53,6 +53,9 @@ pub enum RequestError {
         message: String,
     },
 
+    #[error("pairing was rejected")]
+    PairingRejected,
+
     #[error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8")]
     InvalidTestRelayUrl,
 }
@@ -125,6 +128,7 @@ pub async fn request_credentials(
     let pairing = read_pairing()?;
     let request_contents = match request.operation {
         RequestOperation::Exec { command, arguments } => RequestContents {
+            method: "CredentialRequest",
             profiles: request.profiles,
             operation: "exec",
             command,
@@ -224,6 +228,7 @@ impl From<rest::Error> for RequestError {
 
 #[derive(Serialize)]
 struct RequestContents<'a> {
+    method: &'static str,
     profiles: &'a [String],
     operation: &'static str,
     command: &'a str,

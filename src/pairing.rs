@@ -1,17 +1,18 @@
 use std::{fs, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
     ConfigurationError, ProtocolError, RequestError,
     config::{
-        abort_pending_pairing, ensure_pairing_absent, finish_pending_pairing, write_pending_pairing,
+        abort_pending_pairing, ensure_pairing_absent, finish_pending_pairing, read_pending_pairing,
+        write_pending_pairing,
     },
     crypto::{
-        PairingResponse, derive_pairing_commitment, derive_route_id, generate_client_random,
-        seal_pairing,
+        PairingResponse, Session, derive_pairing_commitment, derive_route_id,
+        generate_client_random, seal_pairing,
     },
     rest::Relay,
 };
@@ -46,8 +47,37 @@ pub async fn start_pairing(address: &str) -> Result<(), RequestError> {
     Ok(())
 }
 
-pub fn finish_pairing() -> Result<(), ConfigurationError> {
-    finish_pending_pairing()
+pub async fn finish_pairing() -> Result<(), RequestError> {
+    let pairing = read_pending_pairing()?;
+    let request_id = Ulid::generate();
+    let plaintext = serde_json::to_vec(&FinishPairingRequest {
+        method: "FinishPairing",
+    })
+    .map_err(ProtocolError::from)?;
+    let mut session = Session::new(&pairing, &request_id).map_err(ProtocolError::from)?;
+    let request = session
+        .seal_request(&plaintext)
+        .map_err(ProtocolError::from)?;
+    let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
+    let response = relay.request(&request).await?;
+    let plaintext = session
+        .open_response(response)
+        .map_err(ProtocolError::from)?;
+    let result: FinishPairingResult =
+        serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
+    if result == FinishPairingResult::Rejected {
+        return Err(RequestError::PairingRejected);
+    }
+
+    let plaintext =
+        serde_json::to_vec(&FinishPairingResult::Accepted).map_err(ProtocolError::from)?;
+    let completion = session
+        .seal_completion(&plaintext)
+        .map_err(ProtocolError::from)?;
+    finish_pending_pairing()?;
+    relay.complete(&request, &completion).await?;
+
+    Ok(())
 }
 
 pub fn abort_pairing() -> Result<(), ConfigurationError> {
@@ -67,6 +97,18 @@ fn format_sas(sas: u64) -> String {
 struct PairingRequest {
     version: u8,
     commitment: String,
+}
+
+#[derive(Serialize)]
+struct FinishPairingRequest {
+    method: &'static str,
+}
+
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
+enum FinishPairingResult {
+    Accepted,
+    Rejected,
 }
 
 #[derive(Serialize)]

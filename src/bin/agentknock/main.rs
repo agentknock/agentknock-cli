@@ -154,7 +154,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             exec(command, credentials)?;
         }
         Operation::StartPairing(address) => start_pairing(&address).await?,
-        Operation::FinishPairing => finish_pairing()?,
+        Operation::FinishPairing => finish_pairing().await?,
         Operation::AbortPairing => abort_pairing()?,
     }
 

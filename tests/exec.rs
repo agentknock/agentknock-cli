@@ -326,6 +326,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     assert_eq!(
         request_plaintext,
         json!({
+            "method": "CredentialRequest",
             "profiles": ["gh-token", "cf-wrangler"],
             "operation": "exec",
             "command": "sh",

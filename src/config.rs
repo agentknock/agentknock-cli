@@ -163,6 +163,20 @@ pub(crate) fn read_pairing() -> Result<Pairing, ConfigurationError> {
     read_pairing_from(&pairing_path()?)
 }
 
+pub(crate) fn read_pending_pairing() -> Result<Pairing, ConfigurationError> {
+    let (path, contents) = read_pending_pairing_file()?;
+    let pairing: Pairing =
+        serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
+            path: path.clone(),
+            source,
+        })?;
+    if pairing.pairing_psk.is_empty() {
+        return Err(ConfigurationError::EmptyPsk { path });
+    }
+
+    Ok(pairing)
+}
+
 pub(crate) fn ensure_pairing_absent() -> Result<(), ConfigurationError> {
     let path = pairing_path()?;
     match path.try_exists() {
@@ -210,7 +224,7 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
 }
 
 pub(crate) fn finish_pending_pairing() -> Result<(), ConfigurationError> {
-    let (path, mut pairing) = read_pending_pairing()?;
+    let (path, mut pairing) = read_pending_pairing_file()?;
     pairing
         .as_object_mut()
         .expect("pending pairing is a JSON object")
@@ -234,7 +248,7 @@ pub(crate) fn finish_pending_pairing() -> Result<(), ConfigurationError> {
 }
 
 pub(crate) fn abort_pending_pairing() -> Result<(), ConfigurationError> {
-    let (path, _) = read_pending_pairing()?;
+    let (path, _) = read_pending_pairing_file()?;
     fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })
 }
 
@@ -243,7 +257,7 @@ fn pairing_path() -> Result<PathBuf, ConfigurationError> {
     Ok(PathBuf::from(home).join(".agentknock/pairing.json"))
 }
 
-fn read_pending_pairing() -> Result<(PathBuf, Value), ConfigurationError> {
+fn read_pending_pairing_file() -> Result<(PathBuf, Value), ConfigurationError> {
     let path = pairing_path()?;
     let file = match File::open(&path) {
         Ok(file) => file,
