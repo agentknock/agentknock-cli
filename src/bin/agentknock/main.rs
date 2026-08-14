@@ -9,8 +9,9 @@ use std::{
 
 use agentknock::{
     ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
-    PairingProgress, PairingSas, RequestError, RequestOperation, UnpairError, abort_pairing,
-    finish_pairing_with_progress, force_unpair, start_pairing_with_progress, unpair_with_progress,
+    PairingProgress, PairingSas, ProfileListProgress, Profiles, RequestError, RequestOperation,
+    UnpairError, ValueSource, abort_pairing, finish_pairing_with_progress, force_unpair,
+    list_profiles_with_progress, start_pairing_with_progress, unpair_with_progress,
 };
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 
@@ -39,6 +40,7 @@ const REQUEST_STATUS_INTERVAL: Duration = Duration::from_secs(30);
                 "finish_pairing",
                 "abort_pairing",
                 "unpair",
+                "list",
             ])
     )
 )]
@@ -95,6 +97,10 @@ struct Cli {
     #[arg(long, requires = "unpair")]
     force: bool,
 
+    /// List the profiles available from the paired phone.
+    #[arg(long)]
+    list: bool,
+
     /// Command and arguments that AgentKnock runs.
     #[arg(
         last = true,
@@ -118,6 +124,7 @@ enum Operation {
     Unpair {
         force: bool,
     },
+    List,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +151,7 @@ enum CommandError {
     AbortPairing(ConfigurationError),
     ForceUnpair(ConfigurationError),
     Unpair(UnpairError),
+    List(RequestError),
 }
 
 fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
@@ -192,6 +200,10 @@ impl Cli {
 
         if self.unpair {
             return Operation::Unpair { force: self.force };
+        }
+
+        if self.list {
+            return Operation::List;
         }
 
         unreachable!("clap requires exactly one operation")
@@ -268,6 +280,10 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 println!("AgentKnock unpaired this installation.");
             }
         }
+        Operation::List => {
+            let profiles = list_profiles_for_cli().await.map_err(CommandError::List)?;
+            print_profiles(&profiles);
+        }
     }
 
     Ok(())
@@ -279,7 +295,10 @@ async fn start_pairing_for_cli(address: &str) -> Result<PairingSas, RequestError
     let request = start_pairing_with_progress(address, move |current| {
         observed_progress.set(Some(current));
     });
-    monitor_pairing(request, progress, PairingOperation::Start).await
+    monitor_operation(request, progress, move |progress| {
+        pairing_progress_message(PairingOperation::Start, progress)
+    })
+    .await
 }
 
 async fn finish_pairing_for_cli() -> Result<(), RequestError> {
@@ -288,7 +307,10 @@ async fn finish_pairing_for_cli() -> Result<(), RequestError> {
     let request = finish_pairing_with_progress(move |current| {
         observed_progress.set(Some(current));
     });
-    monitor_pairing(request, progress, PairingOperation::Finish).await
+    monitor_operation(request, progress, move |progress| {
+        pairing_progress_message(PairingOperation::Finish, progress)
+    })
+    .await
 }
 
 async fn unpair_for_cli() -> Result<(), UnpairError> {
@@ -297,16 +319,30 @@ async fn unpair_for_cli() -> Result<(), UnpairError> {
     let request = unpair_with_progress(move |current| {
         observed_progress.set(Some(current));
     });
-    monitor_pairing(request, progress, PairingOperation::Unpair).await
+    monitor_operation(request, progress, move |progress| {
+        pairing_progress_message(PairingOperation::Unpair, progress)
+    })
+    .await
 }
 
-async fn monitor_pairing<T, E, F>(
+async fn list_profiles_for_cli() -> Result<Profiles, RequestError> {
+    let progress = Rc::new(Cell::new(None));
+    let observed_progress = Rc::clone(&progress);
+    let request = list_profiles_with_progress(move |current| {
+        observed_progress.set(Some(current));
+    });
+    monitor_operation(request, progress, profile_list_progress_message).await
+}
+
+async fn monitor_operation<T, E, F, P, M>(
     request: F,
-    progress: Rc<Cell<Option<PairingProgress>>>,
-    operation: PairingOperation,
+    progress: Rc<Cell<Option<P>>>,
+    progress_message: M,
 ) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
+    P: Copy,
+    M: Fn(P) -> &'static str,
 {
     use tokio::time::{Instant, sleep};
 
@@ -319,11 +355,27 @@ where
             result = request.as_mut() => return result,
             _ = heartbeat.as_mut() => {
                 if let Some(progress) = progress.get() {
-                    eprintln!("{}", pairing_progress_message(operation, progress));
+                    eprintln!("{}", progress_message(progress));
                 }
                 heartbeat.as_mut().reset(Instant::now() + REQUEST_STATUS_INTERVAL);
             }
         }
+    }
+}
+
+fn profile_list_progress_message(progress: ProfileListProgress) -> &'static str {
+    match progress {
+        ProfileListProgress::Preparing => "AgentKnock prepares the profile list request.",
+        ProfileListProgress::WaitingForDelivery => {
+            "AgentKnock waits for the phone to receive the profile list request."
+        }
+        ProfileListProgress::WaitingForResponse => {
+            "The phone received the profile list request. AgentKnock waits for a response from the phone."
+        }
+        ProfileListProgress::Completing => {
+            "AgentKnock received the profile list. AgentKnock confirms receipt."
+        }
+        ProfileListProgress::Completed => "AgentKnock completed the profile list request.",
     }
 }
 
@@ -465,6 +517,47 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::AbortPairing(error) => print_abort_pairing_error(error),
         CommandError::ForceUnpair(error) => print_force_unpair_error(error),
         CommandError::Unpair(error) => print_unpair_error(error),
+        CommandError::List(error) => print_list_error(error),
+    }
+}
+
+fn print_list_error(error: &RequestError) {
+    match error {
+        RequestError::Configuration(ConfigurationError::NoPairing { .. }) => {
+            print_plain_error("AgentKnock is not paired. It cannot list profiles.");
+            print_plain_error("Suggested action: Get a pairing address.");
+            print_plain_error("Suggested action: Run this command:");
+            print_plain_error("agentknock --start-pairing <PAIRING_ADDRESS>");
+        }
+        RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
+            print_plain_error("Pairing is in progress. AgentKnock cannot list profiles yet.");
+            print_plain_error("Suggested action: Approve the pairing on the phone.");
+            print_plain_error("Suggested action: After approval, run this command:");
+            print_plain_error("agentknock --finish-pairing");
+            print_plain_error("Suggested action: Run this command again:");
+            print_plain_error("agentknock --list");
+        }
+        RequestError::Configuration(error) => {
+            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_configuration_action(error);
+        }
+        RequestError::Relay(_) | RequestError::RelayUnavailable { .. } => {
+            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_error("Suggested action: Make sure that the network connection works.");
+            print_plain_error("Suggested action: Run this command again:");
+            print_plain_error("agentknock --list");
+        }
+        RequestError::InvalidTestRelayUrl => {
+            print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
+            print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
+            print_plain_error("Suggested action: Run this command again:");
+            print_plain_error("agentknock --list");
+        }
+        _ => {
+            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_error("Suggested action: Run this command again:");
+            print_plain_error("agentknock --list");
+        }
     }
 }
 
@@ -833,6 +926,39 @@ fn print_received_environment(credentials: &Credentials) {
     }
 }
 
+fn print_profiles(profiles: &Profiles) {
+    let profiles = profiles
+        .iter()
+        .map(|(name, profile)| {
+            let environment = profile
+                .environment
+                .iter()
+                .map(|(name, source)| {
+                    (
+                        name,
+                        match source {
+                            ValueSource::Stored => "STORED",
+                            ValueSource::Issued => "ISSUED",
+                        },
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (
+                name,
+                serde_json::json!({
+                    "description": profile.description,
+                    "environment": environment,
+                }),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let output = serde_json::json!({"profiles": profiles});
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("profile metadata is valid JSON")
+    );
+}
+
 fn progress_message(progress: CredentialRequestProgress) -> &'static str {
     match progress {
         CredentialRequestProgress::Preparing => "AgentKnock prepares the credentials request.",
@@ -1002,6 +1128,13 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "--unpair", "--force"]).unwrap();
 
         assert_eq!(cli.into_operation(), Operation::Unpair { force: true });
+    }
+
+    #[test]
+    fn parses_list_command() {
+        let cli = Cli::try_parse_from(["agentknock", "--list"]).unwrap();
+
+        assert_eq!(cli.into_operation(), Operation::List);
     }
 
     #[test]
