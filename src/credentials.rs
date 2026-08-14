@@ -80,7 +80,10 @@ pub enum ProtocolError {
     #[error("HPKE operation failed: {0}")]
     Hpke(#[from] hpke::HpkeError),
 
-    #[error("response key derivation failed: {0}")]
+    #[error("random generation failed: {0}")]
+    Random(#[from] getrandom::Error),
+
+    #[error("key derivation failed: {0}")]
     KeyDerivation(#[from] hkdf::InvalidLength),
 
     #[error("response decryption failed")]
@@ -184,7 +187,7 @@ async fn message_exchange(
     let completion = session
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
-    relay.complete(&request, completion).await?;
+    relay.complete(&request, &completion).await?;
 
     exchange_result
 }
@@ -197,6 +200,7 @@ impl From<crypto::Error> for ProtocolError {
             }
             crypto::Error::Base64(error) => Self::Base64(error),
             crypto::Error::Hpke(error) => Self::Hpke(error),
+            crypto::Error::Random(error) => Self::Random(error),
             crypto::Error::KeyDerivation(error) => Self::KeyDerivation(error),
             crypto::Error::Decryption(error) => Self::Decryption(error),
         }

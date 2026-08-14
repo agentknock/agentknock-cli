@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::time::sleep;
 
-use crate::crypto::{Completion, Request, Response};
-
 const RELAY_URL: &str = "https://relay.agentknock.dev/";
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -34,12 +32,16 @@ impl Relay {
         })
     }
 
-    pub(crate) async fn request(&self, request: &Request) -> Result<Response, Error> {
+    pub(crate) async fn request<B, R>(&self, request: &B) -> Result<R, Error>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
         let url = format!("{}/request", self.message_url);
         let body = RequestMessage { request };
 
         loop {
-            let response: RequestResponse = self.post(&url, &body).await?;
+            let response: RequestResponse<R> = self.post(&url, &body).await?;
             match response.state {
                 MessageState::RequestPending | MessageState::RequestDelivered => {}
                 MessageState::ResponsePending | MessageState::ResponseDelivered => {
@@ -55,17 +57,17 @@ impl Relay {
         }
     }
 
-    pub(crate) async fn complete(
-        &self,
-        request: &Request,
-        completion: Completion,
-    ) -> Result<(), Error> {
+    pub(crate) async fn complete<B, C>(&self, request: &B, completion: &C) -> Result<(), Error>
+    where
+        B: Serialize + ?Sized,
+        C: Serialize + ?Sized,
+    {
         let response: CompletionResponse = self
             .post(
                 &format!("{}/complete", self.message_url),
                 &CompletionMessage {
                     request,
-                    completion: &completion,
+                    completion,
                 },
             )
             .await?;
@@ -140,20 +142,20 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 }
 
 #[derive(Serialize)]
-struct RequestMessage<'a> {
-    request: &'a Request,
+struct RequestMessage<'a, B: ?Sized> {
+    request: &'a B,
 }
 
 #[derive(Deserialize)]
-struct RequestResponse {
+struct RequestResponse<R> {
     state: MessageState,
-    response: Option<Response>,
+    response: Option<R>,
 }
 
 #[derive(Serialize)]
-struct CompletionMessage<'a> {
-    request: &'a Request,
-    completion: &'a Completion,
+struct CompletionMessage<'a, B: ?Sized, C: ?Sized> {
+    request: &'a B,
+    completion: &'a C,
 }
 
 #[derive(Deserialize)]

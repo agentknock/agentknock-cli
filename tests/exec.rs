@@ -45,7 +45,7 @@ type ResponseNonce = AeadNonce<ResponseAead>;
 const ROUTE_ID: &str = "00112233445566778899aabbccddeeff";
 const PAIRING_ID: &str = "ffeeddccbbaa99887766554433221100";
 const PAIRING_PSK: [u8; 32] = [0x42; 32];
-const RESPONSE_EXPORTER_CONTEXT: &[u8] = b"agentknock-v1 response";
+const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
 
 #[derive(Clone, Debug)]
 struct ReceivedMessage {
@@ -224,7 +224,7 @@ fn encrypt_response(
     salt.extend_from_slice(&random_nonce);
     let mut exported_secret = ResponseSecret::default();
     receiver_context
-        .export(RESPONSE_EXPORTER_CONTEXT, &mut exported_secret)
+        .export(RESPONSE_EXPORT_CONTEXT, &mut exported_secret)
         .unwrap();
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), &exported_secret);
     let mut response_key = ResponseKey::default();

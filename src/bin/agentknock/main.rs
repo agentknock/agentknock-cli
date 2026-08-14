@@ -4,7 +4,10 @@ use std::{
     process::{Command as ProcessCommand, ExitCode},
 };
 
-use agentknock::{CredentialRequest, Credentials, RequestOperation, request_credentials};
+use agentknock::{
+    CredentialRequest, Credentials, RequestOperation, abort_pairing, finish_pairing,
+    request_credentials, start_pairing,
+};
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 
 #[cfg(unix)]
@@ -20,7 +23,7 @@ use std::os::unix::process::CommandExt;
         ArgGroup::new("command")
             .required(true)
             .multiple(false)
-            .args(["exec", "start_pairing", "finish_pairing"])
+            .args(["exec", "start_pairing", "finish_pairing", "abort_pairing"])
     )
 )]
 struct Cli {
@@ -48,13 +51,17 @@ struct Cli {
     #[arg(
         long,
         value_name = "PAIRING_ADDRESS_NAME",
-        value_parser = NonEmptyStringValueParser::new()
+        value_parser = parse_pairing_address
     )]
     start_pairing: Option<String>,
 
     /// Finish pairing with an AgentKnock service.
     #[arg(long)]
     finish_pairing: bool,
+
+    /// Abort a pending AgentKnock pairing.
+    #[arg(long)]
+    abort_pairing: bool,
 
     /// Command and arguments to run.
     #[arg(
@@ -75,6 +82,19 @@ enum Operation {
     },
     StartPairing(String),
     FinishPairing,
+    AbortPairing,
+}
+
+fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
+    if !address.is_empty()
+        && address
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    {
+        Ok(address.to_owned())
+    } else {
+        Err("pairing address must contain only lowercase ASCII letters and dashes")
+    }
 }
 
 impl Cli {
@@ -93,6 +113,10 @@ impl Cli {
 
         if self.finish_pairing {
             return Operation::FinishPairing;
+        }
+
+        if self.abort_pairing {
+            return Operation::AbortPairing;
         }
 
         unreachable!("clap requires exactly one operation")
@@ -129,7 +153,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .await?;
             exec(command, credentials)?;
         }
-        Operation::StartPairing(_) | Operation::FinishPairing => {}
+        Operation::StartPairing(address) => start_pairing(&address).await?,
+        Operation::FinishPairing => finish_pairing()?,
+        Operation::AbortPairing => abort_pairing()?,
     }
 
     Ok(())
@@ -197,6 +223,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_pairing_address() {
+        for address in ["Yup-its-free", "yup_its_free", "yup-its-frée"] {
+            let error =
+                Cli::try_parse_from(["agentknock", "--start-pairing", address]).unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
     fn parses_finish_pairing_command() {
         let cli = Cli::try_parse_from(["agentknock", "--finish-pairing"]).unwrap();
 
@@ -204,9 +240,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_abort_pairing_command() {
+        let cli = Cli::try_parse_from(["agentknock", "--abort-pairing"]).unwrap();
+
+        assert_eq!(cli.into_operation(), Operation::AbortPairing);
+    }
+
+    #[test]
     fn rejects_finish_pairing_argument() {
         let error =
             Cli::try_parse_from(["agentknock", "--finish-pairing", "unexpected"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn rejects_abort_pairing_argument() {
+        let error =
+            Cli::try_parse_from(["agentknock", "--abort-pairing", "unexpected"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }

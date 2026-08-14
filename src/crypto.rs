@@ -14,15 +14,21 @@ use sha2::Sha256;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::config::Pairing;
+use crate::config::{Identifier, Pairing, PendingPairing};
 
-const RESPONSE_EXPORTER_CONTEXT: &[u8] = b"agentknock-v1 response";
+const BASE_DERIVATION_SALT: &[u8] = b"agentknock-v1";
+const ROUTE_DERIVATION_INFO: &[u8] = b"agentknock-v1 route";
+const COMMITMENT_DERIVATION_INFO: &[u8] = b"agentknock-v1 commitment";
+const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
+const SAS_DERIVATION_INFO: &[u8] = b"agentknock-v1 sas";
+const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
+const SAS_DECIMAL_MODULUS: u64 = 1_000_000_000_000;
 
 type Aead = ChaCha20Poly1305;
 type Kdf = HkdfSha256;
 type Kem = X25519HkdfSha256;
 type ResponseAead = <Aead as HpkeAeadTrait>::AeadImpl;
-type ResponseSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
+type ExporterSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 type ResponseKey = AeadKey<ResponseAead>;
 type ResponseNonce = AeadNonce<ResponseAead>;
 
@@ -71,9 +77,9 @@ impl Session {
         salt.extend_from_slice(&self.encapped_key);
         salt.extend_from_slice(&public_nonce);
 
-        let mut exported_secret = ResponseSecret::default();
+        let mut exported_secret = ExporterSecret::default();
         self.sender_context
-            .export(RESPONSE_EXPORTER_CONTEXT, &mut exported_secret)?;
+            .export(RESPONSE_EXPORT_CONTEXT, &mut exported_secret)?;
         let hkdf = Hkdf::<Sha256>::new(Some(&salt), &exported_secret);
         let mut key = ResponseKey::default();
         hkdf.expand(b"key", &mut key)?;
@@ -103,6 +109,62 @@ impl Session {
             })
         }
     }
+}
+
+pub(crate) fn seal_pairing(
+    route_id: Identifier,
+    request_id: &Ulid,
+    response: PairingResponse,
+    client_random: &[u8],
+    plaintext: &[u8],
+) -> Result<(PairingCompletion, PendingPairing, u64), Error> {
+    let route_key = <Kem as KemTrait>::PublicKey::from_bytes(&response.route_key)?;
+    let pairing_id = response.pairing_id.to_bytes();
+    let info = [route_id.to_bytes(), pairing_id, request_id.to_bytes()].concat();
+    let (encapped_key, mut sender_context) =
+        setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &route_key, &info)?;
+    let ciphertext = sender_context.seal(plaintext, b"")?;
+    let mut pairing_psk = ExporterSecret::default();
+    sender_context.export(PSK_EXPORT_CONTEXT, &mut pairing_psk)?;
+    let mut sas_ikm = Vec::with_capacity(client_random.len() + response.route_key.len());
+    sas_ikm.extend_from_slice(client_random);
+    sas_ikm.extend_from_slice(&response.route_key);
+    let hkdf = Hkdf::<Sha256>::new(Some(&pairing_id), &sas_ikm);
+    let mut sas = [0; 8];
+    hkdf.expand(SAS_DERIVATION_INFO, &mut sas)?;
+    let sas = u64::from_be_bytes(sas) % SAS_DECIMAL_MODULUS;
+    let completion = PairingCompletion {
+        key: BASE64_STANDARD.encode(encapped_key.to_bytes()),
+        ciphertext: BASE64_STANDARD.encode(ciphertext),
+    };
+    let pairing = PendingPairing::new(
+        route_id,
+        response.pairing_id,
+        pairing_psk.to_vec(),
+        response.route_key,
+    );
+
+    Ok((completion, pairing, sas))
+}
+
+pub(crate) fn derive_route_id(address: &str) -> Result<Identifier, Error> {
+    let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), address.as_bytes());
+    let mut route_id = [0; 16];
+    hkdf.expand(ROUTE_DERIVATION_INFO, &mut route_id)?;
+    Ok(Identifier::from_bytes(route_id))
+}
+
+pub(crate) fn generate_client_random() -> Result<Vec<u8>, Error> {
+    let mut client_random = ExporterSecret::default();
+    getrandom::fill(&mut client_random)?;
+    Ok(client_random.to_vec())
+}
+
+pub(crate) fn derive_pairing_commitment(address: &str) -> Result<Vec<u8>, Error> {
+    let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), address.as_bytes());
+    let mut commitment = ExporterSecret::default();
+    hkdf.expand(COMMITMENT_DERIVATION_INFO, &mut commitment)?;
+    Ok(commitment.to_vec())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -141,6 +203,19 @@ pub(crate) struct Completion {
     ciphertext: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct PairingResponse {
+    pairing_id: Identifier,
+    #[serde(deserialize_with = "deserialize_base64")]
+    route_key: Vec<u8>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PairingCompletion {
+    key: String,
+    ciphertext: String,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum Error {
     #[error("cannot {operation} while cryptographic session is {state}")]
@@ -149,17 +224,30 @@ pub(crate) enum Error {
         state: &'static str,
     },
 
-    #[error("invalid base64 in encrypted response: {0}")]
+    #[error("invalid base64 in cryptographic message: {0}")]
     Base64(#[from] base64::DecodeError),
 
     #[error("HPKE operation failed: {0}")]
     Hpke(#[from] hpke::HpkeError),
 
-    #[error("response key derivation failed: {0}")]
+    #[error("random generation failed: {0}")]
+    Random(#[from] getrandom::Error),
+
+    #[error("key derivation failed: {0}")]
     KeyDerivation(#[from] hkdf::InvalidLength),
 
     #[error("response decryption failed")]
     Decryption(#[from] chacha20poly1305::aead::Error),
+}
+
+fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -167,6 +255,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn derives_route_id_from_pairing_address() {
+        assert_eq!(
+            derive_route_id("yup-its-free").unwrap().to_string(),
+            "0b7d7963604cba911e9c03e727688b89"
+        );
+    }
+
+    #[test]
+    fn derives_pairing_commitment_from_address() {
+        assert_eq!(
+            BASE64_STANDARD.encode(derive_pairing_commitment("yup-its-free").unwrap()),
+            "TSZ1lTkmAPehOPZpnWV5+O6AncZFD5TMKVfG30j6QVY="
+        );
+    }
 
     #[test]
     fn rejects_completion_before_request() {
