@@ -1,7 +1,9 @@
 use std::{
     cell::Cell,
+    env,
     future::Future,
-    io,
+    io::{self, IsTerminal as _},
+    path::Path,
     process::{Command as ProcessCommand, ExitCode},
     rc::Rc,
     time::Duration,
@@ -10,8 +12,8 @@ use std::{
 use agentknock::{
     ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
     PairingProgress, PairingSas, ProfileListProgress, Profiles, RequestError, RequestOperation,
-    UnpairError, ValueSource, abort_pairing, finish_pairing_with_progress, force_unpair,
-    list_profiles_with_progress, start_pairing_with_progress, unpair_with_progress,
+    StreamKind, UnpairError, ValueSource, abort_pairing, finish_pairing_with_progress,
+    force_unpair, list_profiles_with_progress, start_pairing_with_progress, unpair_with_progress,
 };
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 
@@ -19,10 +21,14 @@ use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 use agentknock::request_credentials;
 #[cfg(unix)]
 use agentknock::request_credentials_with_progress;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt as _, process::CommandExt};
 
 const REQUEST_STATUS_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const MAX_LAUNCHER_DEPTH: usize = 4;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -144,6 +150,7 @@ enum PairingOperation {
 #[derive(Debug)]
 enum CommandError {
     ExecRequest(RequestError),
+    ExecContext(io::Error),
     ExecSignal(io::Error),
     ExecProcess { program: String, source: io::Error },
     StartPairing(RequestError),
@@ -231,13 +238,22 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             command,
         } => {
             let (program, arguments) = command.split_first().expect("command is required");
+            let working_directory = working_directory().map_err(CommandError::ExecContext)?;
+            let resolved_path = resolve_command_path(program, Path::new(&working_directory));
+            let launcher_chain = launcher_chain();
             let request = CredentialRequest {
                 profiles: &profiles,
                 operation: RequestOperation::Exec {
                     command: program,
                     arguments,
+                    working_directory: &working_directory,
+                    resolved_path: resolved_path.as_deref(),
+                    stdin: standard_stream_kind(0, io::stdin().is_terminal()),
+                    stdout: standard_stream_kind(1, io::stdout().is_terminal()),
+                    stderr: standard_stream_kind(2, io::stderr().is_terminal()),
                 },
                 reason: reason.as_deref(),
+                launcher_chain: &launcher_chain,
             };
             #[cfg(unix)]
             let credentials = request_exec_credentials(request, output).await?;
@@ -494,6 +510,14 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::ExecRequest(error) if output != OutputMode::Quiet => {
             print_exec_request_error(error);
         }
+        CommandError::ExecContext(source) if output != OutputMode::Quiet => {
+            print_message(format_args!(
+                "AgentKnock could not inspect the invocation context: {source}."
+            ));
+            print_message("The credentials request did not start.");
+            print_message("Suggested action: Correct the local system error.");
+            print_message("Suggested action: Run the original command again.");
+        }
         CommandError::ExecSignal(source) if output != OutputMode::Quiet => {
             print_message(format_args!(
                 "A signal-handling error stopped the credentials request: {source}."
@@ -510,6 +534,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             print_message("Suggested action: Run the original command again.");
         }
         CommandError::ExecRequest(_)
+        | CommandError::ExecContext(_)
         | CommandError::ExecSignal(_)
         | CommandError::ExecProcess { .. } => {}
         CommandError::StartPairing(error) => print_start_pairing_error(error),
@@ -959,6 +984,156 @@ fn print_profiles(profiles: &Profiles) {
     );
 }
 
+fn working_directory() -> io::Result<String> {
+    env::current_dir()?
+        .into_os_string()
+        .into_string()
+        .map_err(|path| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("working directory is not valid UTF-8: {path:?}"),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn standard_stream_kind(file_descriptor: u8, terminal: bool) -> StreamKind {
+    if terminal {
+        return StreamKind::Terminal;
+    }
+
+    let Ok(metadata) = std::fs::metadata(format!("/proc/self/fd/{file_descriptor}")) else {
+        return StreamKind::Unknown;
+    };
+    let file_type = metadata.file_type();
+
+    if file_type.is_fifo() {
+        StreamKind::Pipe
+    } else if file_type.is_socket() {
+        StreamKind::Socket
+    } else if file_type.is_file() {
+        StreamKind::RegularFile
+    } else if file_type.is_char_device()
+        && std::fs::metadata("/dev/null")
+            .is_ok_and(|null_device| metadata.rdev() == null_device.rdev())
+    {
+        StreamKind::NullDevice
+    } else {
+        StreamKind::Unknown
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn standard_stream_kind(_file_descriptor: u8, terminal: bool) -> StreamKind {
+    if terminal {
+        StreamKind::Terminal
+    } else {
+        StreamKind::Unknown
+    }
+}
+
+#[cfg(unix)]
+fn resolve_command_path(command: &str, working_directory: &Path) -> Option<String> {
+    if command.contains('/') {
+        let command = Path::new(command);
+        let candidate = if command.is_absolute() {
+            command.to_owned()
+        } else {
+            working_directory.join(command)
+        };
+        return resolve_executable(&candidate);
+    }
+
+    let path = env::var_os("PATH")?;
+    for directory in env::split_paths(&path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            working_directory.join(directory)
+        };
+        let candidate = directory.join(command);
+        if is_executable(&candidate) {
+            return std::fs::canonicalize(candidate)
+                .ok()?
+                .into_os_string()
+                .into_string()
+                .ok();
+        }
+    }
+
+    None
+}
+
+#[cfg(unix)]
+fn resolve_executable(path: &Path) -> Option<String> {
+    if !is_executable(path) {
+        return None;
+    }
+
+    std::fs::canonicalize(path)
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn resolve_command_path(_command: &str, _working_directory: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn launcher_chain() -> Vec<String> {
+    let mut launchers = Vec::new();
+    let mut process_id = std::process::id();
+
+    for _ in 0..MAX_LAUNCHER_DEPTH {
+        let status = match std::fs::read_to_string(format!("/proc/{process_id}/status")) {
+            Ok(status) => status,
+            Err(_) => break,
+        };
+        let Some(parent_id) = parent_id(&status) else {
+            break;
+        };
+        if parent_id <= 1 || parent_id == process_id {
+            break;
+        }
+        let executable = match std::fs::read_link(format!("/proc/{parent_id}/exe")) {
+            Ok(executable) => executable,
+            Err(_) => break,
+        };
+        let Some(executable) = executable.to_str() else {
+            break;
+        };
+        launchers.push(executable.to_owned());
+        process_id = parent_id;
+    }
+
+    launchers.reverse();
+    launchers
+}
+
+#[cfg(target_os = "linux")]
+fn parent_id(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn launcher_chain() -> Vec<String> {
+    Vec::new()
+}
+
 fn progress_message(progress: CredentialRequestProgress) -> &'static str {
     match progress {
         CredentialRequestProgress::Preparing => "AgentKnock prepares the credentials request.",
@@ -1004,6 +1179,9 @@ mod tests {
 
     use super::{Cli, Operation, OutputMode, progress_message};
 
+    #[cfg(target_os = "linux")]
+    use super::parent_id;
+
     #[test]
     fn parses_exec_command() {
         let cli = Cli::try_parse_from([
@@ -1029,6 +1207,13 @@ mod tests {
                     .to_vec(),
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_parent_id_from_proc_status() {
+        assert_eq!(parent_id("Name:\tbash\nPPid:\t1234\n"), Some(1234));
+        assert_eq!(parent_id("Name:\tbash\n"), None);
     }
 
     #[test]

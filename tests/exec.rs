@@ -457,7 +457,9 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
         ])
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("HOME", home.path())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let child_id = child.id();
@@ -500,19 +502,47 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
             .unwrap();
     assert!(pairing.get("rotation_key").is_none());
 
-    let (request_plaintext, completion_plaintext) =
+    let (mut request_plaintext, completion_plaintext) =
         decrypt_messages(&home.route_private_key, &messages);
+    let launcher_chain = request_plaintext
+        .as_object_mut()
+        .unwrap()
+        .remove("launcher_chain")
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        launcher_chain.as_array().unwrap().last().unwrap(),
+        env::current_exe().unwrap().to_str().unwrap()
+    );
+    let operation = request_plaintext
+        .as_object_mut()
+        .unwrap()
+        .remove("operation")
+        .unwrap();
+    assert_eq!(operation["type"], "exec");
+    assert_eq!(operation["command"], "sh");
+    assert_eq!(
+        operation["arguments"],
+        json!([
+            "-c",
+            "test \"$AGENTKNOCK_TEST_ONE\" = 'first secret value' && test \"$AGENTKNOCK_TEST_TWO\" = 'second secret value' && printf '%s' \"$$\""
+        ])
+    );
+    assert_eq!(
+        operation["working_directory"],
+        env::current_dir().unwrap().to_str().unwrap()
+    );
+    let resolved_path = operation["resolved_path"].as_str().unwrap();
+    assert!(PathBuf::from(resolved_path).is_absolute());
+    assert!(PathBuf::from(resolved_path).is_file());
+    assert_eq!(operation["stdin"], "NULL_DEVICE");
+    assert_eq!(operation["stdout"], "PIPE");
+    assert_eq!(operation["stderr"], "PIPE");
     assert_eq!(
         request_plaintext,
         json!({
             "method": "CredentialRequest",
             "profiles": ["gh-token", "cf-wrangler"],
-            "operation": "exec",
-            "command": "sh",
-            "arguments": [
-                "-c",
-                "test \"$AGENTKNOCK_TEST_ONE\" = 'first secret value' && test \"$AGENTKNOCK_TEST_TWO\" = 'second secret value' && printf '%s' \"$$\""
-            ],
             "reason": "needed verbatim: $TOKEN, \"quotes\"",
         })
     );

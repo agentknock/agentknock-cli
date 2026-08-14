@@ -21,12 +21,28 @@ pub struct CredentialRequest<'a> {
     pub profiles: &'a [String],
     pub operation: RequestOperation<'a>,
     pub reason: Option<&'a str>,
+    pub launcher_chain: &'a [String],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamKind {
+    Terminal,
+    NullDevice,
+    Pipe,
+    Socket,
+    RegularFile,
+    Unknown,
 }
 
 pub enum RequestOperation<'a> {
     Exec {
         command: &'a str,
         arguments: &'a [String],
+        working_directory: &'a str,
+        resolved_path: Option<&'a str>,
+        stdin: StreamKind,
+        stdout: StreamKind,
+        stderr: StreamKind,
     },
 }
 
@@ -180,15 +196,31 @@ where
         RotationError::Protocol(error) => RequestError::Protocol(error),
     })?;
     let pairing = read_pairing()?;
-    let request_contents = match request.operation {
-        RequestOperation::Exec { command, arguments } => RequestContents {
-            method: "CredentialRequest",
-            profiles: request.profiles,
-            operation: "exec",
+    let operation = match request.operation {
+        RequestOperation::Exec {
             command,
             arguments,
-            reason: request.reason,
+            working_directory,
+            resolved_path,
+            stdin,
+            stdout,
+            stderr,
+        } => OperationMessage::Exec {
+            command,
+            arguments,
+            working_directory,
+            resolved_path,
+            stdin: stdin.into(),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
         },
+    };
+    let request_contents = RequestContents {
+        method: "CredentialRequest",
+        profiles: request.profiles,
+        reason: request.reason,
+        operation,
+        launcher_chain: request.launcher_chain,
     };
 
     message_exchange(
@@ -386,11 +418,49 @@ impl From<rest::Error> for RequestError {
 struct RequestContents<'a> {
     method: &'static str,
     profiles: &'a [String],
-    operation: &'static str,
-    command: &'a str,
-    arguments: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
+    operation: OperationMessage<'a>,
+    launcher_chain: &'a [String],
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum OperationMessage<'a> {
+    Exec {
+        command: &'a str,
+        arguments: &'a [String],
+        working_directory: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved_path: Option<&'a str>,
+        stdin: StreamKindMessage,
+        stdout: StreamKindMessage,
+        stderr: StreamKindMessage,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StreamKindMessage {
+    Terminal,
+    NullDevice,
+    Pipe,
+    Socket,
+    RegularFile,
+    Unknown,
+}
+
+impl From<StreamKind> for StreamKindMessage {
+    fn from(kind: StreamKind) -> Self {
+        match kind {
+            StreamKind::Terminal => Self::Terminal,
+            StreamKind::NullDevice => Self::NullDevice,
+            StreamKind::Pipe => Self::Pipe,
+            StreamKind::Socket => Self::Socket,
+            StreamKind::RegularFile => Self::RegularFile,
+            StreamKind::Unknown => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
