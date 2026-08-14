@@ -65,7 +65,9 @@ impl Relay {
         let body = RequestMessage { request };
 
         loop {
-            let response: RequestResponse<R> = self.post(&url, &body, NORMAL_RETRY_POLICY).await?;
+            let response: RequestResponse<R> = self
+                .post(&url, &body, &[StatusCode::OK], NORMAL_RETRY_POLICY)
+                .await?;
             match response.state {
                 MessageState::RequestPending => state_changed(RequestState::Pending),
                 MessageState::RequestDelivered => state_changed(RequestState::Delivered),
@@ -121,6 +123,7 @@ impl Relay {
                     request,
                     completion,
                 },
+                &[StatusCode::OK, StatusCode::ACCEPTED],
                 retry_policy,
             )
             .await?;
@@ -134,7 +137,13 @@ impl Relay {
         }
     }
 
-    async fn post<B, R>(&self, url: &str, body: &B, retry_policy: RetryPolicy) -> Result<R, Error>
+    async fn post<B, R>(
+        &self,
+        url: &str,
+        body: &B,
+        success_statuses: &[StatusCode],
+        retry_policy: RetryPolicy,
+    ) -> Result<R, Error>
     where
         B: Serialize + ?Sized,
         R: DeserializeOwned,
@@ -188,7 +197,7 @@ impl Relay {
                         .expect_err("client error status must produce an error"),
                 ));
             }
-            if status != StatusCode::OK {
+            if !success_statuses.contains(&status) {
                 return Err(Error::UnexpectedStatus(status.as_u16()));
             }
 

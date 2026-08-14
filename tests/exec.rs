@@ -215,7 +215,11 @@ async fn receive_message_with_retries(
         },
         "complete" => match state.completion_attempts.fetch_add(1, Ordering::SeqCst) {
             0 => (StatusCode::BAD_GATEWAY, [(RETRY_AFTER, "0")]).into_response(),
-            1 => Json(json!({"state": "COMPLETION_PENDING"})).into_response(),
+            1 => (
+                StatusCode::ACCEPTED,
+                Json(json!({"state": "COMPLETION_PENDING"})),
+            )
+                .into_response(),
             attempt => panic!("unexpected completion attempt {attempt}"),
         },
         part => panic!("unexpected message part: {part}"),

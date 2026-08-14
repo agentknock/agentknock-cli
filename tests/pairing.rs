@@ -237,10 +237,10 @@ async fn receive_message(
         part => panic!("unexpected message part: {part}"),
     };
 
-    let status = if part == "complete" && state.fail_completion {
-        StatusCode::INTERNAL_SERVER_ERROR
-    } else {
-        StatusCode::OK
+    let status = match (part.as_str(), state.fail_completion) {
+        ("complete", true) => StatusCode::INTERNAL_SERVER_ERROR,
+        ("complete", false) => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
     };
     state.messages.lock().unwrap().push(ReceivedMessage {
         route_id,
