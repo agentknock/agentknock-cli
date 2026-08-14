@@ -185,6 +185,9 @@ pub enum ConfigurationError {
     #[error("pairing in {path} already has a pending PSK rotation")]
     RotationPending { path: PathBuf },
 
+    #[error("pairing configuration {path} changed during the operation")]
+    PairingChanged { path: PathBuf },
+
     #[error("system clock is before the Unix epoch: {0}")]
     InvalidSystemTime(#[from] SystemTimeError),
 }
@@ -377,6 +380,61 @@ pub(crate) fn abort_pending_pairing() -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
     let (path, _) = read_pending_pairing_file()?;
+    fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })?;
+    sync_directory(&directory, directory_path)
+}
+
+pub(crate) fn remove_pairing() -> Result<(), ConfigurationError> {
+    let pairing_path = pairing_path()?;
+    let directory_path = pairing_path.parent().expect("pairing path has a parent");
+    match pairing_path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Err(ConfigurationError::NoPairing { path: pairing_path }),
+        Err(source) => {
+            return Err(ConfigurationError::Access {
+                path: pairing_path,
+                source,
+            });
+        }
+    }
+
+    let directory = lock_directory(directory_path)?;
+    match fs::remove_file(&pairing_path) {
+        Ok(()) => sync_directory(&directory, directory_path),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Err(ConfigurationError::NoPairing { path: pairing_path })
+        }
+        Err(source) => Err(ConfigurationError::Access {
+            path: pairing_path,
+            source,
+        }),
+    }
+}
+
+pub(crate) fn remove_active_pairing(
+    expected_route_id: [u8; 16],
+    expected_pairing_id: [u8; 16],
+) -> Result<(), ConfigurationError> {
+    let pairing_path = pairing_path()?;
+    let directory_path = pairing_path.parent().expect("pairing path has a parent");
+    let directory = lock_directory(directory_path)?;
+    let (path, contents) = match read_pairing_file() {
+        Ok(pairing) => pairing,
+        Err(ConfigurationError::NoPairing { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let pairing: Pairing =
+        serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
+            path: path.clone(),
+            source,
+        })?;
+    if pairing.pending
+        || pairing.route_id_bytes() != expected_route_id
+        || pairing.pairing_id_bytes() != expected_pairing_id
+    {
+        return Err(ConfigurationError::PairingChanged { path });
+    }
+
     fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })?;
     sync_directory(&directory, directory_path)
 }

@@ -10,11 +10,12 @@ use crate::{
     config::{
         LockedPairing, abort_pending_pairing, current_timestamp, ensure_pairing_absent,
         finish_pending_pairing, lock_pairing_for_rotation, lock_pairing_if_rotated_before,
-        pairing_path, read_pairing_from, read_pending_pairing, write_pending_pairing,
+        pairing_path, read_pairing, read_pairing_from, read_pending_pairing, remove_active_pairing,
+        remove_pairing, write_pending_pairing,
     },
     crypto::{
-        PROTOCOL_VERSION, PairingResponse, Session, derive_pairing_commitment, derive_psk_rotation,
-        derive_route_id, generate_client_random, seal_pairing,
+        self, PROTOCOL_VERSION, PairingResponse, Session, derive_pairing_commitment,
+        derive_psk_rotation, derive_route_id, generate_client_random, seal_pairing,
     },
     rest::{Relay, RequestState},
 };
@@ -149,6 +150,68 @@ pub fn abort_pairing() -> Result<(), ConfigurationError> {
     abort_pending_pairing()
 }
 
+pub fn force_unpair() -> Result<(), ConfigurationError> {
+    remove_pairing()
+}
+
+pub async fn unpair() -> Result<(), UnpairError> {
+    unpair_with_progress(|_| {}).await
+}
+
+pub async fn unpair_with_progress<P>(mut progress: P) -> Result<(), UnpairError>
+where
+    P: FnMut(PairingProgress),
+{
+    progress(PairingProgress::Preparing);
+    let pairing = read_pairing().map_err(UnpairError::Configuration)?;
+    let route_id = pairing.route_id_bytes();
+    let pairing_id = pairing.pairing_id_bytes();
+    let (relay, request, completion) = prepare_unpair(&pairing, &mut progress)
+        .await
+        .map_err(UnpairError::Request)?;
+    remove_active_pairing(route_id, pairing_id).map_err(UnpairError::LocalState)?;
+    let _ = relay.complete_briefly(&request, &completion).await;
+    progress(PairingProgress::Completed);
+    Ok(())
+}
+
+async fn prepare_unpair<P>(
+    pairing: &crate::config::Pairing,
+    progress: &mut P,
+) -> Result<(Relay, crypto::Request, crypto::Completion), RequestError>
+where
+    P: FnMut(PairingProgress),
+{
+    let request_id = Ulid::generate();
+    let plaintext =
+        serde_json::to_vec(&UnpairRequest { method: "Unpair" }).map_err(ProtocolError::from)?;
+    let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
+    let request = session
+        .seal_request(&plaintext)
+        .map_err(ProtocolError::from)?;
+    let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
+    progress(PairingProgress::WaitingForDelivery);
+    let response = relay
+        .request_with_state(&request, |state| {
+            progress(match state {
+                RequestState::Pending => PairingProgress::WaitingForDelivery,
+                RequestState::Delivered => PairingProgress::WaitingForResponse,
+            });
+        })
+        .await?;
+    progress(PairingProgress::Completing);
+    let plaintext = session
+        .open_response(response)
+        .map_err(ProtocolError::from)?;
+    serde_json::from_slice::<EmptyMessage>(&plaintext).map_err(ProtocolError::from)?;
+    let plaintext = serde_json::to_vec(&EmptyMessage {}).map_err(ProtocolError::from)?;
+    let completion = session
+        .seal_completion(&plaintext)
+        .map_err(ProtocolError::from)?;
+
+    Ok((relay, request, completion))
+}
+
 pub fn rotate_psk() -> Result<(), RotationError> {
     rotate_psk_at(&pairing_path()?, current_timestamp()?)
 }
@@ -191,6 +254,18 @@ pub enum RotationError {
     Protocol(#[from] ProtocolError),
 }
 
+#[derive(Debug, Error)]
+pub enum UnpairError {
+    #[error(transparent)]
+    Configuration(ConfigurationError),
+
+    #[error(transparent)]
+    Request(RequestError),
+
+    #[error("phone accepted unpairing, but local pairing removal failed: {0}")]
+    LocalState(ConfigurationError),
+}
+
 #[cfg(test)]
 fn format_sas(sas: u64) -> String {
     PairingSas(sas).to_string()
@@ -206,6 +281,15 @@ struct PairingRequest {
 struct FinishPairingRequest {
     method: &'static str,
 }
+
+#[derive(Serialize)]
+struct UnpairRequest {
+    method: &'static str,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyMessage {}
 
 #[derive(Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]

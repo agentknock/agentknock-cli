@@ -12,6 +12,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
+    http::StatusCode,
     routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -69,6 +70,7 @@ struct TestState {
     finish_result: Value,
     finish_request: Arc<Mutex<Option<Value>>>,
     finish_completion: Arc<Mutex<Option<Value>>>,
+    fail_completion: bool,
 }
 
 struct TestHome(PathBuf);
@@ -89,22 +91,37 @@ impl TestHome {
         route_public_key: &<Kem as KemTrait>::PublicKey,
         pairing_psk: &[u8],
     ) -> PathBuf {
+        self.write_pairing(route_public_key, pairing_psk, true)
+    }
+
+    fn write_active_pairing(
+        &self,
+        route_public_key: &<Kem as KemTrait>::PublicKey,
+        pairing_psk: &[u8],
+    ) -> PathBuf {
+        self.write_pairing(route_public_key, pairing_psk, false)
+    }
+
+    fn write_pairing(
+        &self,
+        route_public_key: &<Kem as KemTrait>::PublicKey,
+        pairing_psk: &[u8],
+        pending: bool,
+    ) -> PathBuf {
         let directory = self.path().join(".agentknock");
         fs::create_dir(&directory).unwrap();
         let path = directory.join("pairing.json");
-        fs::write(
-            &path,
-            serde_json::to_vec(&json!({
-                "pending": true,
-                "route_id": ROUTE_ID,
-                "pairing_id": PAIRING_ID,
-                "pairing_psk": BASE64_STANDARD.encode(pairing_psk),
-                "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
-                "rotated_at": 1_700_000_000,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let mut pairing = json!({
+            "route_id": ROUTE_ID,
+            "pairing_id": PAIRING_ID,
+            "pairing_psk": BASE64_STANDARD.encode(pairing_psk),
+            "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+            "rotated_at": 1_700_000_000,
+        });
+        if pending {
+            pairing["pending"] = true.into();
+        }
+        fs::write(&path, serde_json::to_vec(&pairing).unwrap()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
@@ -120,7 +137,7 @@ async fn receive_message(
     State(state): State<TestState>,
     AxumPath((route_id, request_id, part)): AxumPath<(String, String, String)>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let response = match part.as_str() {
         "request" if body["request"].get("commitment").is_some() => json!({
             "state": "RESPONSE_DELIVERED",
@@ -220,6 +237,11 @@ async fn receive_message(
         part => panic!("unexpected message part: {part}"),
     };
 
+    let status = if part == "complete" && state.fail_completion {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
     state.messages.lock().unwrap().push(ReceivedMessage {
         route_id,
         request_id,
@@ -227,7 +249,7 @@ async fn receive_message(
         body,
     });
 
-    Json(response)
+    (status, Json(response))
 }
 
 fn finish_receiver_context(
@@ -354,6 +376,7 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         finish_result: json!({"result": "ACCEPTED"}),
         finish_request: finish_request.clone(),
         finish_completion: finish_completion.clone(),
+        fail_completion: false,
     };
     let app = Router::new()
         .route(
@@ -621,6 +644,7 @@ async fn leaves_rejected_pairing_pending() {
         finish_result: json!({"result": "REJECTED"}),
         finish_request: finish_request.clone(),
         finish_completion: finish_completion.clone(),
+        fail_completion: false,
     };
     let app = Router::new()
         .route(
@@ -669,14 +693,150 @@ async fn leaves_rejected_pairing_pending() {
     assert_eq!(messages[0].part, "request");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpairs_after_an_authenticated_response() {
+    let home = TestHome::new();
+    let messages = ReceivedMessages::default();
+    let pairing_psk = vec![0x42; PairingPsk::default().len()];
+    let (route_private_key, route_public_key) = Kem::gen_keypair();
+    let pairing_path = home.write_active_pairing(&route_public_key, &pairing_psk);
+    let unpair_request = Arc::new(Mutex::new(None));
+    let unpair_completion = Arc::new(Mutex::new(None));
+    let state = TestState {
+        messages: messages.clone(),
+        route_private_key,
+        route_public_key,
+        pairing_psk: Arc::new(Mutex::new(Some(pairing_psk))),
+        sas: Arc::new(Mutex::new(None)),
+        contents: Arc::new(Mutex::new(None)),
+        commitment_matches: Arc::new(Mutex::new(None)),
+        finish_result: json!({}),
+        finish_request: unpair_request.clone(),
+        finish_completion: unpair_completion.clone(),
+        fail_completion: true,
+    };
+    let app = Router::new()
+        .route(
+            "/v1/route/{route_id}/msg/{request_id}/{part}",
+            post(receive_message),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .arg("--unpair")
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "AgentKnock unpaired this installation.\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!pairing_path.exists());
+    assert_eq!(
+        *unpair_request.lock().unwrap(),
+        Some(json!({"method": "Unpair"}))
+    );
+    assert_eq!(*unpair_completion.lock().unwrap(), Some(json!({})));
+    let messages = messages.lock().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].part, "request");
+    assert_eq!(messages[1].part, "complete");
+    assert_eq!(messages[1].body["request"], messages[0].body["request"]);
+    assert_eq!(messages[2].part, "complete");
+    assert_eq!(messages[2].body, messages[1].body);
+    drop(messages);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .arg("--unpair")
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "AgentKnock is not paired. There is no active pairing to remove.\n"
+    );
+}
+
 #[test]
-fn aborts_pending_pairing_without_removing_directory() {
+fn force_unpair_removes_only_the_local_pairing() {
     let home = TestHome::new();
     let directory = home.path().join(".agentknock");
     fs::create_dir(&directory).unwrap();
     let pairing_path = directory.join("pairing.json");
-    fs::write(&pairing_path, br#"{"pending":true}"#).unwrap();
-    fs::set_permissions(&pairing_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&pairing_path, b"not valid pairing JSON").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--unpair", "--force"])
+        .env("AGENTKNOCK_TEST_RELAY_URL", "not a URL")
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "AgentKnock removed the local pairing. The phone-side pairing was not changed.\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!pairing_path.exists());
+    assert!(directory.is_dir());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["--unpair", "--force"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "AgentKnock is not paired. There is no local pairing to remove.\n"
+    );
+}
+
+#[test]
+fn aborts_pending_pairing_without_removing_directory() {
+    let home = TestHome::new();
+    let directory = home.path().join(".agentknock");
+    let (_, route_public_key) = Kem::gen_keypair();
+    let pairing_psk = vec![0x42; PairingPsk::default().len()];
+    let pairing_path = home.write_pending_pairing(&route_public_key, &pairing_psk);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .arg("--unpair")
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        concat!(
+            "Pairing is in progress. AgentKnock did not remove the pending pairing.\n",
+            "Suggested action: To abort the pending pairing, run this command:\n",
+            "agentknock --abort-pairing\n",
+        )
+    );
+    assert!(pairing_path.exists());
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .arg("--abort-pairing")

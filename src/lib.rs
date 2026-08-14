@@ -11,7 +11,7 @@ pub use credentials::{
     request_credentials_with_progress,
 };
 pub use pairing::{
-    PairingProgress, PairingSas, RotationError, abort_pairing, finish_pairing,
-    finish_pairing_with_progress, maybe_rotate_psk, rotate_psk, start_pairing,
-    start_pairing_with_progress,
+    PairingProgress, PairingSas, RotationError, UnpairError, abort_pairing, finish_pairing,
+    finish_pairing_with_progress, force_unpair, maybe_rotate_psk, rotate_psk, start_pairing,
+    start_pairing_with_progress, unpair, unpair_with_progress,
 };

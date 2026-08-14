@@ -9,8 +9,8 @@ use std::{
 
 use agentknock::{
     ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
-    PairingProgress, PairingSas, RequestError, RequestOperation, abort_pairing,
-    finish_pairing_with_progress, start_pairing_with_progress,
+    PairingProgress, PairingSas, RequestError, RequestOperation, UnpairError, abort_pairing,
+    finish_pairing_with_progress, force_unpair, start_pairing_with_progress, unpair_with_progress,
 };
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
 
@@ -33,7 +33,13 @@ const REQUEST_STATUS_INTERVAL: Duration = Duration::from_secs(30);
         ArgGroup::new("command")
             .required(true)
             .multiple(false)
-            .args(["exec", "start_pairing", "finish_pairing", "abort_pairing"])
+            .args([
+                "exec",
+                "start_pairing",
+                "finish_pairing",
+                "abort_pairing",
+                "unpair",
+            ])
     )
 )]
 struct Cli {
@@ -81,6 +87,14 @@ struct Cli {
     #[arg(long)]
     abort_pairing: bool,
 
+    /// Remove an active AgentKnock pairing.
+    #[arg(long)]
+    unpair: bool,
+
+    /// Remove only the local pairing, without contacting the phone.
+    #[arg(long, requires = "unpair")]
+    force: bool,
+
     /// Command and arguments that AgentKnock runs.
     #[arg(
         last = true,
@@ -101,6 +115,9 @@ enum Operation {
     StartPairing(String),
     FinishPairing,
     AbortPairing,
+    Unpair {
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +131,7 @@ enum OutputMode {
 enum PairingOperation {
     Start,
     Finish,
+    Unpair,
 }
 
 #[derive(Debug)]
@@ -124,6 +142,8 @@ enum CommandError {
     StartPairing(RequestError),
     FinishPairing(RequestError),
     AbortPairing(ConfigurationError),
+    ForceUnpair(ConfigurationError),
+    Unpair(UnpairError),
 }
 
 fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
@@ -168,6 +188,10 @@ impl Cli {
 
         if self.abort_pairing {
             return Operation::AbortPairing;
+        }
+
+        if self.unpair {
+            return Operation::Unpair { force: self.force };
         }
 
         unreachable!("clap requires exactly one operation")
@@ -233,6 +257,17 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             abort_pairing().map_err(CommandError::AbortPairing)?;
             println!("AgentKnock aborted the pending pairing. AgentKnock is not paired.");
         }
+        Operation::Unpair { force } => {
+            if force {
+                force_unpair().map_err(CommandError::ForceUnpair)?;
+                println!(
+                    "AgentKnock removed the local pairing. The phone-side pairing was not changed."
+                );
+            } else {
+                unpair_for_cli().await.map_err(CommandError::Unpair)?;
+                println!("AgentKnock unpaired this installation.");
+            }
+        }
     }
 
     Ok(())
@@ -256,13 +291,22 @@ async fn finish_pairing_for_cli() -> Result<(), RequestError> {
     monitor_pairing(request, progress, PairingOperation::Finish).await
 }
 
-async fn monitor_pairing<T, F>(
+async fn unpair_for_cli() -> Result<(), UnpairError> {
+    let progress = Rc::new(Cell::new(None));
+    let observed_progress = Rc::clone(&progress);
+    let request = unpair_with_progress(move |current| {
+        observed_progress.set(Some(current));
+    });
+    monitor_pairing(request, progress, PairingOperation::Unpair).await
+}
+
+async fn monitor_pairing<T, E, F>(
     request: F,
     progress: Rc<Cell<Option<PairingProgress>>>,
     operation: PairingOperation,
-) -> Result<T, RequestError>
+) -> Result<T, E>
 where
-    F: Future<Output = Result<T, RequestError>>,
+    F: Future<Output = Result<T, E>>,
 {
     use tokio::time::{Instant, sleep};
 
@@ -317,6 +361,21 @@ fn pairing_progress_message(
         }
         (PairingOperation::Finish, PairingProgress::Completed) => {
             "AgentKnock completed the pairing confirmation."
+        }
+        (PairingOperation::Unpair, PairingProgress::Preparing) => {
+            "AgentKnock prepares the unpair request."
+        }
+        (PairingOperation::Unpair, PairingProgress::WaitingForDelivery) => {
+            "AgentKnock waits for the phone to receive the unpair request."
+        }
+        (PairingOperation::Unpair, PairingProgress::WaitingForResponse) => {
+            "The phone received the unpair request. AgentKnock waits for a response from the phone."
+        }
+        (PairingOperation::Unpair, PairingProgress::Completing) => {
+            "The phone accepted the unpair request. AgentKnock removes the local pairing."
+        }
+        (PairingOperation::Unpair, PairingProgress::Completed) => {
+            "AgentKnock completed the unpair request."
         }
     }
 }
@@ -404,6 +463,8 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::StartPairing(error) => print_start_pairing_error(error),
         CommandError::FinishPairing(error) => print_finish_pairing_error(error),
         CommandError::AbortPairing(error) => print_abort_pairing_error(error),
+        CommandError::ForceUnpair(error) => print_force_unpair_error(error),
+        CommandError::Unpair(error) => print_unpair_error(error),
     }
 }
 
@@ -668,6 +729,61 @@ fn print_abort_pairing_error(error: &ConfigurationError) {
     }
 }
 
+fn print_unpair_error(error: &UnpairError) {
+    match error {
+        UnpairError::Configuration(ConfigurationError::NoPairing { .. }) => {
+            print_plain_error("AgentKnock is not paired. There is no active pairing to remove.");
+        }
+        UnpairError::Configuration(ConfigurationError::PairingPending { .. }) => {
+            print_plain_error(
+                "Pairing is in progress. AgentKnock did not remove the pending pairing.",
+            );
+            print_plain_error("Suggested action: To abort the pending pairing, run this command:");
+            print_plain_error("agentknock --abort-pairing");
+        }
+        UnpairError::Configuration(error) => {
+            print_plain_error(format_args!("AgentKnock did not start unpairing: {error}."));
+            print_plain_configuration_action(error);
+        }
+        UnpairError::Request(error) => {
+            print_plain_error(format_args!(
+                "AgentKnock did not receive a valid unpair response: {error}."
+            ));
+            print_plain_error("The local pairing is unchanged. The phone-side result is unknown.");
+            print_plain_error("Suggested action: Run this command again:");
+            print_plain_error("agentknock --unpair");
+        }
+        UnpairError::LocalState(ConfigurationError::PairingChanged { .. }) => {
+            print_plain_error(
+                "The phone accepted the unpair request, but the local pairing changed.",
+            );
+            print_plain_error("AgentKnock did not remove the current local pairing.");
+            print_plain_error("Suggested action: To remove the current pairing, run this command:");
+            print_plain_error("agentknock --unpair");
+        }
+        UnpairError::LocalState(error) => {
+            print_plain_error(format_args!(
+                "The phone accepted the unpair request, but AgentKnock did not remove the local pairing: {error}."
+            ));
+            print_plain_configuration_action(error);
+        }
+    }
+}
+
+fn print_force_unpair_error(error: &ConfigurationError) {
+    match error {
+        ConfigurationError::NoPairing { .. } => {
+            print_plain_error("AgentKnock is not paired. There is no local pairing to remove.");
+        }
+        _ => {
+            print_plain_error(format_args!(
+                "AgentKnock did not remove the local pairing: {error}."
+            ));
+            print_plain_configuration_action(error);
+        }
+    }
+}
+
 fn print_plain_configuration_action(error: &ConfigurationError) {
     match error {
         ConfigurationError::InsecurePermissions { path, .. } => {
@@ -875,6 +991,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_unpair_command() {
+        let cli = Cli::try_parse_from(["agentknock", "--unpair"]).unwrap();
+
+        assert_eq!(cli.into_operation(), Operation::Unpair { force: false });
+    }
+
+    #[test]
+    fn parses_forced_unpair_command() {
+        let cli = Cli::try_parse_from(["agentknock", "--unpair", "--force"]).unwrap();
+
+        assert_eq!(cli.into_operation(), Operation::Unpair { force: true });
+    }
+
+    #[test]
+    fn rejects_force_without_unpair() {
+        let error = Cli::try_parse_from(["agentknock", "--force"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn rejects_finish_pairing_argument() {
         let error =
             Cli::try_parse_from(["agentknock", "--finish-pairing", "unexpected"]).unwrap_err();
@@ -886,6 +1023,13 @@ mod tests {
     fn rejects_abort_pairing_argument() {
         let error =
             Cli::try_parse_from(["agentknock", "--abort-pairing", "unexpected"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn rejects_unpair_argument() {
+        let error = Cli::try_parse_from(["agentknock", "--unpair", "unexpected"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
