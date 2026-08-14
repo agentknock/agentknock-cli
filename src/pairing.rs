@@ -13,8 +13,8 @@ use crate::{
         pairing_path, read_pairing_from, read_pending_pairing, write_pending_pairing,
     },
     crypto::{
-        PairingResponse, Session, derive_pairing_commitment, derive_psk_rotation, derive_route_id,
-        generate_client_random, seal_pairing,
+        PROTOCOL_VERSION, PairingResponse, Session, derive_pairing_commitment, derive_psk_rotation,
+        derive_route_id, generate_client_random, seal_pairing,
     },
     rest::{Relay, RequestState},
 };
@@ -64,7 +64,7 @@ where
     let route_id = derive_route_id(address).map_err(ProtocolError::from)?;
     let relay = Relay::new(&route_id.to_string(), &request_id.to_string())?;
     let request = PairingRequest {
-        version: 1,
+        version: PROTOCOL_VERSION,
         commitment: BASE64_STANDARD.encode(commitment),
     };
     progress(PairingProgress::WaitingForDelivery);
@@ -198,7 +198,7 @@ fn format_sas(sas: u64) -> String {
 
 #[derive(Serialize)]
 struct PairingRequest {
-    version: u8,
+    version: &'static str,
     commitment: String,
 }
 
@@ -350,7 +350,13 @@ mod tests {
 
         let route_id = u128::from_str_radix(ROUTE_ID, 16).unwrap().to_be_bytes();
         let pairing_id = u128::from_str_radix(PAIRING_ID, 16).unwrap().to_be_bytes();
-        let info = [route_id, pairing_id, [0; 16]].concat();
+        let info = [
+            crate::crypto::PROTOCOL_VERSION_INFO,
+            route_id,
+            pairing_id,
+            [0; 16],
+        ]
+        .concat();
         let psk = PskBundle::new(&OLD_PSK, &pairing_id).unwrap();
         let receiver_context = setup_receiver::<Aead, Kdf, Kem>(
             &OpModeR::Psk(psk),

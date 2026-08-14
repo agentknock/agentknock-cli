@@ -46,6 +46,7 @@ type ResponseNonce = AeadNonce<ResponseAead>;
 const ROUTE_ID: &str = "00112233445566778899aabbccddeeff";
 const PAIRING_ID: &str = "ffeeddccbbaa99887766554433221100";
 const PAIRING_PSK: [u8; 32] = [0x42; 32];
+const PROTOCOL_VERSION_INFO: [u8; 16] = *b"agentknock-v1\0\0\0";
 const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
 
 #[derive(Clone, Debug)]
@@ -366,7 +367,13 @@ fn encrypt_response(
     let request_id = request_id.parse::<Ulid>().unwrap();
     let route_id = u128::from_str_radix(ROUTE_ID, 16).unwrap().to_be_bytes();
     let pairing_id = u128::from_str_radix(PAIRING_ID, 16).unwrap().to_be_bytes();
-    let info = [route_id, pairing_id, request_id.to_bytes()].concat();
+    let info = [
+        PROTOCOL_VERSION_INFO,
+        route_id,
+        pairing_id,
+        request_id.to_bytes(),
+    ]
+    .concat();
     let psk = PskBundle::new(&PAIRING_PSK, &pairing_id).unwrap();
     let mut receiver_context = setup_receiver::<Aead, Kdf, Kem>(
         &OpModeR::Psk(psk),
@@ -475,7 +482,7 @@ async fn exchanges_messages_then_replaces_itself_with_command() {
     assert_eq!(messages[0].route_id, ROUTE_ID);
     assert_eq!(messages[0].part, "request");
     let request = &messages[0].body["request"];
-    assert_eq!(request["version"], "1");
+    assert_eq!(request["version"], "agentknock-v1");
     assert_eq!(request["pairing_id"], PAIRING_ID);
     assert_eq!(request["rotation_key"], rotation_key);
     assert_eq!(messages[1].route_id, ROUTE_ID);
@@ -575,7 +582,13 @@ fn decrypt_messages(
     let request_id = messages[0].request_id.parse::<Ulid>().unwrap();
     let route_id = u128::from_str_radix(ROUTE_ID, 16).unwrap().to_be_bytes();
     let pairing_id = u128::from_str_radix(PAIRING_ID, 16).unwrap().to_be_bytes();
-    let info = [route_id, pairing_id, request_id.to_bytes()].concat();
+    let info = [
+        PROTOCOL_VERSION_INFO,
+        route_id,
+        pairing_id,
+        request_id.to_bytes(),
+    ]
+    .concat();
     let psk = PskBundle::new(&PAIRING_PSK, &pairing_id).unwrap();
     let mut receiver_context = setup_receiver::<Aead, Kdf, Kem>(
         &OpModeR::Psk(psk),

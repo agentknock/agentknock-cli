@@ -40,6 +40,7 @@ type ResponseNonce = AeadNonce<ResponseAead>;
 const PAIRING_ID: &str = "ffeeddccbbaa99887766554433221100";
 const BASE_DERIVATION_SALT: &[u8] = b"agentknock-v1";
 const COMMITMENT_DERIVATION_INFO: &[u8] = b"agentknock-v1 commitment";
+const PROTOCOL_VERSION_INFO: [u8; 16] = *b"agentknock-v1\0\0\0";
 const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
 const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
 const SAS_DERIVATION_INFO: &[u8] = b"agentknock-v1 sas";
@@ -157,7 +158,13 @@ async fn receive_message(
             let pairing_id = u128::from_str_radix(PAIRING_ID, 16).unwrap().to_be_bytes();
             let route_id = u128::from_str_radix(&route_id, 16).unwrap().to_be_bytes();
             let request_id = request_id.parse::<Ulid>().unwrap();
-            let info = [route_id, pairing_id, request_id.to_bytes()].concat();
+            let info = [
+                PROTOCOL_VERSION_INFO,
+                route_id,
+                pairing_id,
+                request_id.to_bytes(),
+            ]
+            .concat();
             let mut receiver_context = setup_receiver::<Aead, Kdf, Kem>(
                 &OpModeR::Base,
                 &state.route_private_key,
@@ -238,7 +245,13 @@ fn finish_receiver_context(
     let route_id = u128::from_str_radix(route_id, 16).unwrap().to_be_bytes();
     let pairing_id = u128::from_str_radix(PAIRING_ID, 16).unwrap().to_be_bytes();
     let request_id = request_id.parse::<Ulid>().unwrap();
-    let info = [route_id, pairing_id, request_id.to_bytes()].concat();
+    let info = [
+        PROTOCOL_VERSION_INFO,
+        route_id,
+        pairing_id,
+        request_id.to_bytes(),
+    ]
+    .concat();
     let psk = PskBundle::new(pairing_psk, &pairing_id).unwrap();
     let context = setup_receiver::<Aead, Kdf, Kem>(
         &OpModeR::Psk(psk),
@@ -408,7 +421,10 @@ async fn starts_and_finishes_pairing_message_exchanges() {
         assert_eq!(start_messages[0].route_id, ROUTE_ID);
         assert_eq!(start_messages[0].part, "request");
         assert!(start_messages[0].request_id.parse::<Ulid>().is_ok());
-        assert_eq!(start_messages[0].body["request"]["version"], 1);
+        assert_eq!(
+            start_messages[0].body["request"]["version"],
+            "agentknock-v1"
+        );
         assert_eq!(
             BASE64_STANDARD
                 .decode(

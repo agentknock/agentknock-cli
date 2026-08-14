@@ -23,6 +23,8 @@ const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
 const SAS_DERIVATION_INFO: &[u8] = b"agentknock-v1 sas";
 const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
 const SAS_DECIMAL_MODULUS: u64 = 1_000_000_000_000;
+pub(crate) const PROTOCOL_VERSION: &str = "agentknock-v1";
+pub(crate) const PROTOCOL_VERSION_INFO: [u8; 16] = *b"agentknock-v1\0\0\0";
 
 type Aead = ChaCha20Poly1305;
 type Kdf = HkdfSha256;
@@ -65,7 +67,7 @@ impl Session {
         self.state = SessionState::RequestSealed;
 
         Ok(Request {
-            version: "1",
+            version: PROTOCOL_VERSION,
             pairing_id: self.pairing_id.clone(),
             key: BASE64_STANDARD.encode(&self.encapped_key),
             ciphertext: BASE64_STANDARD.encode(ciphertext),
@@ -131,7 +133,13 @@ fn setup_pairing_sender(
 ) -> Result<(Vec<u8>, SenderContext), Error> {
     let route_key = <Kem as KemTrait>::PublicKey::from_bytes(pairing.route_key())?;
     let pairing_id = pairing.pairing_id_bytes();
-    let info = [pairing.route_id_bytes(), pairing_id, request_id].concat();
+    let info = [
+        PROTOCOL_VERSION_INFO,
+        pairing.route_id_bytes(),
+        pairing_id,
+        request_id,
+    ]
+    .concat();
     let psk = PskBundle::new(pairing.pairing_psk(), &pairing_id)?;
     let (encapped_key, sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &route_key, &info)?;
@@ -147,7 +155,13 @@ pub(crate) fn seal_pairing(
 ) -> Result<(PairingCompletion, PendingPairing, u64), Error> {
     let route_key = <Kem as KemTrait>::PublicKey::from_bytes(&response.route_key)?;
     let pairing_id = response.pairing_id.to_bytes();
-    let info = [route_id.to_bytes(), pairing_id, request_id.to_bytes()].concat();
+    let info = [
+        PROTOCOL_VERSION_INFO,
+        route_id.to_bytes(),
+        pairing_id,
+        request_id.to_bytes(),
+    ]
+    .concat();
     let (encapped_key, mut sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &route_key, &info)?;
     let ciphertext = sender_context.seal(plaintext, b"")?;
@@ -341,6 +355,48 @@ mod tests {
                 state: "completion sealed",
             })
         ));
+    }
+
+    #[test]
+    fn binds_request_to_protocol_version() {
+        use hpke::{OpModeR, setup_receiver};
+
+        let (route_private_key, route_public_key) = Kem::gen_keypair();
+        let pairing: Pairing = serde_json::from_value(json!({
+            "route_id": "00112233445566778899aabbccddeeff",
+            "pairing_id": "ffeeddccbbaa99887766554433221100",
+            "pairing_psk": BASE64_STANDARD.encode([0x42; 32]),
+            "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+            "rotated_at": 1_700_000_000,
+        }))
+        .unwrap();
+        let request_id = Ulid::generate();
+        let mut session = Session::new(&pairing, &request_id).unwrap();
+        let request = session.seal_request(b"request").unwrap();
+
+        let encapped_key = BASE64_STANDARD.decode(request.key).unwrap();
+        let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&encapped_key).unwrap();
+        let ciphertext = BASE64_STANDARD.decode(request.ciphertext).unwrap();
+        let pairing_id = pairing.pairing_id_bytes();
+        let psk = PskBundle::new(pairing.pairing_psk(), &pairing_id).unwrap();
+        let mut other_version = PROTOCOL_VERSION_INFO;
+        other_version[12] = b'2';
+        let info = [
+            other_version,
+            pairing.route_id_bytes(),
+            pairing_id,
+            request_id.to_bytes(),
+        ]
+        .concat();
+        let mut receiver_context = setup_receiver::<Aead, Kdf, Kem>(
+            &OpModeR::Psk(psk),
+            &route_private_key,
+            &encapped_key,
+            &info,
+        )
+        .unwrap();
+
+        assert!(receiver_context.open(&ciphertext, b"").is_err());
     }
 
     fn test_session() -> Session {
