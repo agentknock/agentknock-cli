@@ -408,6 +408,7 @@ impl RelayExchange {
         if self.socket.is_some() {
             return Ok(false);
         }
+        ensure_rustls_provider();
         loop {
             let builder = ClientBuilder::new()
                 .uri(&self.url)
@@ -649,6 +650,10 @@ impl RelayExchange {
     fn completion_mut(&mut self) -> &mut OutgoingMessage {
         self.completion.as_mut().expect("completion exists")
     }
+}
+
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 impl OutgoingMessage {
@@ -896,4 +901,13 @@ pub(crate) enum Error {
 
     #[error("{TEST_RELAY_URL_ENV} is not valid UTF-8")]
     InvalidTestRelayUrl,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn installs_rustls_crypto_provider() {
+        super::ensure_rustls_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 }
