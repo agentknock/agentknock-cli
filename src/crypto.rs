@@ -164,19 +164,19 @@ pub(crate) fn seal_pairing(
             expected: ExporterSecret::default().len(),
         });
     }
-    let mut sas_ikm = Vec::with_capacity(
-        mailbox_id_bytes.len()
+    let mut sas_info = Vec::with_capacity(
+        SAS_DERIVATION_INFO.len()
+            + mailbox_id_bytes.len()
             + client_id_bytes.len()
-            + client_random.len()
             + response.device_key.len(),
     );
-    sas_ikm.extend_from_slice(&mailbox_id_bytes);
-    sas_ikm.extend_from_slice(&client_id_bytes);
-    sas_ikm.extend_from_slice(client_random);
-    sas_ikm.extend_from_slice(&response.device_key);
-    let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), &sas_ikm);
+    sas_info.extend_from_slice(SAS_DERIVATION_INFO);
+    sas_info.extend_from_slice(&mailbox_id_bytes);
+    sas_info.extend_from_slice(&client_id_bytes);
+    sas_info.extend_from_slice(&response.device_key);
+    let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), client_random);
     let mut sas = [0; 8];
-    hkdf.expand(SAS_DERIVATION_INFO, &mut sas)?;
+    hkdf.expand(&sas_info, &mut sas)?;
     let sas = u64::from_be_bytes(sas) % SAS_DECIMAL_MODULUS;
     let completion = PairingCompletion {
         key: BASE64_STANDARD.encode(encapped_key.to_bytes()),

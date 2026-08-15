@@ -147,14 +147,14 @@ async fn starts_and_finishes_pairing_over_websockets() {
         let mut client_psk = Array::<u8, <HkdfSha256 as KdfTrait>::Nh>::default();
         context.export(PSK_EXPORT_CONTEXT, &mut client_psk).unwrap();
 
-        let mut sas_input = Vec::new();
-        sas_input.extend_from_slice(&MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes());
-        sas_input.extend_from_slice(&client_id.parse::<Ulid>().unwrap().to_bytes());
-        sas_input.extend_from_slice(&client_random);
-        sas_input.extend_from_slice(&device_public_key.to_bytes());
-        let hkdf = Hkdf::<Sha256>::new(Some(&DEVICE_RANDOM), &sas_input);
+        let mut sas_info = Vec::new();
+        sas_info.extend_from_slice(SAS_DERIVATION_INFO);
+        sas_info.extend_from_slice(&MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes());
+        sas_info.extend_from_slice(&client_id.parse::<Ulid>().unwrap().to_bytes());
+        sas_info.extend_from_slice(&device_public_key.to_bytes());
+        let hkdf = Hkdf::<Sha256>::new(Some(&DEVICE_RANDOM), &client_random);
         let mut sas = [0; 8];
-        hkdf.expand(SAS_DERIVATION_INFO, &mut sas).unwrap();
+        hkdf.expand(&sas_info, &mut sas).unwrap();
         let sas = u64::from_be_bytes(sas) % SAS_DECIMAL_MODULUS;
         let sas = format!(
             "{:04} {:04} {:04}",
