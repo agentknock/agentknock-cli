@@ -7,10 +7,14 @@ use std::{
 };
 
 use atomic_write_file::AtomicWriteFile;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE},
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
+use ulid::Ulid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -19,12 +23,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub(crate) struct Pairing {
     #[serde(default)]
     pending: bool,
-    route_id: Identifier,
-    pairing_id: Identifier,
+    mailbox_id: RelayId,
+    client_id: RelayId,
+    #[serde(deserialize_with = "deserialize_client_token")]
+    client_token: String,
     #[serde(deserialize_with = "deserialize_base64")]
-    pairing_psk: Vec<u8>,
+    client_psk: Vec<u8>,
     #[serde(deserialize_with = "deserialize_base64")]
-    route_key: Vec<u8>,
+    device_key: Vec<u8>,
     rotated_at: u64,
     #[serde(default)]
     rotation_key: Option<String>,
@@ -33,11 +39,15 @@ pub(crate) struct Pairing {
 #[derive(Clone, Copy)]
 pub(crate) struct Identifier(u128);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RelayId(Ulid);
+
 pub(crate) struct PendingPairing {
-    route_id: Identifier,
-    pairing_id: Identifier,
-    pairing_psk: Vec<u8>,
-    route_key: Vec<u8>,
+    mailbox_id: RelayId,
+    client_id: RelayId,
+    client_token: String,
+    client_psk: Vec<u8>,
+    device_key: Vec<u8>,
 }
 
 pub(crate) struct LockedPairing {
@@ -49,28 +59,32 @@ pub(crate) struct LockedPairing {
 }
 
 impl Pairing {
-    pub(crate) fn route_id(&self) -> String {
-        self.route_id.to_string()
+    pub(crate) fn mailbox_id(&self) -> String {
+        self.mailbox_id.to_string()
     }
 
-    pub(crate) fn route_id_bytes(&self) -> [u8; 16] {
-        self.route_id.0.to_be_bytes()
+    pub(crate) fn mailbox_id_bytes(&self) -> [u8; 16] {
+        self.mailbox_id.to_bytes()
     }
 
-    pub(crate) fn pairing_id(&self) -> String {
-        self.pairing_id.to_string()
+    pub(crate) fn client_id(&self) -> String {
+        self.client_id.to_string()
     }
 
-    pub(crate) fn pairing_id_bytes(&self) -> [u8; 16] {
-        self.pairing_id.0.to_be_bytes()
+    pub(crate) fn client_id_bytes(&self) -> [u8; 16] {
+        self.client_id.to_bytes()
     }
 
-    pub(crate) fn pairing_psk(&self) -> &[u8] {
-        &self.pairing_psk
+    pub(crate) fn client_token(&self) -> &str {
+        &self.client_token
     }
 
-    pub(crate) fn route_key(&self) -> &[u8] {
-        &self.route_key
+    pub(crate) fn client_psk(&self) -> &[u8] {
+        &self.client_psk
+    }
+
+    pub(crate) fn device_key(&self) -> &[u8] {
+        &self.device_key
     }
 
     pub(crate) fn rotation_key(&self) -> Option<&str> {
@@ -86,24 +100,32 @@ impl Identifier {
     pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(u128::from_be_bytes(bytes))
     }
+}
+
+impl RelayId {
+    pub(crate) fn new(id: Ulid) -> Self {
+        Self(id)
+    }
 
     pub(crate) fn to_bytes(self) -> [u8; 16] {
-        self.0.to_be_bytes()
+        self.0.to_bytes()
     }
 }
 
 impl PendingPairing {
     pub(crate) fn new(
-        route_id: Identifier,
-        pairing_id: Identifier,
-        pairing_psk: Vec<u8>,
-        route_key: Vec<u8>,
+        mailbox_id: RelayId,
+        client_id: RelayId,
+        client_token: String,
+        client_psk: Vec<u8>,
+        device_key: Vec<u8>,
     ) -> Self {
         Self {
-            route_id,
-            pairing_id,
-            pairing_psk,
-            route_key,
+            mailbox_id,
+            client_id,
+            client_token,
+            client_psk,
+            device_key,
         }
     }
 }
@@ -111,6 +133,12 @@ impl PendingPairing {
 impl fmt::Display for Identifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{:032x}", self.0)
+    }
+}
+
+impl fmt::Display for RelayId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -145,6 +173,31 @@ impl Serialize for Identifier {
     }
 }
 
+impl<'de> Deserialize<'de> for RelayId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let id = encoded.parse::<Ulid>().map_err(serde::de::Error::custom)?;
+        if id.to_string() != encoded {
+            return Err(serde::de::Error::custom(
+                "expected a canonical uppercase ULID",
+            ));
+        }
+        Ok(Self(id))
+    }
+}
+
+impl Serialize for RelayId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigurationError {
     #[error("HOME is not set")]
@@ -167,7 +220,7 @@ pub enum ConfigurationError {
         source: serde_json::Error,
     },
 
-    #[error("{path} contains an empty pairing PSK")]
+    #[error("{path} contains an empty client PSK")]
     EmptyPsk { path: PathBuf },
 
     #[error("pairing in {path} is still pending")]
@@ -203,7 +256,7 @@ pub(crate) fn read_pending_pairing() -> Result<Pairing, ConfigurationError> {
             path: path.clone(),
             source,
         })?;
-    if pairing.pairing_psk.is_empty() {
+    if pairing.client_psk.is_empty() {
         return Err(ConfigurationError::EmptyPsk { path });
     }
 
@@ -249,10 +302,11 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
     let rotated_at = current_timestamp()?;
     let contents = serde_json::to_vec_pretty(&PendingPairingFile {
         pending: true,
-        route_id: pairing.route_id,
-        pairing_id: pairing.pairing_id,
-        pairing_psk: &pairing.pairing_psk,
-        route_key: &pairing.route_key,
+        mailbox_id: pairing.mailbox_id,
+        client_id: pairing.client_id,
+        client_token: &pairing.client_token,
+        client_psk: &pairing.client_psk,
+        device_key: &pairing.device_key,
         rotated_at,
     })
     .map_err(|source| ConfigurationError::Invalid {
@@ -343,7 +397,7 @@ impl LockedPairing {
 
     pub(crate) fn write_rotation(
         mut self,
-        pairing_psk: &[u8],
+        client_psk: &[u8],
         rotation_key: &str,
         rotated_at: u64,
     ) -> Result<(), ConfigurationError> {
@@ -352,8 +406,8 @@ impl LockedPairing {
             .as_object_mut()
             .expect("pairing configuration is a JSON object");
         pairing.insert(
-            "pairing_psk".into(),
-            BASE64_STANDARD.encode(pairing_psk).into(),
+            "client_psk".into(),
+            BASE64_STANDARD.encode(client_psk).into(),
         );
         pairing.insert("rotation_key".into(), rotation_key.into());
         pairing.insert("rotated_at".into(), rotated_at.into());
@@ -412,8 +466,8 @@ pub(crate) fn remove_pairing() -> Result<(), ConfigurationError> {
 }
 
 pub(crate) fn remove_active_pairing(
-    expected_route_id: [u8; 16],
-    expected_pairing_id: [u8; 16],
+    expected_mailbox_id: [u8; 16],
+    expected_client_id: [u8; 16],
 ) -> Result<(), ConfigurationError> {
     let pairing_path = pairing_path()?;
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
@@ -429,8 +483,8 @@ pub(crate) fn remove_active_pairing(
             source,
         })?;
     if pairing.pending
-        || pairing.route_id_bytes() != expected_route_id
-        || pairing.pairing_id_bytes() != expected_pairing_id
+        || pairing.mailbox_id_bytes() != expected_mailbox_id
+        || pairing.client_id_bytes() != expected_client_id
     {
         return Err(ConfigurationError::PairingChanged { path });
     }
@@ -573,7 +627,7 @@ fn validate_pairing(path: &Path, pairing: Pairing) -> Result<Pairing, Configurat
             path: path.to_owned(),
         });
     }
-    if pairing.pairing_psk.is_empty() {
+    if pairing.client_psk.is_empty() {
         return Err(ConfigurationError::EmptyPsk {
             path: path.to_owned(),
         });
@@ -615,15 +669,32 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+fn deserialize_client_token<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    let token = BASE64_URL_SAFE
+        .decode(&encoded)
+        .map_err(serde::de::Error::custom)?;
+    if token.len() != 32 || BASE64_URL_SAFE.encode(token) != encoded {
+        return Err(serde::de::Error::custom(
+            "expected a canonical unpadded base64url-encoded 32-byte client token",
+        ));
+    }
+    Ok(encoded)
+}
+
 #[derive(Serialize)]
 struct PendingPairingFile<'a> {
     pending: bool,
-    route_id: Identifier,
-    pairing_id: Identifier,
+    mailbox_id: RelayId,
+    client_id: RelayId,
+    client_token: &'a str,
     #[serde(serialize_with = "serialize_base64")]
-    pairing_psk: &'a [u8],
+    client_psk: &'a [u8],
     #[serde(serialize_with = "serialize_base64")]
-    route_key: &'a [u8],
+    device_key: &'a [u8],
     rotated_at: u64,
 }
 

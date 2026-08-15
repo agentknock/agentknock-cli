@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-    future::Future,
-    pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,7 +8,7 @@ use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
     pairing::{RotationError, maybe_rotate_psk},
-    rest::{self, Relay, RequestState},
+    websocket::{self, Relay},
 };
 
 pub struct CredentialRequest<'a> {
@@ -75,7 +69,7 @@ pub enum RequestError {
     Configuration(#[from] ConfigurationError),
 
     #[error("relay request failed: {0}")]
-    Relay(#[from] reqwest::Error),
+    Relay(String),
 
     #[error("relay returned unexpected HTTP status {0}")]
     UnexpectedRelayStatus(u16),
@@ -139,6 +133,9 @@ pub enum ProtocolError {
 
     #[error("received an ABORTED result in a response")]
     AbortedResponse,
+
+    #[error("device random has length {actual}, expected {expected} bytes")]
+    InvalidDeviceRandomLength { actual: usize, expected: usize },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -245,27 +242,20 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
+    let mut relay = Relay::authenticated(pairing, &request_id.to_string())?;
 
-    let request_started = AtomicBool::new(false);
     progress(CredentialRequestProgress::WaitingForDelivery);
     let response = match tokio::select! {
         biased;
         _ = cancellation.as_mut() => {
-            if request_started.load(Ordering::Relaxed) {
-                complete_cancelled(&mut session, &relay, &request).await;
+            if relay.request_was_sent() {
+                complete_cancelled(&mut session, &mut relay).await;
             }
             return Err(RequestError::Interrupted);
         }
-        response = async {
-            request_started.store(true, Ordering::Relaxed);
-            relay.request_with_state(&request, |state| {
-                progress(match state {
-                    RequestState::Pending => CredentialRequestProgress::WaitingForDelivery,
-                    RequestState::Delivered => CredentialRequestProgress::WaitingForResponse,
-                });
-            }).await
-        } => response,
+        response = relay.request(&request, || {
+            progress(CredentialRequestProgress::WaitingForResponse);
+        }) => response,
     } {
         Ok(response) => response,
         Err(error) => {
@@ -276,10 +266,10 @@ where
                 tokio::select! {
                     biased;
                     _ = cancellation.as_mut() => {
-                        let _ = relay.complete_briefly(&request, &completion).await;
+                        let _ = relay.complete_briefly(&completion).await;
                         return Err(RequestError::Interrupted);
                     }
-                    _ = relay.complete(&request, &completion) => {}
+                    _ = relay.complete(&completion) => {}
                 }
             }
             return Err(error);
@@ -330,28 +320,24 @@ where
     let interrupted = tokio::select! {
         biased;
         _ = cancellation.as_mut() => true,
-        result = relay.complete(&request, &completion) => {
+        result = relay.complete(&completion) => {
             result?;
             progress(CredentialRequestProgress::Completed);
             false
         }
     };
     if interrupted {
-        let _ = relay.complete_briefly(&request, &completion).await;
+        let _ = relay.complete_briefly(&completion).await;
         return Err(RequestError::Interrupted);
     }
 
     exchange_result
 }
 
-fn abort_reason(error: &rest::Error) -> AbortReason {
+fn abort_reason(error: &websocket::Error) -> AbortReason {
     match error {
-        rest::Error::RetriesExhausted { .. } => AbortReason::TimedOut,
-        rest::Error::Relay(error)
-            if error
-                .status()
-                .is_some_and(|status| status.is_client_error()) =>
-        {
+        websocket::Error::RetriesExhausted { .. } => AbortReason::TimedOut,
+        websocket::Error::UnexpectedStatus(status) if (400..500).contains(status) => {
             AbortReason::ClientError
         }
         _ => AbortReason::InvalidResponse,
@@ -369,7 +355,7 @@ fn seal_aborted(
     session.seal_completion(&plaintext).ok()
 }
 
-async fn complete_cancelled(session: &mut Session, relay: &Relay, request: &crypto::Request) {
+async fn complete_cancelled(session: &mut Session, relay: &mut Relay) {
     let Some(completion) = seal_aborted(
         session,
         AbortReason::Cancelled,
@@ -377,7 +363,7 @@ async fn complete_cancelled(session: &mut Session, relay: &Relay, request: &cryp
     ) else {
         return;
     };
-    let _ = relay.complete_briefly(request, &completion).await;
+    let _ = relay.complete_briefly(&completion).await;
 }
 
 impl From<crypto::Error> for ProtocolError {
@@ -391,22 +377,27 @@ impl From<crypto::Error> for ProtocolError {
             crypto::Error::Random(error) => Self::Random(error),
             crypto::Error::KeyDerivation(error) => Self::KeyDerivation(error),
             crypto::Error::Decryption(error) => Self::Decryption(error),
+            crypto::Error::InvalidDeviceRandomLength { actual, expected } => {
+                Self::InvalidDeviceRandomLength { actual, expected }
+            }
         }
     }
 }
 
-impl From<rest::Error> for RequestError {
-    fn from(error: rest::Error) -> Self {
+impl From<websocket::Error> for RequestError {
+    fn from(error: websocket::Error) -> Self {
         match error {
-            rest::Error::Relay(error) => Self::Relay(error),
-            rest::Error::InvalidJson(error) => Self::Protocol(ProtocolError::Json(error)),
-            rest::Error::UnexpectedStatus(status) => Self::UnexpectedRelayStatus(status),
-            rest::Error::RetriesExhausted { failures } => Self::RelayUnavailable { failures },
-            rest::Error::Unauthenticated { code, message } => {
+            websocket::Error::InvalidJson(error) => Self::Protocol(ProtocolError::Json(error)),
+            websocket::Error::UnexpectedStatus(status) => Self::UnexpectedRelayStatus(status),
+            websocket::Error::RetriesExhausted { failures, .. } => {
+                Self::RelayUnavailable { failures }
+            }
+            websocket::Error::Unauthenticated { code, message } => {
                 Self::Unauthenticated { code, message }
             }
-            rest::Error::MissingResponse => Self::Protocol(ProtocolError::MissingResponse),
-            rest::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,
+            websocket::Error::MissingResponse => Self::Protocol(ProtocolError::MissingResponse),
+            websocket::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,
+            error => Self::Relay(error.to_string()),
         }
     }
 }

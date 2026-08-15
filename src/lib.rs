@@ -4,7 +4,7 @@ mod crypto;
 mod pairing;
 mod profiles;
 mod protocol;
-mod rest;
+mod websocket;
 
 pub use config::ConfigurationError;
 pub use credentials::{

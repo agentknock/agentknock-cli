@@ -1,6 +1,9 @@
 use std::{fmt, fs, path::Path};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -8,16 +11,16 @@ use ulid::Ulid;
 use crate::{
     ConfigurationError, ProtocolError, RequestError,
     config::{
-        LockedPairing, abort_pending_pairing, current_timestamp, ensure_pairing_absent,
+        LockedPairing, RelayId, abort_pending_pairing, current_timestamp, ensure_pairing_absent,
         finish_pending_pairing, lock_pairing_for_rotation, lock_pairing_if_rotated_before,
         pairing_path, read_pairing, read_pairing_from, read_pending_pairing, remove_active_pairing,
         remove_pairing, write_pending_pairing,
     },
     crypto::{
-        self, PROTOCOL_VERSION, PairingResponse, Session, derive_pairing_commitment,
-        derive_psk_rotation, derive_route_id, generate_client_random, seal_pairing,
+        self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
+        derive_pairing_commitment, derive_psk_rotation, generate_client_random, seal_pairing,
     },
-    rest::{Relay, RequestState},
+    websocket::Relay,
 };
 
 const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
@@ -62,19 +65,22 @@ where
     let client_random = generate_client_random().map_err(ProtocolError::from)?;
     let commitment = derive_pairing_commitment(address).map_err(ProtocolError::from)?;
     let request_id = Ulid::generate();
-    let route_id = derive_route_id(address).map_err(ProtocolError::from)?;
-    let relay = Relay::new(&route_id.to_string(), &request_id.to_string())?;
+    let client_id = RelayId::new(request_id);
+    let client_token = generate_client_token()?;
+    let address_id = derive_address_id(address).map_err(ProtocolError::from)?;
+    let mut relay = Relay::pairing(
+        &address_id.to_string(),
+        &request_id.to_string(),
+        &client_token,
+    )?;
     let request = PairingRequest {
         version: PROTOCOL_VERSION,
         commitment: BASE64_STANDARD.encode(commitment),
     };
     progress(PairingProgress::WaitingForDelivery);
     let response: PairingResponse = relay
-        .request_with_state(&request, |state| {
-            progress(match state {
-                RequestState::Pending => PairingProgress::WaitingForDelivery,
-                RequestState::Delivered => PairingProgress::WaitingForResponse,
-            });
+        .request(&request, || {
+            progress(PairingProgress::WaitingForResponse);
         })
         .await?;
     progress(PairingProgress::Completing);
@@ -87,12 +93,20 @@ where
         os_version: os_version(),
     };
     let plaintext = crate::protocol::encode(&contents).map_err(ProtocolError::from)?;
-    let (completion, pairing, sas) =
-        seal_pairing(route_id, &request_id, response, &client_random, &plaintext)
-            .map_err(ProtocolError::from)?;
+    let (completion, pairing, sas) = seal_pairing(
+        client_id,
+        client_token,
+        response,
+        &client_random,
+        &plaintext,
+    )
+    .map_err(ProtocolError::from)?;
     write_pending_pairing(&pairing)?;
 
-    relay.complete(&request, &completion).await?;
+    if let Err(error) = relay.complete(&completion).await {
+        let _ = abort_pending_pairing();
+        return Err(error.into());
+    }
     progress(PairingProgress::Completed);
     Ok(PairingSas(sas))
 }
@@ -116,14 +130,11 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
+    let mut relay = Relay::authenticated(&pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = relay
-        .request_with_state(&request, |state| {
-            progress(match state {
-                RequestState::Pending => PairingProgress::WaitingForDelivery,
-                RequestState::Delivered => PairingProgress::WaitingForResponse,
-            });
+        .request(&request, || {
+            progress(PairingProgress::WaitingForResponse);
         })
         .await?;
     progress(PairingProgress::Completing);
@@ -142,7 +153,7 @@ where
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
     finish_pending_pairing()?;
-    relay.complete(&request, &completion).await?;
+    relay.complete(&completion).await?;
     progress(PairingProgress::Completed);
 
     Ok(())
@@ -166,13 +177,13 @@ where
 {
     progress(PairingProgress::Preparing);
     let pairing = read_pairing().map_err(UnpairError::Configuration)?;
-    let route_id = pairing.route_id_bytes();
-    let pairing_id = pairing.pairing_id_bytes();
-    let (relay, request, completion) = prepare_unpair(&pairing, &mut progress)
+    let mailbox_id = pairing.mailbox_id_bytes();
+    let client_id = pairing.client_id_bytes();
+    let (mut relay, completion) = prepare_unpair(&pairing, &mut progress)
         .await
         .map_err(UnpairError::Request)?;
-    remove_active_pairing(route_id, pairing_id).map_err(UnpairError::LocalState)?;
-    let _ = relay.complete_briefly(&request, &completion).await;
+    remove_active_pairing(mailbox_id, client_id).map_err(UnpairError::LocalState)?;
+    let _ = relay.complete_briefly(&completion).await;
     progress(PairingProgress::Completed);
     Ok(())
 }
@@ -180,7 +191,7 @@ where
 async fn prepare_unpair<P>(
     pairing: &crate::config::Pairing,
     progress: &mut P,
-) -> Result<(Relay, crypto::Request, crypto::Completion), RequestError>
+) -> Result<(Relay, crypto::Completion), RequestError>
 where
     P: FnMut(PairingProgress),
 {
@@ -191,14 +202,11 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let relay = Relay::new(&pairing.route_id(), &request_id.to_string())?;
+    let mut relay = Relay::authenticated(pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = relay
-        .request_with_state(&request, |state| {
-            progress(match state {
-                RequestState::Pending => PairingProgress::WaitingForDelivery,
-                RequestState::Delivered => PairingProgress::WaitingForResponse,
-            });
+        .request(&request, || {
+            progress(PairingProgress::WaitingForResponse);
         })
         .await?;
     progress(PairingProgress::Completing);
@@ -211,7 +219,7 @@ where
         .seal_completion(&plaintext)
         .map_err(ProtocolError::from)?;
 
-    Ok((relay, request, completion))
+    Ok((relay, completion))
 }
 
 pub fn rotate_psk() -> Result<(), RotationError> {
@@ -243,7 +251,7 @@ fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RotationError> {
 
 fn rotate_locked(pairing: LockedPairing, rotated_at: u64) -> Result<(), RotationError> {
     let rotation = derive_psk_rotation(pairing.pairing()).map_err(ProtocolError::from)?;
-    pairing.write_rotation(&rotation.pairing_psk, &rotation.rotation_key, rotated_at)?;
+    pairing.write_rotation(&rotation.client_psk, &rotation.rotation_key, rotated_at)?;
     Ok(())
 }
 
@@ -264,7 +272,7 @@ pub enum UnpairError {
     #[error(transparent)]
     Request(RequestError),
 
-    #[error("phone accepted unpairing, but local pairing removal failed: {0}")]
+    #[error("device accepted unpairing, but local pairing removal failed: {0}")]
     LocalState(ConfigurationError),
 }
 
@@ -329,6 +337,12 @@ fn os_version() -> Option<String> {
         .map(str::to_owned)
 }
 
+fn generate_client_token() -> Result<String, ProtocolError> {
+    let mut token = [0; 32];
+    getrandom::fill(&mut token).map_err(ProtocolError::Random)?;
+    Ok(BASE64_URL_SAFE.encode(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_sas;
@@ -343,7 +357,12 @@ mod tests {
     };
 
     #[cfg(unix)]
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{
+            STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE,
+        },
+    };
     #[cfg(unix)]
     use hpke::{
         Deserializable, Kem as KemTrait, OpModeR, PskBundle, Serializable,
@@ -370,21 +389,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rotates_pairing_psk_locally() {
+    fn rotates_client_psk_locally() {
         type Aead = ChaCha20Poly1305;
         type Kdf = HkdfSha256;
         type Kem = X25519HkdfSha256;
         type ExporterSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 
-        const ROUTE_ID: &str = "00112233445566778899aabbccddeeff";
-        const PAIRING_ID: &str = "ffeeddccbbaa99887766554433221100";
+        const MAILBOX_ID: &str = "01K2ENXDTW1P3XAR4J7V7C9D0H";
+        const CLIENT_ID: &str = "01K2EP16NWNAGJYF8J1Q2V6P3X";
         const OLD_PSK: [u8; 32] = [0x42; 32];
         const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
         const NOW: u64 = 2_000_000_000;
 
         let directory = TestDirectory::new();
         let path = directory.path.join("pairing.json");
-        let (route_private_key, route_public_key) = Kem::gen_keypair();
+        let (device_private_key, device_public_key) = Kem::gen_keypair();
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -394,10 +413,11 @@ mod tests {
         serde_json::to_writer_pretty(
             &mut file,
             &json!({
-                "route_id": ROUTE_ID,
-                "pairing_id": PAIRING_ID,
-                "pairing_psk": BASE64_STANDARD.encode(OLD_PSK),
-                "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+                "mailbox_id": MAILBOX_ID,
+                "client_id": CLIENT_ID,
+                "client_token": BASE64_URL_SAFE.encode([0x24; 32]),
+                "client_psk": BASE64_STANDARD.encode(OLD_PSK),
+                "device_key": BASE64_STANDARD.encode(device_public_key.to_bytes()),
                 "rotated_at": NOW - PSK_ROTATION_INTERVAL_SECONDS,
             }),
         )
@@ -432,23 +452,17 @@ mod tests {
             .unwrap();
         let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&rotation_key).unwrap();
         let new_psk = BASE64_STANDARD
-            .decode(pairing["pairing_psk"].as_str().unwrap())
+            .decode(pairing["client_psk"].as_str().unwrap())
             .unwrap();
         assert_ne!(new_psk, OLD_PSK);
 
-        let route_id = u128::from_str_radix(ROUTE_ID, 16).unwrap().to_be_bytes();
-        let pairing_id = u128::from_str_radix(PAIRING_ID, 16).unwrap().to_be_bytes();
-        let info = [
-            crate::crypto::PROTOCOL_VERSION_INFO,
-            route_id,
-            pairing_id,
-            [0; 16],
-        ]
-        .concat();
-        let psk = PskBundle::new(&OLD_PSK, &pairing_id).unwrap();
+        let mailbox_id = MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes();
+        let client_id = CLIENT_ID.parse::<Ulid>().unwrap().to_bytes();
+        let info = [crate::crypto::PROTOCOL_VERSION_INFO, mailbox_id, [0; 16]].concat();
+        let psk = PskBundle::new(&OLD_PSK, &client_id).unwrap();
         let receiver_context = setup_receiver::<Aead, Kdf, Kem>(
             &OpModeR::Psk(psk),
-            &route_private_key,
+            &device_private_key,
             &encapped_key,
             &info,
         )

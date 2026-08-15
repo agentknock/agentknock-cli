@@ -14,10 +14,10 @@ use sha2::Sha256;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::config::{Identifier, Pairing, PendingPairing};
+use crate::config::{Identifier, Pairing, PendingPairing, RelayId};
 
 const BASE_DERIVATION_SALT: &[u8] = b"agentknock-v1";
-const ROUTE_DERIVATION_INFO: &[u8] = b"agentknock-v1 route";
+const ADDRESS_DERIVATION_INFO: &[u8] = b"agentknock-v1 address";
 const COMMITMENT_DERIVATION_INFO: &[u8] = b"agentknock-v1 commitment";
 const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
 const SAS_DERIVATION_INFO: &[u8] = b"agentknock-v1 sas";
@@ -36,12 +36,11 @@ type ResponseKey = AeadKey<ResponseAead>;
 type ResponseNonce = AeadNonce<ResponseAead>;
 
 pub(crate) struct PskRotation {
-    pub(crate) pairing_psk: Vec<u8>,
+    pub(crate) client_psk: Vec<u8>,
     pub(crate) rotation_key: String,
 }
 
 pub(crate) struct Session {
-    pairing_id: String,
     encapped_key: Vec<u8>,
     rotation_key: Option<String>,
     sender_context: SenderContext,
@@ -53,7 +52,6 @@ impl Session {
         let (encapped_key, sender_context) = setup_pairing_sender(pairing, request_id.to_bytes())?;
 
         Ok(Self {
-            pairing_id: pairing.pairing_id(),
             encapped_key,
             rotation_key: pairing.rotation_key().map(str::to_owned),
             sender_context,
@@ -68,7 +66,6 @@ impl Session {
 
         Ok(Request {
             version: PROTOCOL_VERSION,
-            pairing_id: self.pairing_id.clone(),
             key: BASE64_STANDARD.encode(&self.encapped_key),
             ciphertext: BASE64_STANDARD.encode(ciphertext),
             rotation_key: self.rotation_key.clone(),
@@ -118,11 +115,11 @@ impl Session {
 
 pub(crate) fn derive_psk_rotation(pairing: &Pairing) -> Result<PskRotation, Error> {
     let (encapped_key, sender_context) = setup_pairing_sender(pairing, [0; 16])?;
-    let mut pairing_psk = ExporterSecret::default();
-    sender_context.export(PSK_EXPORT_CONTEXT, &mut pairing_psk)?;
+    let mut client_psk = ExporterSecret::default();
+    sender_context.export(PSK_EXPORT_CONTEXT, &mut client_psk)?;
 
     Ok(PskRotation {
-        pairing_psk: pairing_psk.to_vec(),
+        client_psk: client_psk.to_vec(),
         rotation_key: BASE64_STANDARD.encode(encapped_key),
     })
 }
@@ -131,46 +128,53 @@ fn setup_pairing_sender(
     pairing: &Pairing,
     request_id: [u8; 16],
 ) -> Result<(Vec<u8>, SenderContext), Error> {
-    let route_key = <Kem as KemTrait>::PublicKey::from_bytes(pairing.route_key())?;
-    let pairing_id = pairing.pairing_id_bytes();
+    let device_key = <Kem as KemTrait>::PublicKey::from_bytes(pairing.device_key())?;
+    let client_id = pairing.client_id_bytes();
     let info = [
         PROTOCOL_VERSION_INFO,
-        pairing.route_id_bytes(),
-        pairing_id,
+        pairing.mailbox_id_bytes(),
         request_id,
     ]
     .concat();
-    let psk = PskBundle::new(pairing.pairing_psk(), &pairing_id)?;
+    let psk = PskBundle::new(pairing.client_psk(), &client_id)?;
     let (encapped_key, sender_context) =
-        setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &route_key, &info)?;
+        setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &device_key, &info)?;
     Ok((encapped_key.to_bytes().to_vec(), sender_context))
 }
 
 pub(crate) fn seal_pairing(
-    route_id: Identifier,
-    request_id: &Ulid,
+    client_id: RelayId,
+    client_token: String,
     response: PairingResponse,
     client_random: &[u8],
     plaintext: &[u8],
 ) -> Result<(PairingCompletion, PendingPairing, u64), Error> {
-    let route_key = <Kem as KemTrait>::PublicKey::from_bytes(&response.route_key)?;
-    let pairing_id = response.pairing_id.to_bytes();
-    let info = [
-        PROTOCOL_VERSION_INFO,
-        route_id.to_bytes(),
-        pairing_id,
-        request_id.to_bytes(),
-    ]
-    .concat();
+    let device_key = <Kem as KemTrait>::PublicKey::from_bytes(&response.device_key)?;
+    let mailbox_id_bytes = response.mailbox_id.to_bytes();
+    let client_id_bytes = client_id.to_bytes();
+    let info = [PROTOCOL_VERSION_INFO, mailbox_id_bytes, client_id_bytes].concat();
     let (encapped_key, mut sender_context) =
-        setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &route_key, &info)?;
+        setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &device_key, &info)?;
     let ciphertext = sender_context.seal(plaintext, b"")?;
-    let mut pairing_psk = ExporterSecret::default();
-    sender_context.export(PSK_EXPORT_CONTEXT, &mut pairing_psk)?;
-    let mut sas_ikm = Vec::with_capacity(client_random.len() + response.route_key.len());
+    let mut client_psk = ExporterSecret::default();
+    sender_context.export(PSK_EXPORT_CONTEXT, &mut client_psk)?;
+    if response.device_random.len() != ExporterSecret::default().len() {
+        return Err(Error::InvalidDeviceRandomLength {
+            actual: response.device_random.len(),
+            expected: ExporterSecret::default().len(),
+        });
+    }
+    let mut sas_ikm = Vec::with_capacity(
+        mailbox_id_bytes.len()
+            + client_id_bytes.len()
+            + client_random.len()
+            + response.device_key.len(),
+    );
+    sas_ikm.extend_from_slice(&mailbox_id_bytes);
+    sas_ikm.extend_from_slice(&client_id_bytes);
     sas_ikm.extend_from_slice(client_random);
-    sas_ikm.extend_from_slice(&response.route_key);
-    let hkdf = Hkdf::<Sha256>::new(Some(&pairing_id), &sas_ikm);
+    sas_ikm.extend_from_slice(&response.device_key);
+    let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), &sas_ikm);
     let mut sas = [0; 8];
     hkdf.expand(SAS_DERIVATION_INFO, &mut sas)?;
     let sas = u64::from_be_bytes(sas) % SAS_DECIMAL_MODULUS;
@@ -179,20 +183,21 @@ pub(crate) fn seal_pairing(
         ciphertext: BASE64_STANDARD.encode(ciphertext),
     };
     let pairing = PendingPairing::new(
-        route_id,
-        response.pairing_id,
-        pairing_psk.to_vec(),
-        response.route_key,
+        response.mailbox_id,
+        client_id,
+        client_token,
+        client_psk.to_vec(),
+        response.device_key,
     );
 
     Ok((completion, pairing, sas))
 }
 
-pub(crate) fn derive_route_id(address: &str) -> Result<Identifier, Error> {
+pub(crate) fn derive_address_id(address: &str) -> Result<Identifier, Error> {
     let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), address.as_bytes());
-    let mut route_id = [0; 16];
-    hkdf.expand(ROUTE_DERIVATION_INFO, &mut route_id)?;
-    Ok(Identifier::from_bytes(route_id))
+    let mut address_id = [0; 16];
+    hkdf.expand(ADDRESS_DERIVATION_INFO, &mut address_id)?;
+    Ok(Identifier::from_bytes(address_id))
 }
 
 pub(crate) fn generate_client_random() -> Result<Vec<u8>, Error> {
@@ -228,7 +233,6 @@ impl SessionState {
 #[derive(Serialize)]
 pub(crate) struct Request {
     version: &'static str,
-    pairing_id: String,
     key: String,
     ciphertext: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,9 +252,11 @@ pub(crate) struct Completion {
 
 #[derive(Deserialize)]
 pub(crate) struct PairingResponse {
-    pairing_id: Identifier,
+    mailbox_id: RelayId,
     #[serde(deserialize_with = "deserialize_base64")]
-    route_key: Vec<u8>,
+    device_key: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_base64")]
+    device_random: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -281,6 +287,9 @@ pub(crate) enum Error {
 
     #[error("response decryption failed")]
     Decryption(#[from] chacha20poly1305::aead::Error),
+
+    #[error("device random has length {actual}, expected {expected} bytes")]
+    InvalidDeviceRandomLength { actual: usize, expected: usize },
 }
 
 fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -300,10 +309,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_route_id_from_pairing_address() {
+    fn derives_address_id_from_pairing_address() {
         assert_eq!(
-            derive_route_id("yup-its-free").unwrap().to_string(),
-            "0b7d7963604cba911e9c03e727688b89"
+            derive_address_id("yup-its-free").unwrap().to_string(),
+            "9e6f33bf47382846903dffa0962ea313"
         );
     }
 
@@ -363,10 +372,11 @@ mod tests {
 
         let (route_private_key, route_public_key) = Kem::gen_keypair();
         let pairing: Pairing = serde_json::from_value(json!({
-            "route_id": "00112233445566778899aabbccddeeff",
-            "pairing_id": "ffeeddccbbaa99887766554433221100",
-            "pairing_psk": BASE64_STANDARD.encode([0x42; 32]),
-            "route_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+            "mailbox_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+            "client_id": "01K2EP16NWNAGJYF8J1Q2V6P3X",
+            "client_token": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x24; 32]),
+            "client_psk": BASE64_STANDARD.encode([0x42; 32]),
+            "device_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
             "rotated_at": 1_700_000_000,
         }))
         .unwrap();
@@ -377,14 +387,13 @@ mod tests {
         let encapped_key = BASE64_STANDARD.decode(request.key).unwrap();
         let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&encapped_key).unwrap();
         let ciphertext = BASE64_STANDARD.decode(request.ciphertext).unwrap();
-        let pairing_id = pairing.pairing_id_bytes();
-        let psk = PskBundle::new(pairing.pairing_psk(), &pairing_id).unwrap();
+        let client_id = pairing.client_id_bytes();
+        let psk = PskBundle::new(pairing.client_psk(), &client_id).unwrap();
         let mut other_version = PROTOCOL_VERSION_INFO;
         other_version[12] = b'2';
         let info = [
             other_version,
-            pairing.route_id_bytes(),
-            pairing_id,
+            pairing.mailbox_id_bytes(),
             request_id.to_bytes(),
         ]
         .concat();
@@ -400,12 +409,13 @@ mod tests {
     }
 
     fn test_session() -> Session {
-        let (_, route_key) = Kem::gen_keypair();
+        let (_, device_key) = Kem::gen_keypair();
         let pairing: Pairing = serde_json::from_value(json!({
-            "route_id": "00112233445566778899aabbccddeeff",
-            "pairing_id": "ffeeddccbbaa99887766554433221100",
-            "pairing_psk": BASE64_STANDARD.encode([0x42; 32]),
-            "route_key": BASE64_STANDARD.encode(route_key.to_bytes()),
+            "mailbox_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+            "client_id": "01K2EP16NWNAGJYF8J1Q2V6P3X",
+            "client_token": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x24; 32]),
+            "client_psk": BASE64_STANDARD.encode([0x42; 32]),
+            "device_key": BASE64_STANDARD.encode(device_key.to_bytes()),
             "rotated_at": 1_700_000_000,
         }))
         .unwrap();

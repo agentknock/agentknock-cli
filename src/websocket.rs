@@ -1,0 +1,881 @@
+use std::{env, time::Duration};
+
+use futures_util::{SinkExt as _, StreamExt as _};
+use http::{HeaderValue, header::AUTHORIZATION};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::{net::TcpStream, time::Instant};
+use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, WebSocketStream, upgrade};
+
+use crate::config::Pairing;
+
+const RELAY_URL: &str = "wss://relay.agentknock.dev";
+const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
+const MAXIMUM_FRAME_SIZE: usize = 256 * 1024;
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+const NORMAL_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    connection_timeout: Duration::from_secs(15),
+    retry_delay: Duration::from_secs(1),
+    failure_timeout: Duration::from_secs(2 * 60),
+    maximum_failures: 10,
+};
+const BRIEF_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    connection_timeout: Duration::from_secs(2),
+    retry_delay: Duration::from_millis(250),
+    failure_timeout: Duration::from_secs(5),
+    maximum_failures: 2,
+};
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    connection_timeout: Duration,
+    retry_delay: Duration,
+    failure_timeout: Duration,
+    maximum_failures: usize,
+}
+
+pub(crate) struct Relay {
+    url: String,
+    authorization: HeaderValue,
+    client_id: String,
+    request_id: String,
+    socket: Option<Socket>,
+    request: Option<OutgoingMessage>,
+    response: Option<Value>,
+    completion: Option<OutgoingMessage>,
+}
+
+struct OutgoingMessage {
+    encoded: String,
+    sent: bool,
+    acknowledged: bool,
+    delivered: bool,
+}
+
+impl Relay {
+    pub(crate) fn pairing(
+        address_id: &str,
+        client_id: &str,
+        client_token: &str,
+    ) -> Result<Self, Error> {
+        let path = format!("/v1/address/{address_id}/request/{client_id}");
+        Self::new(path, client_id, client_id, client_token)
+    }
+
+    pub(crate) fn authenticated(pairing: &Pairing, request_id: &str) -> Result<Self, Error> {
+        let path = format!(
+            "/v1/mailbox/{}/client/{}",
+            pairing.mailbox_id(),
+            pairing.client_id(),
+        );
+        Self::new(
+            path,
+            &pairing.client_id(),
+            request_id,
+            pairing.client_token(),
+        )
+    }
+
+    fn new(
+        path: String,
+        client_id: &str,
+        request_id: &str,
+        client_token: &str,
+    ) -> Result<Self, Error> {
+        let relay_url = match env::var(TEST_RELAY_URL_ENV) {
+            Ok(relay_url) => relay_url,
+            Err(env::VarError::NotPresent) => RELAY_URL.to_owned(),
+            Err(env::VarError::NotUnicode(_)) => return Err(Error::InvalidTestRelayUrl),
+        };
+        let authorization = HeaderValue::from_str(&format!("Bearer {client_token}"))
+            .map_err(|_| Error::InvalidClientToken)?;
+
+        Ok(Self {
+            url: format!("{}{path}", relay_url.trim_end_matches('/')),
+            authorization,
+            client_id: client_id.to_owned(),
+            request_id: request_id.to_owned(),
+            socket: None,
+            request: None,
+            response: None,
+            completion: None,
+        })
+    }
+
+    pub(crate) fn request_was_sent(&self) -> bool {
+        self.request.as_ref().is_some_and(|request| request.sent)
+    }
+
+    pub(crate) async fn request<B, R, F>(
+        &mut self,
+        request: &B,
+        mut delivered: F,
+    ) -> Result<R, Error>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+        F: FnMut(),
+    {
+        if self.request.is_some() {
+            return Err(Error::Protocol("request was already started".into()));
+        }
+        self.request = Some(OutgoingMessage::new(
+            self.message(MessageKind::Request, request)?,
+        )?);
+
+        let mut recovery = Recovery::new(NORMAL_RETRY_POLICY);
+        loop {
+            let reconnected = self.ensure_connected(&mut recovery).await?;
+            if reconnected {
+                if self.request_message().acknowledged {
+                    if !self.send_resume(&mut recovery).await? {
+                        continue;
+                    }
+                } else if !self.send_request(&mut recovery).await? {
+                    continue;
+                }
+            }
+
+            let incoming = match self.receive(&mut recovery).await? {
+                Some(incoming) => incoming,
+                None => continue,
+            };
+            match self.validate(incoming)? {
+                Incoming::Ack {
+                    kind: MessageKind::Request,
+                    ..
+                } => {
+                    self.request_mut().acknowledged = true;
+                }
+                Incoming::Receipt {
+                    kind: MessageKind::Request,
+                    ..
+                } => {
+                    self.request_mut().acknowledged = true;
+                    self.request_mut().delivered = true;
+                    delivered();
+                }
+                Incoming::Message {
+                    kind: MessageKind::Response,
+                    payload,
+                    ..
+                } => {
+                    self.request_mut().acknowledged = true;
+                    self.request_mut().delivered = true;
+                    delivered();
+                    if self.response.is_none() {
+                        self.response = Some(payload);
+                    }
+                    if self.send_ack(MessageKind::Response, &mut recovery).await? {
+                        return self.decode_response();
+                    }
+                }
+                Incoming::State {
+                    exchange,
+                    request,
+                    response,
+                    ..
+                } => {
+                    self.apply_request_state(request, &mut delivered);
+                    if response == MessageState::Delivered {
+                        return self.decode_response();
+                    }
+                    if matches!(exchange, ExchangeState::Settled | ExchangeState::Expired) {
+                        return Err(Error::MissingResponse);
+                    }
+                }
+                Incoming::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                Incoming::Error {
+                    error,
+                    message,
+                    retryable,
+                    retry_after_ms,
+                    ..
+                } => {
+                    if !retryable {
+                        return Err(Error::RelayRejected {
+                            code: error,
+                            message,
+                        });
+                    }
+                    self.socket = None;
+                    recovery.last_error = format!("relay requested retry: {error}: {message}");
+                    recovery
+                        .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) async fn complete<C>(&mut self, completion: &C) -> Result<(), Error>
+    where
+        C: Serialize + ?Sized,
+    {
+        self.complete_with_policy(completion, NORMAL_RETRY_POLICY)
+            .await
+    }
+
+    pub(crate) async fn complete_briefly<C>(&mut self, completion: &C) -> Result<(), Error>
+    where
+        C: Serialize + ?Sized,
+    {
+        self.complete_with_policy(completion, BRIEF_RETRY_POLICY)
+            .await
+    }
+
+    async fn complete_with_policy<C>(
+        &mut self,
+        completion: &C,
+        policy: RetryPolicy,
+    ) -> Result<(), Error>
+    where
+        C: Serialize + ?Sized,
+    {
+        if self.request.is_none() {
+            return Err(Error::Protocol(
+                "completion cannot be sent before a request".into(),
+            ));
+        }
+        if self.completion.is_none() {
+            self.completion = Some(OutgoingMessage::new(
+                self.message(MessageKind::Completion, completion)?,
+            )?);
+        }
+
+        let mut recovery = Recovery::new(policy);
+        loop {
+            let reconnected = self.ensure_connected(&mut recovery).await?;
+            if reconnected {
+                if self.request_message().acknowledged {
+                    if !self.send_resume(&mut recovery).await? {
+                        continue;
+                    }
+                } else if !self.send_request(&mut recovery).await? {
+                    continue;
+                }
+            }
+
+            if !self.request_message().acknowledged {
+                let Some(incoming) = self.receive(&mut recovery).await? else {
+                    continue;
+                };
+                match self.validate(incoming)? {
+                    Incoming::Ack {
+                        kind: MessageKind::Request,
+                        ..
+                    } => {
+                        self.request_mut().acknowledged = true;
+                    }
+                    Incoming::Receipt {
+                        kind: MessageKind::Request,
+                        ..
+                    } => {
+                        self.request_mut().acknowledged = true;
+                        self.request_mut().delivered = true;
+                    }
+                    Incoming::Message {
+                        kind: MessageKind::Response,
+                        payload,
+                        ..
+                    } => {
+                        self.request_mut().acknowledged = true;
+                        self.request_mut().delivered = true;
+                        self.response.get_or_insert(payload);
+                        if !self.send_ack(MessageKind::Response, &mut recovery).await? {
+                            continue;
+                        }
+                    }
+                    Incoming::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                    Incoming::Error {
+                        error,
+                        message,
+                        retryable,
+                        retry_after_ms,
+                        ..
+                    } => {
+                        if !retryable {
+                            return Err(Error::RelayRejected {
+                                code: error,
+                                message,
+                            });
+                        }
+                        self.socket = None;
+                        recovery.last_error = format!("relay requested retry: {error}: {message}");
+                        recovery
+                            .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
+                            .await?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if (reconnected || !self.completion().sent)
+                && !self.send_completion(&mut recovery).await?
+            {
+                continue;
+            }
+
+            let Some(incoming) = self.receive(&mut recovery).await? else {
+                continue;
+            };
+            match self.validate(incoming)? {
+                Incoming::Ack {
+                    kind: MessageKind::Completion,
+                    ..
+                } => {
+                    self.completion_mut().acknowledged = true;
+                    return Ok(());
+                }
+                Incoming::Message {
+                    kind: MessageKind::Response,
+                    payload,
+                    ..
+                } => {
+                    self.response.get_or_insert(payload);
+                    if !self.send_ack(MessageKind::Response, &mut recovery).await? {
+                        continue;
+                    }
+                }
+                Incoming::State {
+                    completion:
+                        MessageState::Accepted | MessageState::Delivered | MessageState::Discarded,
+                    ..
+                } => {
+                    self.completion_mut().acknowledged = true;
+                    return Ok(());
+                }
+                Incoming::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                Incoming::Error {
+                    error,
+                    message,
+                    retryable,
+                    retry_after_ms,
+                    ..
+                } => {
+                    if !retryable {
+                        return Err(Error::RelayRejected {
+                            code: error,
+                            message,
+                        });
+                    }
+                    self.socket = None;
+                    recovery.last_error = format!("relay requested retry: {error}: {message}");
+                    recovery
+                        .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn message<B>(&self, kind: MessageKind, payload: &B) -> Result<String, Error>
+    where
+        B: Serialize + ?Sized,
+    {
+        serde_json::to_string(&Outgoing::Message {
+            client_id: &self.client_id,
+            request_id: &self.request_id,
+            kind,
+            payload,
+        })
+        .map_err(Error::InvalidJson)
+    }
+
+    async fn ensure_connected(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+        if self.socket.is_some() {
+            return Ok(false);
+        }
+        loop {
+            let builder = ClientBuilder::new()
+                .uri(&self.url)
+                .map_err(|error| Error::InvalidRelayUrl(error.to_string()))?
+                .limits(Limits::default().max_payload_len(Some(MAXIMUM_FRAME_SIZE)))
+                .add_header(AUTHORIZATION, self.authorization.clone())?;
+            match tokio::time::timeout(recovery.policy.connection_timeout, builder.connect()).await
+            {
+                Ok(Ok((socket, _))) => {
+                    self.socket = Some(socket);
+                    return Ok(true);
+                }
+                Ok(Err(tokio_websockets::Error::Upgrade(
+                    upgrade::Error::DidNotSwitchProtocols(status),
+                ))) if status < 500 => return Err(Error::UnexpectedStatus(status)),
+                Ok(Err(error)) => recovery.failed_with(error.to_string()).await?,
+                Err(_) => recovery.failed_with("connection timed out".into()).await?,
+            }
+        }
+    }
+
+    async fn send_request(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+        let encoded = self.request_message().encoded.clone();
+        let sent = self.send_text(encoded, recovery).await?;
+        self.request_mut().sent |= sent;
+        Ok(sent)
+    }
+
+    async fn send_completion(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+        let encoded = self.completion().encoded.clone();
+        let sent = self.send_text(encoded, recovery).await?;
+        self.completion_mut().sent |= sent;
+        Ok(sent)
+    }
+
+    async fn send_resume(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+        let frame: Outgoing<'_, ()> = Outgoing::Resume {
+            client_id: &self.client_id,
+            request_id: &self.request_id,
+        };
+        let encoded = serde_json::to_string(&frame).map_err(Error::InvalidJson)?;
+        self.send_text(encoded, recovery).await
+    }
+
+    async fn send_ack(
+        &mut self,
+        kind: MessageKind,
+        recovery: &mut Recovery,
+    ) -> Result<bool, Error> {
+        let frame: Outgoing<'_, ()> = Outgoing::Ack {
+            client_id: &self.client_id,
+            request_id: &self.request_id,
+            kind,
+        };
+        let encoded = serde_json::to_string(&frame).map_err(Error::InvalidJson)?;
+        self.send_text(encoded, recovery).await
+    }
+
+    async fn send_text(&mut self, encoded: String, recovery: &mut Recovery) -> Result<bool, Error> {
+        if encoded.len() > MAXIMUM_FRAME_SIZE {
+            return Err(Error::FrameTooLarge(encoded.len()));
+        }
+        let result = self
+            .socket
+            .as_mut()
+            .expect("socket is connected")
+            .send(Message::text(encoded))
+            .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.socket = None;
+                recovery.failed_with(error.to_string()).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn receive(&mut self, recovery: &mut Recovery) -> Result<Option<Incoming>, Error> {
+        loop {
+            let message = match tokio::time::timeout(
+                PING_INTERVAL,
+                self.socket.as_mut().expect("socket is connected").next(),
+            )
+            .await
+            {
+                Ok(message) => message,
+                Err(_) => {
+                    if let Err(error) = self
+                        .socket
+                        .as_mut()
+                        .expect("socket is connected")
+                        .send(Message::ping(Vec::new()))
+                        .await
+                    {
+                        self.socket = None;
+                        recovery.failed_with(error.to_string()).await?;
+                        return Ok(None);
+                    }
+                    match tokio::time::timeout(
+                        PONG_TIMEOUT,
+                        self.socket.as_mut().expect("socket is connected").next(),
+                    )
+                    .await
+                    {
+                        Ok(message) => message,
+                        Err(_) => {
+                            self.socket = None;
+                            recovery
+                                .failed_with("relay did not answer a WebSocket ping".into())
+                                .await?;
+                            return Ok(None);
+                        }
+                    }
+                }
+            };
+
+            let Some(message) = message else {
+                self.socket = None;
+                recovery
+                    .failed_with("relay closed the WebSocket".into())
+                    .await?;
+                return Ok(None);
+            };
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    self.socket = None;
+                    recovery.failed_with(error.to_string()).await?;
+                    return Ok(None);
+                }
+            };
+            if let Some((code, reason)) = message.as_close() {
+                let code = u16::from(code);
+                self.socket = None;
+                if matches!(code, 4002 | 4003) {
+                    return Err(Error::PairingInactive {
+                        code,
+                        reason: reason.to_owned(),
+                    });
+                }
+                recovery
+                    .failed_with(format!("relay closed the WebSocket ({code} {reason})"))
+                    .await?;
+                return Ok(None);
+            }
+            if message.is_ping() {
+                let payload = message.into_payload();
+                if let Err(error) = self
+                    .socket
+                    .as_mut()
+                    .expect("socket is connected")
+                    .send(Message::pong(payload))
+                    .await
+                {
+                    self.socket = None;
+                    recovery.failed_with(error.to_string()).await?;
+                    return Ok(None);
+                }
+                recovery.succeeded();
+                continue;
+            }
+            if message.is_pong() {
+                recovery.succeeded();
+                continue;
+            }
+            let Some(text) = message.as_text() else {
+                return Err(Error::Protocol(
+                    "relay sent a binary WebSocket frame".into(),
+                ));
+            };
+            let incoming: Incoming = serde_json::from_str(text).map_err(Error::InvalidJson)?;
+            if !incoming.is_retryable_error() {
+                recovery.succeeded();
+            }
+            return Ok(Some(incoming));
+        }
+    }
+
+    fn validate(&self, incoming: Incoming) -> Result<Incoming, Error> {
+        if let Some(client_id) = incoming.client_id()
+            && client_id != self.client_id
+        {
+            return Err(Error::Protocol(
+                "relay frame has the wrong client_id".into(),
+            ));
+        }
+        if let Some(request_id) = incoming.request_id()
+            && request_id != self.request_id
+        {
+            return Err(Error::Protocol(
+                "relay frame has the wrong request_id".into(),
+            ));
+        }
+        Ok(incoming)
+    }
+
+    fn apply_request_state<F>(&mut self, state: MessageState, delivered: &mut F)
+    where
+        F: FnMut(),
+    {
+        match state {
+            MessageState::Accepted => self.request_mut().acknowledged = true,
+            MessageState::Delivered => {
+                self.request_mut().acknowledged = true;
+                self.request_mut().delivered = true;
+                delivered();
+            }
+            MessageState::Absent | MessageState::Discarded => {}
+        }
+    }
+
+    fn decode_response<R: DeserializeOwned>(&self) -> Result<R, Error> {
+        let response = self.response.clone().ok_or(Error::MissingResponse)?;
+        match serde_json::from_value(response).map_err(Error::InvalidJson)? {
+            ApplicationResponse::Message(response) => Ok(response),
+            ApplicationResponse::Error(error) => Err(Error::Unauthenticated {
+                code: error.error,
+                message: error.message,
+            }),
+        }
+    }
+
+    fn request_message(&self) -> &OutgoingMessage {
+        self.request.as_ref().expect("request exists")
+    }
+
+    fn request_mut(&mut self) -> &mut OutgoingMessage {
+        self.request.as_mut().expect("request exists")
+    }
+
+    fn completion(&self) -> &OutgoingMessage {
+        self.completion.as_ref().expect("completion exists")
+    }
+
+    fn completion_mut(&mut self) -> &mut OutgoingMessage {
+        self.completion.as_mut().expect("completion exists")
+    }
+}
+
+impl OutgoingMessage {
+    fn new(encoded: String) -> Result<Self, Error> {
+        if encoded.len() > MAXIMUM_FRAME_SIZE {
+            return Err(Error::FrameTooLarge(encoded.len()));
+        }
+        Ok(Self {
+            encoded,
+            sent: false,
+            acknowledged: false,
+            delivered: false,
+        })
+    }
+}
+
+struct Recovery {
+    policy: RetryPolicy,
+    first_failure: Option<Instant>,
+    failures: usize,
+    last_error: String,
+}
+
+impl Recovery {
+    fn new(policy: RetryPolicy) -> Self {
+        Self {
+            policy,
+            first_failure: None,
+            failures: 0,
+            last_error: String::new(),
+        }
+    }
+
+    fn succeeded(&mut self) {
+        self.first_failure = None;
+        self.failures = 0;
+        self.last_error.clear();
+    }
+
+    async fn failed_with(&mut self, error: String) -> Result<(), Error> {
+        self.last_error = error;
+        self.failed(self.policy.retry_delay).await
+    }
+
+    async fn failed(&mut self, delay: Duration) -> Result<(), Error> {
+        let first_failure = *self.first_failure.get_or_insert_with(Instant::now);
+        self.failures += 1;
+        let deadline = first_failure + self.policy.failure_timeout;
+        if self.failures >= self.policy.maximum_failures || Instant::now() >= deadline {
+            return Err(Error::RetriesExhausted {
+                failures: self.failures,
+                last_error: self.last_error.clone(),
+            });
+        }
+        tokio::time::sleep(delay.min(deadline.saturating_duration_since(Instant::now()))).await;
+        if Instant::now() >= deadline {
+            return Err(Error::RetriesExhausted {
+                failures: self.failures,
+                last_error: self.last_error.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MessageKind {
+    Request,
+    Response,
+    Completion,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Outgoing<'a, B: ?Sized> {
+    Message {
+        client_id: &'a str,
+        request_id: &'a str,
+        kind: MessageKind,
+        payload: &'a B,
+    },
+    Ack {
+        client_id: &'a str,
+        request_id: &'a str,
+        kind: MessageKind,
+    },
+    Resume {
+        client_id: &'a str,
+        request_id: &'a str,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Incoming {
+    Ack {
+        client_id: String,
+        request_id: String,
+        kind: MessageKind,
+    },
+    Receipt {
+        client_id: String,
+        request_id: String,
+        kind: MessageKind,
+    },
+    Message {
+        client_id: String,
+        request_id: String,
+        kind: MessageKind,
+        payload: Value,
+    },
+    State {
+        client_id: String,
+        request_id: String,
+        exchange: ExchangeState,
+        request: MessageState,
+        response: MessageState,
+        completion: MessageState,
+    },
+    Inactive {
+        client_id: String,
+        request_id: String,
+        #[serde(default)]
+        kind: Option<MessageKind>,
+    },
+    Error {
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        request_id: Option<String>,
+        error: String,
+        message: String,
+        retryable: bool,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    },
+}
+
+impl Incoming {
+    fn is_retryable_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Error {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
+    fn client_id(&self) -> Option<&str> {
+        match self {
+            Self::Ack { client_id, .. }
+            | Self::Receipt { client_id, .. }
+            | Self::Message { client_id, .. }
+            | Self::State { client_id, .. }
+            | Self::Inactive { client_id, .. } => Some(client_id),
+            Self::Error { client_id, .. } => client_id.as_deref(),
+        }
+    }
+
+    fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Ack { request_id, .. }
+            | Self::Receipt { request_id, .. }
+            | Self::Message { request_id, .. }
+            | Self::State { request_id, .. }
+            | Self::Inactive { request_id, .. } => Some(request_id),
+            Self::Error { request_id, .. } => request_id.as_deref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ExchangeState {
+    Open,
+    Closing,
+    Settled,
+    Expired,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum MessageState {
+    Absent,
+    Accepted,
+    Delivered,
+    Discarded,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ApplicationResponse<R> {
+    Error(UnauthenticatedError),
+    Message(R),
+}
+
+#[derive(Deserialize)]
+struct UnauthenticatedError {
+    error: String,
+    message: String,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum Error {
+    #[error("relay returned invalid JSON: {0}")]
+    InvalidJson(serde_json::Error),
+
+    #[error("relay returned unexpected HTTP status {0}")]
+    UnexpectedStatus(u16),
+
+    #[error("relay protocol error: {0}")]
+    Protocol(String),
+
+    #[error("relay response did not include a response message")]
+    MissingResponse,
+
+    #[error("received unauthenticated error {code}: {message:?}")]
+    Unauthenticated { code: String, message: String },
+
+    #[error("relay rejected the exchange with {code}: {message}")]
+    RelayRejected { code: String, message: String },
+
+    #[error("relay reported that the exchange is inactive")]
+    Inactive { kind: Option<MessageKind> },
+
+    #[error("paired client is not active ({code} {reason})")]
+    PairingInactive { code: u16, reason: String },
+
+    #[error("relay remained unavailable after {failures} consecutive failures: {last_error}")]
+    RetriesExhausted { failures: usize, last_error: String },
+
+    #[error("WebSocket frame has {0} bytes, exceeding the 256 KiB limit")]
+    FrameTooLarge(usize),
+
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(String),
+
+    #[error("client token cannot be used in an Authorization header")]
+    InvalidClientToken,
+
+    #[error("WebSocket setup failed: {0}")]
+    WebSocket(#[from] tokio_websockets::Error),
+
+    #[error("{TEST_RELAY_URL_ENV} is not valid UTF-8")]
+    InvalidTestRelayUrl,
+}

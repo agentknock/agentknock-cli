@@ -99,11 +99,11 @@ struct Cli {
     #[arg(long)]
     unpair: bool,
 
-    /// Remove only the local pairing, without contacting the phone.
+    /// Remove only the local pairing, without contacting the device.
     #[arg(long, requires = "unpair")]
     force: bool,
 
-    /// List the profiles available from the paired phone.
+    /// List the profiles available from the paired device.
     #[arg(long)]
     list: bool,
 
@@ -289,7 +289,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             if force {
                 force_unpair().map_err(CommandError::ForceUnpair)?;
                 println!(
-                    "AgentKnock removed the local pairing. The phone-side pairing was not changed."
+                    "AgentKnock removed the local pairing. The device-side pairing was not changed."
                 );
             } else {
                 unpair_for_cli().await.map_err(CommandError::Unpair)?;
@@ -383,10 +383,10 @@ fn profile_list_progress_message(progress: ProfileListProgress) -> &'static str 
     match progress {
         ProfileListProgress::Preparing => "AgentKnock prepares the profile list request.",
         ProfileListProgress::WaitingForDelivery => {
-            "AgentKnock waits for the phone to receive the profile list request."
+            "AgentKnock waits for the device to receive the profile list request."
         }
         ProfileListProgress::WaitingForResponse => {
-            "The phone received the profile list request. AgentKnock waits for a response from the phone."
+            "The device received the profile list request. AgentKnock waits for a response from the device."
         }
         ProfileListProgress::Completing => {
             "AgentKnock received the profile list. AgentKnock confirms receipt."
@@ -404,10 +404,10 @@ fn pairing_progress_message(
             "AgentKnock prepares the pairing request."
         }
         (PairingOperation::Start, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the phone to receive the pairing request."
+            "AgentKnock waits for the device to receive the pairing request."
         }
         (PairingOperation::Start, PairingProgress::WaitingForResponse) => {
-            "The phone received the pairing request. AgentKnock waits for a response from the phone."
+            "The device received the pairing request. AgentKnock waits for a response from the device."
         }
         (PairingOperation::Start, PairingProgress::Completing) => {
             "AgentKnock received the pairing response. AgentKnock saves the pending pairing."
@@ -419,13 +419,13 @@ fn pairing_progress_message(
             "AgentKnock prepares the pairing confirmation."
         }
         (PairingOperation::Finish, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the phone to receive the pairing confirmation."
+            "AgentKnock waits for the device to receive the pairing confirmation."
         }
         (PairingOperation::Finish, PairingProgress::WaitingForResponse) => {
-            "The phone received the pairing confirmation. AgentKnock waits for a response from the phone."
+            "The device received the pairing confirmation. AgentKnock waits for a response from the device."
         }
         (PairingOperation::Finish, PairingProgress::Completing) => {
-            "The phone accepted the pairing. AgentKnock saves the active pairing."
+            "The device accepted the pairing. AgentKnock saves the active pairing."
         }
         (PairingOperation::Finish, PairingProgress::Completed) => {
             "AgentKnock completed the pairing confirmation."
@@ -434,13 +434,13 @@ fn pairing_progress_message(
             "AgentKnock prepares the unpair request."
         }
         (PairingOperation::Unpair, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the phone to receive the unpair request."
+            "AgentKnock waits for the device to receive the unpair request."
         }
         (PairingOperation::Unpair, PairingProgress::WaitingForResponse) => {
-            "The phone received the unpair request. AgentKnock waits for a response from the phone."
+            "The device received the unpair request. AgentKnock waits for a response from the device."
         }
         (PairingOperation::Unpair, PairingProgress::Completing) => {
-            "The phone accepted the unpair request. AgentKnock removes the local pairing."
+            "The device accepted the unpair request. AgentKnock removes the local pairing."
         }
         (PairingOperation::Unpair, PairingProgress::Completed) => {
             "AgentKnock completed the unpair request."
@@ -499,8 +499,8 @@ fn print_start_pairing_success(sas: &PairingSas) {
     println!("AgentKnock started the pairing process.");
     println!("Verification code:");
     println!("{sas}");
-    println!("Suggested action: Compare the verification code with the code on the phone.");
-    println!("Suggested action: If the codes match, approve the pairing on the phone.");
+    println!("Suggested action: Compare the verification code with the code on the device.");
+    println!("Suggested action: If the codes match, approve the pairing on the device.");
     println!("Suggested action: After approval, run this command:");
     println!("agentknock --finish-pairing");
 }
@@ -528,7 +528,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "The phone approved the credentials request. AgentKnock did not execute the command {program:?}: {source}."
+                "The device approved the credentials request. AgentKnock did not execute the command {program:?}: {source}."
             ));
             print_message("Suggested action: Make sure that the command exists and is executable.");
             print_message("Suggested action: Run the original command again.");
@@ -556,7 +556,7 @@ fn print_list_error(error: &RequestError) {
         }
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error("Pairing is in progress. AgentKnock cannot list profiles yet.");
-            print_plain_error("Suggested action: Approve the pairing on the phone.");
+            print_plain_error("Suggested action: Approve the pairing on the device.");
             print_plain_error("Suggested action: After approval, run this command:");
             print_plain_error("agentknock --finish-pairing");
             print_plain_error("Suggested action: Run this command again:");
@@ -604,7 +604,7 @@ fn print_exec_request_error(error: &RequestError) {
             message,
         } => {
             print_message(format_args!(
-                "The credentials request was denied on the phone: {message}"
+                "The credentials request was denied on the device: {message}"
             ));
             print_message("The command did not start.");
         }
@@ -689,7 +689,7 @@ fn print_exec_request_error(error: &RequestError) {
             );
         }
         RequestError::PairingRejected => {
-            print_message("The paired phone rejected the client pairing.");
+            print_message("The paired device rejected the client pairing.");
             print_message("The command did not start.");
             print_message("Suggested action: Repair or remove the pairing configuration.");
             print_message("Suggested action: Start pairing again.");
@@ -715,7 +715,7 @@ fn print_exec_configuration_error(error: &ConfigurationError) {
         }
         ConfigurationError::PairingPending { .. } => {
             print_message("Pairing is in progress. The command did not start.");
-            print_message("Suggested action: Approve the pairing on the phone.");
+            print_message("Suggested action: Approve the pairing on the device.");
             print_message("Suggested action: After approval, run this command:");
             print_message("agentknock --finish-pairing");
             print_message("Suggested action: Run the original command again.");
@@ -771,7 +771,7 @@ fn print_start_pairing_error(error: &RequestError) {
     match error {
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error("Pairing is already in progress.");
-            print_plain_error("Suggested action: Approve the pairing on the phone.");
+            print_plain_error("Suggested action: Approve the pairing on the device.");
             print_plain_error("Suggested action: After approval, run this command:");
             print_plain_error("agentknock --finish-pairing");
             print_plain_error("Suggested action: To abort the pending pairing, run this command:");
@@ -802,7 +802,7 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_unauthenticated_action(code);
             print_plain_error("Suggested action: Run the original command again.");
             print_plain_error(
-                "Suggested action: If pairing is in progress, approve it on the phone and run this command:",
+                "Suggested action: If pairing is in progress, approve it on the device and run this command:",
             );
             print_plain_error("agentknock --finish-pairing");
         }
@@ -834,9 +834,9 @@ fn print_finish_pairing_error(error: &RequestError) {
         }
         RequestError::PairingRejected => {
             print_plain_error(
-                "The phone rejected the pairing. AgentKnock kept the pending pairing.",
+                "The device rejected the pairing. AgentKnock kept the pending pairing.",
             );
-            print_plain_error("Suggested action: Review the pairing request on the phone.");
+            print_plain_error("Suggested action: Review the pairing request on the device.");
             print_plain_error(
                 "Suggested action: To send the finish request again, run this command:",
             );
@@ -910,13 +910,13 @@ fn print_unpair_error(error: &UnpairError) {
                     "AgentKnock did not receive a valid unpair response: {error}."
                 ));
             }
-            print_plain_error("The local pairing is unchanged. The phone-side result is unknown.");
+            print_plain_error("The local pairing is unchanged. The device-side result is unknown.");
             print_plain_error("Suggested action: Run this command again:");
             print_plain_error("agentknock --unpair");
         }
         UnpairError::LocalState(ConfigurationError::PairingChanged { .. }) => {
             print_plain_error(
-                "The phone accepted the unpair request, but the local pairing changed.",
+                "The device accepted the unpair request, but the local pairing changed.",
             );
             print_plain_error("AgentKnock did not remove the current local pairing.");
             print_plain_error("Suggested action: To remove the current pairing, run this command:");
@@ -924,7 +924,7 @@ fn print_unpair_error(error: &UnpairError) {
         }
         UnpairError::LocalState(error) => {
             print_plain_error(format_args!(
-                "The phone accepted the unpair request, but AgentKnock did not remove the local pairing: {error}."
+                "The device accepted the unpair request, but AgentKnock did not remove the local pairing: {error}."
             ));
             print_plain_configuration_action(error);
         }
@@ -936,7 +936,7 @@ fn print_unauthenticated_report(code: &str, message: &str) {
         "AgentKnock received this error report: {code:?}: {message:?}."
     ));
     print_message(
-        "AgentKnock could not authenticate the report. The phone or relay could have sent it.",
+        "AgentKnock could not authenticate the report. The device or relay could have sent it.",
     );
 }
 
@@ -945,16 +945,16 @@ fn print_plain_unauthenticated_report(code: &str, message: &str) {
         "AgentKnock received this error report: {code:?}: {message:?}."
     ));
     print_plain_error(
-        "AgentKnock could not authenticate the report. The phone or relay could have sent it.",
+        "AgentKnock could not authenticate the report. The device or relay could have sent it.",
     );
 }
 
 fn print_unauthenticated_action(code: &str) {
     if is_pairing_error(code) {
-        print_message("Suggested action: Confirm the pairing state on the phone.");
+        print_message("Suggested action: Confirm the pairing state on the device.");
     } else if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_message(
-            "Suggested action: Make sure that AgentKnock and the phone support the same protocol version.",
+            "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
         );
     } else {
         print_message(
@@ -965,10 +965,10 @@ fn print_unauthenticated_action(code: &str) {
 
 fn print_plain_unauthenticated_action(code: &str) {
     if is_pairing_error(code) {
-        print_plain_error("Suggested action: Confirm the pairing state on the phone.");
+        print_plain_error("Suggested action: Confirm the pairing state on the device.");
     } else if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_plain_error(
-            "Suggested action: Make sure that AgentKnock and the phone support the same protocol version.",
+            "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
         );
     } else {
         print_plain_error(
@@ -1237,10 +1237,10 @@ fn progress_message(progress: CredentialRequestProgress) -> &'static str {
     match progress {
         CredentialRequestProgress::Preparing => "AgentKnock prepares the credentials request.",
         CredentialRequestProgress::WaitingForDelivery => {
-            "AgentKnock waits for the phone to receive the credentials request."
+            "AgentKnock waits for the device to receive the credentials request."
         }
         CredentialRequestProgress::WaitingForResponse => {
-            "The phone received the credentials request. AgentKnock waits for a response from the phone."
+            "The device received the credentials request. AgentKnock waits for a response from the device."
         }
         CredentialRequestProgress::Completing => {
             "AgentKnock received the credentials response. AgentKnock completes the request."
@@ -1353,11 +1353,11 @@ mod tests {
 
         assert_eq!(
             progress_message(WaitingForDelivery),
-            "AgentKnock waits for the phone to receive the credentials request."
+            "AgentKnock waits for the device to receive the credentials request."
         );
         assert_eq!(
             progress_message(WaitingForResponse),
-            "The phone received the credentials request. AgentKnock waits for a response from the phone."
+            "The device received the credentials request. AgentKnock waits for a response from the device."
         );
         assert_eq!(
             progress_message(Completing),
