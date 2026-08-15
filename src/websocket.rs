@@ -40,6 +40,7 @@ struct RetryPolicy {
 
 pub(crate) struct RelayExchange {
     url: String,
+    connection_kind: ConnectionKind,
     authorization: HeaderValue,
     client_id: String,
     request_id: String,
@@ -47,6 +48,12 @@ pub(crate) struct RelayExchange {
     request: Option<OutgoingMessage>,
     response: Option<Value>,
     completion: Option<OutgoingMessage>,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionKind {
+    Pairing,
+    Client,
 }
 
 struct OutgoingMessage {
@@ -63,7 +70,13 @@ impl RelayExchange {
         client_token: &str,
     ) -> Result<Self, Error> {
         let path = format!("/v1/address/{address_id}/request/{client_id}");
-        Self::new(path, client_id, client_id, client_token)
+        Self::new(
+            path,
+            ConnectionKind::Pairing,
+            client_id,
+            client_id,
+            client_token,
+        )
     }
 
     pub(crate) fn authenticated(pairing: &Pairing, request_id: &str) -> Result<Self, Error> {
@@ -74,6 +87,7 @@ impl RelayExchange {
         );
         Self::new(
             path,
+            ConnectionKind::Client,
             &pairing.client_id(),
             request_id,
             pairing.client_token(),
@@ -82,6 +96,7 @@ impl RelayExchange {
 
     fn new(
         path: String,
+        connection_kind: ConnectionKind,
         client_id: &str,
         request_id: &str,
         client_token: &str,
@@ -96,6 +111,7 @@ impl RelayExchange {
 
         Ok(Self {
             url: format!("{}{path}", relay_url.trim_end_matches('/')),
+            connection_kind,
             authorization,
             client_id: client_id.to_owned(),
             request_id: request_id.to_owned(),
@@ -402,6 +418,14 @@ impl RelayExchange {
                 Ok(Ok((socket, _))) => {
                     self.socket = Some(socket);
                     return Ok(true);
+                }
+                Ok(Err(tokio_websockets::Error::Upgrade(
+                    upgrade::Error::DidNotSwitchProtocols(status),
+                ))) if status == 403 && matches!(self.connection_kind, ConnectionKind::Client) => {
+                    return Err(Error::ClientInactive {
+                        code: status,
+                        reason: "WebSocket setup returned HTTP status 403".into(),
+                    });
                 }
                 Ok(Err(tokio_websockets::Error::Upgrade(
                     upgrade::Error::DidNotSwitchProtocols(status),

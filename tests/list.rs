@@ -5,6 +5,7 @@ mod support;
 use std::process::Command;
 
 use serde_json::json;
+use tokio::io::AsyncWriteExt as _;
 
 use support::{
     TestHome, accept, assert_authenticated_request, encrypt_response, open_completion,
@@ -133,4 +134,29 @@ fn reports_when_no_pairing_exists() {
             .unwrap()
             .contains("AgentKnock is not paired")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reports_inactive_client_without_suggesting_recovery() {
+    let home = TestHome::active();
+    let (relay_url, server) = websocket_server(|listener| async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .arg("--list")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("paired client is not active"), "{stderr}");
+    assert!(!stderr.contains("Suggested action:"), "{stderr}");
+    server.await.unwrap();
 }

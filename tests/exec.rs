@@ -372,11 +372,9 @@ async fn signal_before_response_sends_an_aborted_completion() {
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("A signal interrupted")
-    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A signal interrupted"));
+    assert!(!stderr.contains("Suggested action:"));
     server.await.unwrap();
 }
 
@@ -461,11 +459,9 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
             .unwrap()
             .contains("AGENTKNOCK_MUST_NOT_EXEC")
     );
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("A signal interrupted")
-    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A signal interrupted"));
+    assert!(!stderr.contains("Suggested action:"));
     server.await.unwrap();
 }
 

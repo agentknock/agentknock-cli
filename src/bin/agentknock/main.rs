@@ -515,23 +515,28 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                 "AgentKnock could not inspect the invocation context: {source}."
             ));
             print_message("The credentials request did not start.");
-            print_message("Suggested action: Correct the local system error.");
-            print_message("Suggested action: Run the original command again.");
         }
         CommandError::ExecSignal(source) if output != OutputMode::Quiet => {
             print_message(format_args!(
                 "A signal-handling error stopped the credentials request: {source}."
             ));
             print_message("The command did not start.");
-            print_message("Suggested action: Correct the local system error.");
-            print_message("Suggested action: Run the original command again.");
         }
         CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
                 "The device approved the credentials request. AgentKnock did not execute the command {program:?}: {source}."
             ));
-            print_message("Suggested action: Make sure that the command exists and is executable.");
-            print_message("Suggested action: Run the original command again.");
+            match source.kind() {
+                io::ErrorKind::NotFound => {
+                    print_message("Suggested action: Correct the command name or path.");
+                }
+                io::ErrorKind::PermissionDenied => {
+                    print_message(
+                        "Suggested action: Make the command executable or correct its access permissions.",
+                    );
+                }
+                _ => {}
+            }
         }
         CommandError::ExecRequest(_)
         | CommandError::ExecContext(_)
@@ -556,21 +561,18 @@ fn print_list_error(error: &RequestError) {
         }
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error("Pairing is in progress. AgentKnock cannot list profiles yet.");
-            print_plain_error("Suggested action: Approve the pairing on the device.");
-            print_plain_error("Suggested action: After approval, run this command:");
-            print_plain_error("agentknock --finish-pairing");
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --list");
         }
         RequestError::Configuration(error) => {
             print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
             print_plain_configuration_action(error);
         }
-        RequestError::Relay(_) | RequestError::RelayUnavailable { .. } => {
+        RequestError::RelayUnavailable { .. } => {
             print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
-            print_plain_error("Suggested action: Make sure that the network connection works.");
-            print_plain_error("Suggested action: Run this command again:");
+            print_plain_error("Suggested action: After relay connectivity is restored, run:");
             print_plain_error("agentknock --list");
+        }
+        RequestError::Relay(_) => {
+            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
@@ -579,26 +581,19 @@ fn print_list_error(error: &RequestError) {
                 "AgentKnock did not change the local pairing because of this report.",
             );
             print_plain_unauthenticated_action(code);
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --list");
         }
         RequestError::ClientInactive { message } => {
             print_plain_error(format_args!(
                 "The relay reports that this paired client is not active: {message}"
             ));
             print_plain_error("AgentKnock did not list profiles.");
-            print_plain_error("Suggested action: Check the client state on the device.");
         }
         RequestError::InvalidTestRelayUrl => {
             print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
             print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --list");
         }
         _ => {
             print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --list");
         }
     }
 }
@@ -646,73 +641,52 @@ fn print_exec_request_error(error: &RequestError) {
             print_message(
                 "A signal interrupted the credentials request. The command did not start.",
             );
-            print_message(
-                "Suggested action: If you still need the credentials, run the original command again.",
-            );
         }
         RequestError::RelayUnavailable { failures } => {
             print_message(format_args!(
                 "AgentKnock did not receive a relay response after {failures} consecutive errors."
             ));
             print_message("The command did not start.");
-            print_message("Suggested action: Make sure that the network connection works.");
-            print_message("Suggested action: Run the original command again.");
+            print_message(
+                "Suggested action: After relay connectivity is restored, run the original command again.",
+            );
         }
         RequestError::Relay(source) => {
-            print_message(format_args!(
-                "The relay rejected the credentials request: {source}."
-            ));
+            print_message(format_args!("The credentials request failed: {source}."));
             print_message("The command did not start.");
-            print_message(
-                "Suggested action: Make sure that the network connection and pairing state are correct.",
-            );
-            print_message("Suggested action: Run the original command again.");
         }
         RequestError::Unauthenticated { code, message } => {
             print_unauthenticated_report(code, message);
             print_message("The command did not start.");
             print_message("AgentKnock did not change the local pairing because of this report.");
             print_unauthenticated_action(code);
-            print_message("Suggested action: Run the original command again.");
         }
         RequestError::ClientInactive { message } => {
             print_message(format_args!(
                 "The relay reports that this paired client is not active: {message}"
             ));
             print_message("The command did not start.");
-            print_message("Suggested action: Check the client state on the device.");
         }
         RequestError::Protocol(source) => {
             print_message(format_args!(
                 "A protocol error stopped the credentials request: {source}."
             ));
             print_message("The command did not start.");
-            print_message("Suggested action: Run the original command again.");
-            print_message(
-                "Suggested action: If the error occurs again, report the protocol error.",
-            );
         }
         RequestError::UnexpectedRelayStatus(status) => {
             print_message(format_args!(
                 "The relay returned HTTP status {status}. AgentKnock did not expect this status."
             ));
             print_message("The command did not start.");
-            print_message("Suggested action: Run the original command again.");
-            print_message(
-                "Suggested action: If the status occurs again, report a relay compatibility problem.",
-            );
         }
         RequestError::PairingRejected => {
             print_message("The paired device rejected the client pairing.");
             print_message("The command did not start.");
-            print_message("Suggested action: Repair or remove the pairing configuration.");
-            print_message("Suggested action: Start pairing again.");
         }
         RequestError::InvalidTestRelayUrl => {
             print_message("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
             print_message("The command did not start.");
             print_message("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
-            print_message("Suggested action: Run the original command again.");
         }
     }
 }
@@ -729,10 +703,6 @@ fn print_exec_configuration_error(error: &ConfigurationError) {
         }
         ConfigurationError::PairingPending { .. } => {
             print_message("Pairing is in progress. The command did not start.");
-            print_message("Suggested action: Approve the pairing on the device.");
-            print_message("Suggested action: After approval, run this command:");
-            print_message("agentknock --finish-pairing");
-            print_message("Suggested action: Run the original command again.");
         }
         ConfigurationError::InsecurePermissions { path, mode } => {
             print_message(format_args!(
@@ -741,42 +711,31 @@ fn print_exec_configuration_error(error: &ConfigurationError) {
             print_message("The command did not start.");
             print_message("Suggested action: Run this command:");
             print_message(format_args!("chmod 600 {path:?}"));
-            print_message("Suggested action: Run the original command again.");
         }
         ConfigurationError::HomeNotSet => {
             print_message("HOME is not set. AgentKnock cannot find the pairing configuration.");
             print_message("The command did not start.");
             print_message("Suggested action: Set HOME to the correct home directory.");
-            print_message("Suggested action: Run the original command again.");
         }
         ConfigurationError::Invalid { path, source } => {
             print_message(format_args!(
                 "The pairing configuration at {path:?} contains invalid JSON: {source}."
             ));
             print_message("The command did not start.");
-            print_message(
-                "Suggested action: Repair the file, or remove it and start pairing again.",
-            );
         }
         ConfigurationError::EmptyPsk { path } => {
             print_message(format_args!("The pairing PSK in {path:?} is empty."));
             print_message("The command did not start.");
-            print_message(
-                "Suggested action: Repair the file, or remove it and start pairing again.",
-            );
         }
         ConfigurationError::InvalidSystemTime(_) => {
             print_message(format_args!("The system clock is invalid: {error}."));
             print_message("The command did not start.");
             print_message("Suggested action: Correct the system clock.");
-            print_message("Suggested action: Run the original command again.");
         }
         _ => {
             print_message(format_args!(
                 "A pairing configuration error stopped the command: {error}."
             ));
-            print_message("Suggested action: Correct the pairing configuration error.");
-            print_message("Suggested action: Run the original command again.");
         }
     }
 }
@@ -785,11 +744,6 @@ fn print_start_pairing_error(error: &RequestError) {
     match error {
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error("Pairing is already in progress.");
-            print_plain_error("Suggested action: Approve the pairing on the device.");
-            print_plain_error("Suggested action: After approval, run this command:");
-            print_plain_error("agentknock --finish-pairing");
-            print_plain_error("Suggested action: To abort the pending pairing, run this command:");
-            print_plain_error("agentknock --abort-pairing");
         }
         RequestError::Configuration(ConfigurationError::PairingExists { .. }) => {
             print_plain_error("AgentKnock is already paired and ready to provide credentials.");
@@ -799,14 +753,14 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
             print_plain_configuration_action(error);
         }
-        RequestError::Relay(_) | RequestError::RelayUnavailable { .. } => {
+        RequestError::RelayUnavailable { .. } => {
             print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
-            print_plain_error("Suggested action: Make sure that the network connection works.");
-            print_plain_error("Suggested action: Run the original command again.");
             print_plain_error(
-                "Suggested action: If pairing is in progress after another error, run this command:",
+                "Suggested action: After relay connectivity is restored, run the original command again.",
             );
-            print_plain_error("agentknock --abort-pairing");
+        }
+        RequestError::Relay(_) => {
+            print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
@@ -814,19 +768,13 @@ fn print_start_pairing_error(error: &RequestError) {
                 "AgentKnock did not change the pairing state because of this report.",
             );
             print_plain_unauthenticated_action(code);
-            print_plain_error("Suggested action: Run the original command again.");
-            print_plain_error(
-                "Suggested action: If pairing is in progress, approve it on the device and run this command:",
-            );
-            print_plain_error("agentknock --finish-pairing");
+        }
+        RequestError::InvalidTestRelayUrl => {
+            print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
+            print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
         }
         _ => {
             print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
-            print_plain_error("Suggested action: Run the original command again.");
-            print_plain_error(
-                "Suggested action: If pairing is in progress after another error, run this command:",
-            );
-            print_plain_error("agentknock --abort-pairing");
         }
     }
 }
@@ -850,13 +798,6 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error(
                 "The device rejected the pairing. AgentKnock kept the pending pairing.",
             );
-            print_plain_error("Suggested action: Review the pairing request on the device.");
-            print_plain_error(
-                "Suggested action: To send the finish request again, run this command:",
-            );
-            print_plain_error("agentknock --finish-pairing");
-            print_plain_error("Suggested action: To abort the pending pairing, run this command:");
-            print_plain_error("agentknock --abort-pairing");
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
@@ -864,26 +805,19 @@ fn print_finish_pairing_error(error: &RequestError) {
                 "AgentKnock did not change the pairing state because of this report.",
             );
             print_plain_unauthenticated_action(code);
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --finish-pairing");
         }
         RequestError::ClientInactive { message } => {
             print_plain_error(format_args!(
                 "The relay reports that the pending client is not active: {message}"
             ));
             print_plain_error("AgentKnock kept the pending pairing.");
-            print_plain_error("Suggested action: Check the pairing request on the device.");
-            print_plain_error("Suggested action: Run this command again after approval:");
-            print_plain_error("agentknock --finish-pairing");
+        }
+        RequestError::InvalidTestRelayUrl => {
+            print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
+            print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
         }
         _ => {
             print_plain_error(format_args!("AgentKnock did not finish pairing: {error}."));
-            print_plain_error("Suggested action: Make sure that the network connection works.");
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --finish-pairing");
-            print_plain_error(
-                "If AgentKnock reports that pairing is complete, no action is necessary.",
-            );
         }
     }
 }
@@ -942,16 +876,12 @@ fn print_unpair_error(error: &UnpairError) {
                 }
             }
             print_plain_error("The local pairing is unchanged. The device-side result is unknown.");
-            print_plain_error("Suggested action: Run this command again:");
-            print_plain_error("agentknock --unpair");
         }
         UnpairError::LocalState(ConfigurationError::PairingChanged { .. }) => {
             print_plain_error(
                 "The device accepted the unpair request, but the local pairing changed.",
             );
             print_plain_error("AgentKnock did not remove the current local pairing.");
-            print_plain_error("Suggested action: To remove the current pairing, run this command:");
-            print_plain_error("agentknock --unpair");
         }
         UnpairError::LocalState(error) => {
             print_plain_error(format_args!(
@@ -985,10 +915,6 @@ fn print_unauthenticated_action(code: &str) {
         print_message(
             "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
         );
-    } else {
-        print_message(
-            "Suggested action: If this report occurs again, report a protocol compatibility problem.",
-        );
     }
 }
 
@@ -996,10 +922,6 @@ fn print_plain_unauthenticated_action(code: &str) {
     if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_plain_error(
             "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
-        );
-    } else {
-        print_plain_error(
-            "Suggested action: If this report occurs again, report a protocol compatibility problem.",
         );
     }
 }
@@ -1023,24 +945,14 @@ fn print_plain_configuration_action(error: &ConfigurationError) {
         ConfigurationError::InsecurePermissions { path, .. } => {
             print_plain_error("Suggested action: Run this command:");
             print_plain_error(format_args!("chmod 600 {path:?}"));
-            print_plain_error("Suggested action: Run the original command again.");
         }
         ConfigurationError::HomeNotSet => {
             print_plain_error("Suggested action: Set HOME to the correct home directory.");
-            print_plain_error("Suggested action: Run the original command again.");
-        }
-        ConfigurationError::Invalid { path, .. } | ConfigurationError::EmptyPsk { path } => {
-            print_plain_error(format_args!("Suggested action: Repair or remove {path:?}."));
-            print_plain_error("Suggested action: Run the original command again.");
         }
         ConfigurationError::InvalidSystemTime(_) => {
             print_plain_error("Suggested action: Correct the system clock.");
-            print_plain_error("Suggested action: Run the original command again.");
         }
-        _ => {
-            print_plain_error("Suggested action: Correct the configuration error.");
-            print_plain_error("Suggested action: Run the original command again.");
-        }
+        _ => {}
     }
 }
 
