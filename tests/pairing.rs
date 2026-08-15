@@ -20,7 +20,7 @@ use sha2::Sha256;
 use ulid::Ulid;
 
 use support::{
-    Aead, Kem, MAILBOX_ID, PROTOCOL_VERSION_INFO, ReceiverContext, TestHome, accept,
+    Aead, DEVICE_ID, Kem, PROTOCOL_VERSION_INFO, ReceiverContext, TestHome, accept,
     assert_authenticated_request, encrypt_response, open_completion, open_request, receive_json,
     send_json, websocket_server,
 };
@@ -99,7 +99,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
                 "request_id": client_id,
                 "kind": "response",
                 "payload": {
-                    "mailbox_id": MAILBOX_ID,
+                    "device_id": DEVICE_ID,
                     "device_key": BASE64_STANDARD.encode(device_public_key.to_bytes()),
                     "device_random": BASE64_STANDARD.encode(DEVICE_RANDOM),
                 },
@@ -121,7 +121,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
         let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&encapped_key).unwrap();
         let info = [
             PROTOCOL_VERSION_INFO,
-            MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes(),
+            DEVICE_ID.parse::<Ulid>().unwrap().to_bytes(),
             client_id.parse::<Ulid>().unwrap().to_bytes(),
         ]
         .concat();
@@ -149,7 +149,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
 
         let mut sas_info = Vec::new();
         sas_info.extend_from_slice(SAS_DERIVATION_INFO);
-        sas_info.extend_from_slice(&MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes());
+        sas_info.extend_from_slice(&DEVICE_ID.parse::<Ulid>().unwrap().to_bytes());
         sas_info.extend_from_slice(&client_id.parse::<Ulid>().unwrap().to_bytes());
         sas_info.extend_from_slice(&device_public_key.to_bytes());
         let hkdf = Hkdf::<Sha256>::new(Some(&DEVICE_RANDOM), &client_random);
@@ -177,7 +177,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
         let (upgrade, mut socket) = accept(&listener).await;
         assert_eq!(
             upgrade.uri().path(),
-            format!("/v1/mailbox/{MAILBOX_ID}/client/{client_id}")
+            format!("/v1/device/{DEVICE_ID}/client/{client_id}")
         );
         assert_eq!(
             upgrade.headers()[http::header::AUTHORIZATION],
@@ -257,7 +257,8 @@ async fn starts_and_finishes_pairing_over_websockets() {
     );
     let pending: Value = serde_json::from_slice(&fs::read(home.pairing_path()).unwrap()).unwrap();
     assert_eq!(pending["pending"], true);
-    assert_eq!(pending["mailbox_id"], MAILBOX_ID);
+    assert_eq!(pending["device_id"], DEVICE_ID);
+    assert!(pending.get("mailbox_id").is_none());
     assert!(pending.get("route_id").is_none());
     assert!(pending.get("pairing_id").is_none());
     assert!(pending.get("pairing_psk").is_none());
@@ -406,7 +407,7 @@ fn open_authenticated_request(
     let client_id = client_id.parse::<Ulid>().unwrap().to_bytes();
     let info = [
         PROTOCOL_VERSION_INFO,
-        MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes(),
+        DEVICE_ID.parse::<Ulid>().unwrap().to_bytes(),
         request_id.parse::<Ulid>().unwrap().to_bytes(),
     ]
     .concat();

@@ -130,12 +130,7 @@ fn setup_pairing_sender(
 ) -> Result<(Vec<u8>, SenderContext), Error> {
     let device_key = <Kem as KemTrait>::PublicKey::from_bytes(pairing.device_key())?;
     let client_id = pairing.client_id_bytes();
-    let info = [
-        PROTOCOL_VERSION_INFO,
-        pairing.mailbox_id_bytes(),
-        request_id,
-    ]
-    .concat();
+    let info = [PROTOCOL_VERSION_INFO, pairing.device_id_bytes(), request_id].concat();
     let psk = PskBundle::new(pairing.client_psk(), &client_id)?;
     let (encapped_key, sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Psk(psk), &device_key, &info)?;
@@ -150,9 +145,9 @@ pub(crate) fn seal_pairing(
     plaintext: &[u8],
 ) -> Result<(PairingCompletion, PendingPairing, u64), Error> {
     let device_key = <Kem as KemTrait>::PublicKey::from_bytes(&response.device_key)?;
-    let mailbox_id_bytes = response.mailbox_id.to_bytes();
+    let device_id_bytes = response.device_id.to_bytes();
     let client_id_bytes = client_id.to_bytes();
-    let info = [PROTOCOL_VERSION_INFO, mailbox_id_bytes, client_id_bytes].concat();
+    let info = [PROTOCOL_VERSION_INFO, device_id_bytes, client_id_bytes].concat();
     let (encapped_key, mut sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &device_key, &info)?;
     let ciphertext = sender_context.seal(plaintext, b"")?;
@@ -166,12 +161,12 @@ pub(crate) fn seal_pairing(
     }
     let mut sas_info = Vec::with_capacity(
         SAS_DERIVATION_INFO.len()
-            + mailbox_id_bytes.len()
+            + device_id_bytes.len()
             + client_id_bytes.len()
             + response.device_key.len(),
     );
     sas_info.extend_from_slice(SAS_DERIVATION_INFO);
-    sas_info.extend_from_slice(&mailbox_id_bytes);
+    sas_info.extend_from_slice(&device_id_bytes);
     sas_info.extend_from_slice(&client_id_bytes);
     sas_info.extend_from_slice(&response.device_key);
     let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), client_random);
@@ -183,7 +178,7 @@ pub(crate) fn seal_pairing(
         ciphertext: BASE64_STANDARD.encode(ciphertext),
     };
     let pairing = PendingPairing::new(
-        response.mailbox_id,
+        response.device_id,
         client_id,
         client_token,
         client_psk.to_vec(),
@@ -252,7 +247,7 @@ pub(crate) struct Completion {
 
 #[derive(Deserialize)]
 pub(crate) struct PairingResponse {
-    mailbox_id: RelayId,
+    device_id: RelayId,
     #[serde(deserialize_with = "deserialize_base64")]
     device_key: Vec<u8>,
     #[serde(deserialize_with = "deserialize_base64")]
@@ -372,7 +367,7 @@ mod tests {
 
         let (route_private_key, route_public_key) = Kem::gen_keypair();
         let pairing: Pairing = serde_json::from_value(json!({
-            "mailbox_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+            "device_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
             "client_id": "01K2EP16NWNAGJYF8J1Q2V6P3X",
             "client_token": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x24; 32]),
             "client_psk": BASE64_STANDARD.encode([0x42; 32]),
@@ -393,7 +388,7 @@ mod tests {
         other_version[12] = b'2';
         let info = [
             other_version,
-            pairing.mailbox_id_bytes(),
+            pairing.device_id_bytes(),
             request_id.to_bytes(),
         ]
         .concat();
@@ -411,7 +406,7 @@ mod tests {
     fn test_session() -> Session {
         let (_, device_key) = Kem::gen_keypair();
         let pairing: Pairing = serde_json::from_value(json!({
-            "mailbox_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+            "device_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
             "client_id": "01K2EP16NWNAGJYF8J1Q2V6P3X",
             "client_token": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x24; 32]),
             "client_psk": BASE64_STANDARD.encode([0x42; 32]),

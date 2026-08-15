@@ -40,7 +40,7 @@ type ResponseSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 type ResponseKey = AeadKey<ResponseAead>;
 type ResponseNonce = AeadNonce<ResponseAead>;
 
-pub const MAILBOX_ID: &str = "01K2ENXDTW1P3XAR4J7V7C9D0H";
+pub const DEVICE_ID: &str = "01K2ENXDTW1P3XAR4J7V7C9D0H";
 pub const CLIENT_ID: &str = "01K2EP16NWNAGJYF8J1Q2V6P3X";
 pub const CLIENT_PSK: [u8; 32] = [0x42; 32];
 pub const CLIENT_TOKEN: [u8; 32] = [0x24; 32];
@@ -68,7 +68,7 @@ impl TestHome {
         fs::create_dir_all(&config_dir).unwrap();
         let (device_private_key, device_public_key) = Kem::gen_keypair();
         let mut pairing = json!({
-            "mailbox_id": MAILBOX_ID,
+            "device_id": DEVICE_ID,
             "client_id": CLIENT_ID,
             "client_token": BASE64_URL_SAFE.encode(CLIENT_TOKEN),
             "client_psk": BASE64_STANDARD.encode(CLIENT_PSK),
@@ -171,7 +171,7 @@ where
 pub fn assert_authenticated_request(request: &http::Request<()>) {
     assert_eq!(
         request.uri().path(),
-        format!("/v1/mailbox/{MAILBOX_ID}/client/{CLIENT_ID}")
+        format!("/v1/device/{DEVICE_ID}/client/{CLIENT_ID}")
     );
     assert_eq!(
         request.headers()[http::header::AUTHORIZATION],
@@ -189,9 +189,9 @@ pub fn open_request(
         .unwrap();
     let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&key).unwrap();
     let request_id = request_id.parse::<Ulid>().unwrap();
-    let mailbox_id = MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes();
+    let device_id = DEVICE_ID.parse::<Ulid>().unwrap().to_bytes();
     let client_id = CLIENT_ID.parse::<Ulid>().unwrap().to_bytes();
-    let info = [PROTOCOL_VERSION_INFO, mailbox_id, request_id.to_bytes()].concat();
+    let info = [PROTOCOL_VERSION_INFO, device_id, request_id.to_bytes()].concat();
     let psk = PskBundle::new(&CLIENT_PSK, &client_id).unwrap();
     let mut context = setup_receiver::<Aead, Kdf, Kem>(
         &OpModeR::Psk(psk),

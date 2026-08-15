@@ -23,7 +23,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub(crate) struct Pairing {
     #[serde(default)]
     pending: bool,
-    mailbox_id: RelayId,
+    device_id: RelayId,
     client_id: RelayId,
     #[serde(deserialize_with = "deserialize_client_token")]
     client_token: String,
@@ -43,7 +43,7 @@ pub(crate) struct Identifier(u128);
 pub(crate) struct RelayId(Ulid);
 
 pub(crate) struct PendingPairing {
-    mailbox_id: RelayId,
+    device_id: RelayId,
     client_id: RelayId,
     client_token: String,
     client_psk: Vec<u8>,
@@ -59,12 +59,12 @@ pub(crate) struct LockedPairing {
 }
 
 impl Pairing {
-    pub(crate) fn mailbox_id(&self) -> String {
-        self.mailbox_id.to_string()
+    pub(crate) fn device_id(&self) -> String {
+        self.device_id.to_string()
     }
 
-    pub(crate) fn mailbox_id_bytes(&self) -> [u8; 16] {
-        self.mailbox_id.to_bytes()
+    pub(crate) fn device_id_bytes(&self) -> [u8; 16] {
+        self.device_id.to_bytes()
     }
 
     pub(crate) fn client_id(&self) -> String {
@@ -114,14 +114,14 @@ impl RelayId {
 
 impl PendingPairing {
     pub(crate) fn new(
-        mailbox_id: RelayId,
+        device_id: RelayId,
         client_id: RelayId,
         client_token: String,
         client_psk: Vec<u8>,
         device_key: Vec<u8>,
     ) -> Self {
         Self {
-            mailbox_id,
+            device_id,
             client_id,
             client_token,
             client_psk,
@@ -302,7 +302,7 @@ pub(crate) fn write_pending_pairing(pairing: &PendingPairing) -> Result<(), Conf
     let rotated_at = current_timestamp()?;
     let contents = serde_json::to_vec_pretty(&PendingPairingFile {
         pending: true,
-        mailbox_id: pairing.mailbox_id,
+        device_id: pairing.device_id,
         client_id: pairing.client_id,
         client_token: &pairing.client_token,
         client_psk: &pairing.client_psk,
@@ -466,7 +466,7 @@ pub(crate) fn remove_pairing() -> Result<(), ConfigurationError> {
 }
 
 pub(crate) fn remove_active_pairing(
-    expected_mailbox_id: [u8; 16],
+    expected_device_id: [u8; 16],
     expected_client_id: [u8; 16],
 ) -> Result<(), ConfigurationError> {
     let pairing_path = pairing_path()?;
@@ -483,7 +483,7 @@ pub(crate) fn remove_active_pairing(
             source,
         })?;
     if pairing.pending
-        || pairing.mailbox_id_bytes() != expected_mailbox_id
+        || pairing.device_id_bytes() != expected_device_id
         || pairing.client_id_bytes() != expected_client_id
     {
         return Err(ConfigurationError::PairingChanged { path });
@@ -688,7 +688,7 @@ where
 #[derive(Serialize)]
 struct PendingPairingFile<'a> {
     pending: bool,
-    mailbox_id: RelayId,
+    device_id: RelayId,
     client_id: RelayId,
     client_token: &'a str,
     #[serde(serialize_with = "serialize_base64")]

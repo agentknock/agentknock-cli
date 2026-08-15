@@ -177,12 +177,12 @@ where
 {
     progress(PairingProgress::Preparing);
     let pairing = read_pairing().map_err(UnpairError::Configuration)?;
-    let mailbox_id = pairing.mailbox_id_bytes();
+    let device_id = pairing.device_id_bytes();
     let client_id = pairing.client_id_bytes();
     let (mut relay, completion) = prepare_unpair(&pairing, &mut progress)
         .await
         .map_err(UnpairError::Request)?;
-    remove_active_pairing(mailbox_id, client_id).map_err(UnpairError::LocalState)?;
+    remove_active_pairing(device_id, client_id).map_err(UnpairError::LocalState)?;
     let _ = relay.complete_briefly(&completion).await;
     progress(PairingProgress::Completed);
     Ok(())
@@ -395,7 +395,7 @@ mod tests {
         type Kem = X25519HkdfSha256;
         type ExporterSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 
-        const MAILBOX_ID: &str = "01K2ENXDTW1P3XAR4J7V7C9D0H";
+        const DEVICE_ID: &str = "01K2ENXDTW1P3XAR4J7V7C9D0H";
         const CLIENT_ID: &str = "01K2EP16NWNAGJYF8J1Q2V6P3X";
         const OLD_PSK: [u8; 32] = [0x42; 32];
         const PSK_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 psk";
@@ -413,7 +413,7 @@ mod tests {
         serde_json::to_writer_pretty(
             &mut file,
             &json!({
-                "mailbox_id": MAILBOX_ID,
+                "device_id": DEVICE_ID,
                 "client_id": CLIENT_ID,
                 "client_token": BASE64_URL_SAFE.encode([0x24; 32]),
                 "client_psk": BASE64_STANDARD.encode(OLD_PSK),
@@ -456,9 +456,9 @@ mod tests {
             .unwrap();
         assert_ne!(new_psk, OLD_PSK);
 
-        let mailbox_id = MAILBOX_ID.parse::<Ulid>().unwrap().to_bytes();
+        let device_id = DEVICE_ID.parse::<Ulid>().unwrap().to_bytes();
         let client_id = CLIENT_ID.parse::<Ulid>().unwrap().to_bytes();
-        let info = [crate::crypto::PROTOCOL_VERSION_INFO, mailbox_id, [0; 16]].concat();
+        let info = [crate::crypto::PROTOCOL_VERSION_INFO, device_id, [0; 16]].concat();
         let psk = PskBundle::new(&OLD_PSK, &client_id).unwrap();
         let receiver_context = setup_receiver::<Aead, Kdf, Kem>(
             &OpModeR::Psk(psk),

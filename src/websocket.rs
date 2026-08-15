@@ -68,8 +68,8 @@ impl Relay {
 
     pub(crate) fn authenticated(pairing: &Pairing, request_id: &str) -> Result<Self, Error> {
         let path = format!(
-            "/v1/mailbox/{}/client/{}",
-            pairing.mailbox_id(),
+            "/v1/device/{}/client/{}",
+            pairing.device_id(),
             pairing.client_id(),
         );
         Self::new(
