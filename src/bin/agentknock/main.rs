@@ -82,7 +82,7 @@ struct Cli {
     /// Start pairing with an AgentKnock service.
     #[arg(
         long,
-        value_name = "PAIRING_ADDRESS_NAME",
+        value_name = "PAIRING_ADDRESS",
         value_parser = parse_pairing_address
     )]
     start_pairing: Option<String>,
@@ -193,8 +193,8 @@ impl Cli {
             };
         }
 
-        if let Some(address_name) = self.start_pairing {
-            return Operation::StartPairing(address_name);
+        if let Some(address) = self.start_pairing {
+            return Operation::StartPairing(address);
         }
 
         if self.finish_pairing {
@@ -582,6 +582,13 @@ fn print_list_error(error: &RequestError) {
             print_plain_error("Suggested action: Run this command again:");
             print_plain_error("agentknock --list");
         }
+        RequestError::ClientInactive { message } => {
+            print_plain_error(format_args!(
+                "The relay reports that this paired client is not active: {message}"
+            ));
+            print_plain_error("AgentKnock did not list profiles.");
+            print_plain_error("Suggested action: Check the client state on the device.");
+        }
         RequestError::InvalidTestRelayUrl => {
             print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
             print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
@@ -667,6 +674,13 @@ fn print_exec_request_error(error: &RequestError) {
             print_message("AgentKnock did not change the local pairing because of this report.");
             print_unauthenticated_action(code);
             print_message("Suggested action: Run the original command again.");
+        }
+        RequestError::ClientInactive { message } => {
+            print_message(format_args!(
+                "The relay reports that this paired client is not active: {message}"
+            ));
+            print_message("The command did not start.");
+            print_message("Suggested action: Check the client state on the device.");
         }
         RequestError::Protocol(source) => {
             print_message(format_args!(
@@ -853,6 +867,15 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error("Suggested action: Run this command again:");
             print_plain_error("agentknock --finish-pairing");
         }
+        RequestError::ClientInactive { message } => {
+            print_plain_error(format_args!(
+                "The relay reports that the pending client is not active: {message}"
+            ));
+            print_plain_error("AgentKnock kept the pending pairing.");
+            print_plain_error("Suggested action: Check the pairing request on the device.");
+            print_plain_error("Suggested action: Run this command again after approval:");
+            print_plain_error("agentknock --finish-pairing");
+        }
         _ => {
             print_plain_error(format_args!("AgentKnock did not finish pairing: {error}."));
             print_plain_error("Suggested action: Make sure that the network connection works.");
@@ -902,13 +925,21 @@ fn print_unpair_error(error: &UnpairError) {
             print_plain_configuration_action(error);
         }
         UnpairError::Request(error) => {
-            if let RequestError::Unauthenticated { code, message } = error {
-                print_plain_unauthenticated_report(code, message);
-                print_plain_unauthenticated_action(code);
-            } else {
-                print_plain_error(format_args!(
-                    "AgentKnock did not receive a valid unpair response: {error}."
-                ));
+            match error {
+                RequestError::Unauthenticated { code, message } => {
+                    print_plain_unauthenticated_report(code, message);
+                    print_plain_unauthenticated_action(code);
+                }
+                RequestError::ClientInactive { message } => {
+                    print_plain_error(format_args!(
+                        "The relay reports that this paired client is not active: {message}"
+                    ));
+                }
+                _ => {
+                    print_plain_error(format_args!(
+                        "AgentKnock did not receive a valid unpair response: {error}."
+                    ));
+                }
             }
             print_plain_error("The local pairing is unchanged. The device-side result is unknown.");
             print_plain_error("Suggested action: Run this command again:");
@@ -950,9 +981,7 @@ fn print_plain_unauthenticated_report(code: &str, message: &str) {
 }
 
 fn print_unauthenticated_action(code: &str) {
-    if is_pairing_error(code) {
-        print_message("Suggested action: Confirm the pairing state on the device.");
-    } else if code == "UNSUPPORTED_PROTOCOL_VERSION" {
+    if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_message(
             "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
         );
@@ -964,9 +993,7 @@ fn print_unauthenticated_action(code: &str) {
 }
 
 fn print_plain_unauthenticated_action(code: &str) {
-    if is_pairing_error(code) {
-        print_plain_error("Suggested action: Confirm the pairing state on the device.");
-    } else if code == "UNSUPPORTED_PROTOCOL_VERSION" {
+    if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_plain_error(
             "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
         );
@@ -975,16 +1002,6 @@ fn print_plain_unauthenticated_action(code: &str) {
             "Suggested action: If this report occurs again, report a protocol compatibility problem.",
         );
     }
-}
-
-fn is_pairing_error(code: &str) -> bool {
-    matches!(
-        code,
-        "PAIRING_ID_UNKNOWN"
-            | "PAIRING_REVOKED"
-            | "PAIRING_CONTINUITY_LOST"
-            | "PAIRING_AUTHENTICATION_FAILED"
-    )
 }
 
 fn print_force_unpair_error(error: &ConfigurationError) {

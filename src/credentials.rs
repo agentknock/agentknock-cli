@@ -8,7 +8,7 @@ use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
     pairing::{RotationError, maybe_rotate_psk},
-    websocket::{self, Relay},
+    websocket::{self, RelayExchange},
 };
 
 pub struct CredentialRequest<'a> {
@@ -79,6 +79,9 @@ pub enum RequestError {
 
     #[error("received unauthenticated error {code}: {message:?}")]
     Unauthenticated { code: String, message: String },
+
+    #[error("paired client is not active: {message}")]
+    ClientInactive { message: String },
 
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -209,7 +212,7 @@ where
             stderr: stderr.into(),
         },
     };
-    let request_contents = RequestContents {
+    let request_payload = CredentialRequestPayload {
         method: "CredentialRequest",
         profiles: request.profiles,
         reason: request.reason,
@@ -219,7 +222,7 @@ where
 
     message_exchange(
         &pairing,
-        &request_contents,
+        &request_payload,
         cancellation.as_mut(),
         &mut progress,
     )
@@ -228,7 +231,7 @@ where
 
 async fn message_exchange<C, P>(
     pairing: &Pairing,
-    request_contents: &RequestContents<'_>,
+    request_payload: &CredentialRequestPayload<'_>,
     mut cancellation: Pin<&mut C>,
     progress: &mut P,
 ) -> Result<Credentials, RequestError>
@@ -237,12 +240,12 @@ where
     P: FnMut(CredentialRequestProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(request_contents).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(request_payload).map_err(ProtocolError::from)?;
     let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let mut relay = Relay::authenticated(pairing, &request_id.to_string())?;
+    let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
 
     progress(CredentialRequestProgress::WaitingForDelivery);
     let response = match tokio::select! {
@@ -355,7 +358,7 @@ fn seal_aborted(
     session.seal_completion(&plaintext).ok()
 }
 
-async fn complete_cancelled(session: &mut Session, relay: &mut Relay) {
+async fn complete_cancelled(session: &mut Session, relay: &mut RelayExchange) {
     let Some(completion) = seal_aborted(
         session,
         AbortReason::Cancelled,
@@ -395,6 +398,12 @@ impl From<websocket::Error> for RequestError {
             websocket::Error::Unauthenticated { code, message } => {
                 Self::Unauthenticated { code, message }
             }
+            websocket::Error::RelayRejected { code, message } if code == "CLIENT_INACTIVE" => {
+                Self::ClientInactive { message }
+            }
+            websocket::Error::ClientInactive { reason, .. } => {
+                Self::ClientInactive { message: reason }
+            }
             websocket::Error::MissingResponse => Self::Protocol(ProtocolError::MissingResponse),
             websocket::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,
             error => Self::Relay(error.to_string()),
@@ -403,7 +412,7 @@ impl From<websocket::Error> for RequestError {
 }
 
 #[derive(Serialize)]
-struct RequestContents<'a> {
+struct CredentialRequestPayload<'a> {
     method: &'static str,
     profiles: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]

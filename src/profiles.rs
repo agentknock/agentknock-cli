@@ -8,7 +8,7 @@ use crate::{
     config::{clear_rotation_key, read_pairing},
     crypto::Session,
     pairing::{RotationError, maybe_rotate_psk},
-    websocket::Relay,
+    websocket::RelayExchange,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -55,7 +55,7 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let mut relay = Relay::authenticated(&pairing, &request_id.to_string())?;
+    let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
     progress(ProfileListProgress::WaitingForDelivery);
     let response = relay

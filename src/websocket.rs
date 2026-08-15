@@ -38,7 +38,7 @@ struct RetryPolicy {
     maximum_failures: usize,
 }
 
-pub(crate) struct Relay {
+pub(crate) struct RelayExchange {
     url: String,
     authorization: HeaderValue,
     client_id: String,
@@ -56,7 +56,7 @@ struct OutgoingMessage {
     delivered: bool,
 }
 
-impl Relay {
+impl RelayExchange {
     pub(crate) fn pairing(
         address_id: &str,
         client_id: &str,
@@ -127,31 +127,31 @@ impl Relay {
             self.message(MessageKind::Request, request)?,
         )?);
 
-        let mut recovery = Recovery::new(NORMAL_RETRY_POLICY);
+        let mut retry = RetryState::new(NORMAL_RETRY_POLICY);
         loop {
-            let reconnected = self.ensure_connected(&mut recovery).await?;
+            let reconnected = self.ensure_connected(&mut retry).await?;
             if reconnected {
                 if self.request_message().acknowledged {
-                    if !self.send_resume(&mut recovery).await? {
+                    if !self.send_resume(&mut retry).await? {
                         continue;
                     }
-                } else if !self.send_request(&mut recovery).await? {
+                } else if !self.send_request(&mut retry).await? {
                     continue;
                 }
             }
 
-            let incoming = match self.receive(&mut recovery).await? {
+            let incoming = match self.receive(&mut retry).await? {
                 Some(incoming) => incoming,
                 None => continue,
             };
             match self.validate(incoming)? {
-                Incoming::Ack {
+                IncomingFrame::Ack {
                     kind: MessageKind::Request,
                     ..
                 } => {
                     self.request_mut().acknowledged = true;
                 }
-                Incoming::Receipt {
+                IncomingFrame::Receipt {
                     kind: MessageKind::Request,
                     ..
                 } => {
@@ -159,7 +159,7 @@ impl Relay {
                     self.request_mut().delivered = true;
                     delivered();
                 }
-                Incoming::Message {
+                IncomingFrame::Message {
                     kind: MessageKind::Response,
                     payload,
                     ..
@@ -170,11 +170,11 @@ impl Relay {
                     if self.response.is_none() {
                         self.response = Some(payload);
                     }
-                    if self.send_ack(MessageKind::Response, &mut recovery).await? {
+                    if self.send_ack(MessageKind::Response, &mut retry).await? {
                         return self.decode_response();
                     }
                 }
-                Incoming::State {
+                IncomingFrame::State {
                     exchange,
                     request,
                     response,
@@ -188,8 +188,8 @@ impl Relay {
                         return Err(Error::MissingResponse);
                     }
                 }
-                Incoming::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
-                Incoming::Error {
+                IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                IncomingFrame::Error {
                     error,
                     message,
                     retryable,
@@ -203,8 +203,8 @@ impl Relay {
                         });
                     }
                     self.socket = None;
-                    recovery.last_error = format!("relay requested retry: {error}: {message}");
-                    recovery
+                    retry.last_error = format!("relay requested retry: {error}: {message}");
+                    retry
                         .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
                         .await?;
                 }
@@ -248,38 +248,38 @@ impl Relay {
             )?);
         }
 
-        let mut recovery = Recovery::new(policy);
+        let mut retry = RetryState::new(policy);
         loop {
-            let reconnected = self.ensure_connected(&mut recovery).await?;
+            let reconnected = self.ensure_connected(&mut retry).await?;
             if reconnected {
                 if self.request_message().acknowledged {
-                    if !self.send_resume(&mut recovery).await? {
+                    if !self.send_resume(&mut retry).await? {
                         continue;
                     }
-                } else if !self.send_request(&mut recovery).await? {
+                } else if !self.send_request(&mut retry).await? {
                     continue;
                 }
             }
 
             if !self.request_message().acknowledged {
-                let Some(incoming) = self.receive(&mut recovery).await? else {
+                let Some(incoming) = self.receive(&mut retry).await? else {
                     continue;
                 };
                 match self.validate(incoming)? {
-                    Incoming::Ack {
+                    IncomingFrame::Ack {
                         kind: MessageKind::Request,
                         ..
                     } => {
                         self.request_mut().acknowledged = true;
                     }
-                    Incoming::Receipt {
+                    IncomingFrame::Receipt {
                         kind: MessageKind::Request,
                         ..
                     } => {
                         self.request_mut().acknowledged = true;
                         self.request_mut().delivered = true;
                     }
-                    Incoming::Message {
+                    IncomingFrame::Message {
                         kind: MessageKind::Response,
                         payload,
                         ..
@@ -287,12 +287,12 @@ impl Relay {
                         self.request_mut().acknowledged = true;
                         self.request_mut().delivered = true;
                         self.response.get_or_insert(payload);
-                        if !self.send_ack(MessageKind::Response, &mut recovery).await? {
+                        if !self.send_ack(MessageKind::Response, &mut retry).await? {
                             continue;
                         }
                     }
-                    Incoming::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
-                    Incoming::Error {
+                    IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                    IncomingFrame::Error {
                         error,
                         message,
                         retryable,
@@ -306,8 +306,8 @@ impl Relay {
                             });
                         }
                         self.socket = None;
-                        recovery.last_error = format!("relay requested retry: {error}: {message}");
-                        recovery
+                        retry.last_error = format!("relay requested retry: {error}: {message}");
+                        retry
                             .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
                             .await?;
                     }
@@ -316,34 +316,33 @@ impl Relay {
                 continue;
             }
 
-            if (reconnected || !self.completion().sent)
-                && !self.send_completion(&mut recovery).await?
+            if (reconnected || !self.completion().sent) && !self.send_completion(&mut retry).await?
             {
                 continue;
             }
 
-            let Some(incoming) = self.receive(&mut recovery).await? else {
+            let Some(incoming) = self.receive(&mut retry).await? else {
                 continue;
             };
             match self.validate(incoming)? {
-                Incoming::Ack {
+                IncomingFrame::Ack {
                     kind: MessageKind::Completion,
                     ..
                 } => {
                     self.completion_mut().acknowledged = true;
                     return Ok(());
                 }
-                Incoming::Message {
+                IncomingFrame::Message {
                     kind: MessageKind::Response,
                     payload,
                     ..
                 } => {
                     self.response.get_or_insert(payload);
-                    if !self.send_ack(MessageKind::Response, &mut recovery).await? {
+                    if !self.send_ack(MessageKind::Response, &mut retry).await? {
                         continue;
                     }
                 }
-                Incoming::State {
+                IncomingFrame::State {
                     completion:
                         MessageState::Accepted | MessageState::Delivered | MessageState::Discarded,
                     ..
@@ -351,8 +350,8 @@ impl Relay {
                     self.completion_mut().acknowledged = true;
                     return Ok(());
                 }
-                Incoming::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
-                Incoming::Error {
+                IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                IncomingFrame::Error {
                     error,
                     message,
                     retryable,
@@ -366,8 +365,8 @@ impl Relay {
                         });
                     }
                     self.socket = None;
-                    recovery.last_error = format!("relay requested retry: {error}: {message}");
-                    recovery
+                    retry.last_error = format!("relay requested retry: {error}: {message}");
+                    retry
                         .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
                         .await?;
                 }
@@ -380,7 +379,7 @@ impl Relay {
     where
         B: Serialize + ?Sized,
     {
-        serde_json::to_string(&Outgoing::Message {
+        serde_json::to_string(&OutgoingFrame::Message {
             client_id: &self.client_id,
             request_id: &self.request_id,
             kind,
@@ -389,7 +388,7 @@ impl Relay {
         .map_err(Error::InvalidJson)
     }
 
-    async fn ensure_connected(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+    async fn ensure_connected(&mut self, retry: &mut RetryState) -> Result<bool, Error> {
         if self.socket.is_some() {
             return Ok(false);
         }
@@ -399,8 +398,7 @@ impl Relay {
                 .map_err(|error| Error::InvalidRelayUrl(error.to_string()))?
                 .limits(Limits::default().max_payload_len(Some(MAXIMUM_FRAME_SIZE)))
                 .add_header(AUTHORIZATION, self.authorization.clone())?;
-            match tokio::time::timeout(recovery.policy.connection_timeout, builder.connect()).await
-            {
+            match tokio::time::timeout(retry.policy.connection_timeout, builder.connect()).await {
                 Ok(Ok((socket, _))) => {
                     self.socket = Some(socket);
                     return Ok(true);
@@ -408,50 +406,46 @@ impl Relay {
                 Ok(Err(tokio_websockets::Error::Upgrade(
                     upgrade::Error::DidNotSwitchProtocols(status),
                 ))) if status < 500 => return Err(Error::UnexpectedStatus(status)),
-                Ok(Err(error)) => recovery.failed_with(error.to_string()).await?,
-                Err(_) => recovery.failed_with("connection timed out".into()).await?,
+                Ok(Err(error)) => retry.failed_with(error.to_string()).await?,
+                Err(_) => retry.failed_with("connection timed out".into()).await?,
             }
         }
     }
 
-    async fn send_request(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+    async fn send_request(&mut self, retry: &mut RetryState) -> Result<bool, Error> {
         let encoded = self.request_message().encoded.clone();
-        let sent = self.send_text(encoded, recovery).await?;
+        let sent = self.send_text(encoded, retry).await?;
         self.request_mut().sent |= sent;
         Ok(sent)
     }
 
-    async fn send_completion(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
+    async fn send_completion(&mut self, retry: &mut RetryState) -> Result<bool, Error> {
         let encoded = self.completion().encoded.clone();
-        let sent = self.send_text(encoded, recovery).await?;
+        let sent = self.send_text(encoded, retry).await?;
         self.completion_mut().sent |= sent;
         Ok(sent)
     }
 
-    async fn send_resume(&mut self, recovery: &mut Recovery) -> Result<bool, Error> {
-        let frame: Outgoing<'_, ()> = Outgoing::Resume {
+    async fn send_resume(&mut self, retry: &mut RetryState) -> Result<bool, Error> {
+        let frame: OutgoingFrame<'_, ()> = OutgoingFrame::Resume {
             client_id: &self.client_id,
             request_id: &self.request_id,
         };
         let encoded = serde_json::to_string(&frame).map_err(Error::InvalidJson)?;
-        self.send_text(encoded, recovery).await
+        self.send_text(encoded, retry).await
     }
 
-    async fn send_ack(
-        &mut self,
-        kind: MessageKind,
-        recovery: &mut Recovery,
-    ) -> Result<bool, Error> {
-        let frame: Outgoing<'_, ()> = Outgoing::Ack {
+    async fn send_ack(&mut self, kind: MessageKind, retry: &mut RetryState) -> Result<bool, Error> {
+        let frame: OutgoingFrame<'_, ()> = OutgoingFrame::Ack {
             client_id: &self.client_id,
             request_id: &self.request_id,
             kind,
         };
         let encoded = serde_json::to_string(&frame).map_err(Error::InvalidJson)?;
-        self.send_text(encoded, recovery).await
+        self.send_text(encoded, retry).await
     }
 
-    async fn send_text(&mut self, encoded: String, recovery: &mut Recovery) -> Result<bool, Error> {
+    async fn send_text(&mut self, encoded: String, retry: &mut RetryState) -> Result<bool, Error> {
         if encoded.len() > MAXIMUM_FRAME_SIZE {
             return Err(Error::FrameTooLarge(encoded.len()));
         }
@@ -465,13 +459,13 @@ impl Relay {
             Ok(()) => Ok(true),
             Err(error) => {
                 self.socket = None;
-                recovery.failed_with(error.to_string()).await?;
+                retry.failed_with(error.to_string()).await?;
                 Ok(false)
             }
         }
     }
 
-    async fn receive(&mut self, recovery: &mut Recovery) -> Result<Option<Incoming>, Error> {
+    async fn receive(&mut self, retry: &mut RetryState) -> Result<Option<IncomingFrame>, Error> {
         loop {
             let message = match tokio::time::timeout(
                 PING_INTERVAL,
@@ -489,7 +483,7 @@ impl Relay {
                         .await
                     {
                         self.socket = None;
-                        recovery.failed_with(error.to_string()).await?;
+                        retry.failed_with(error.to_string()).await?;
                         return Ok(None);
                     }
                     match tokio::time::timeout(
@@ -501,7 +495,7 @@ impl Relay {
                         Ok(message) => message,
                         Err(_) => {
                             self.socket = None;
-                            recovery
+                            retry
                                 .failed_with("relay did not answer a WebSocket ping".into())
                                 .await?;
                             return Ok(None);
@@ -512,7 +506,7 @@ impl Relay {
 
             let Some(message) = message else {
                 self.socket = None;
-                recovery
+                retry
                     .failed_with("relay closed the WebSocket".into())
                     .await?;
                 return Ok(None);
@@ -521,7 +515,7 @@ impl Relay {
                 Ok(message) => message,
                 Err(error) => {
                     self.socket = None;
-                    recovery.failed_with(error.to_string()).await?;
+                    retry.failed_with(error.to_string()).await?;
                     return Ok(None);
                 }
             };
@@ -529,12 +523,12 @@ impl Relay {
                 let code = u16::from(code);
                 self.socket = None;
                 if matches!(code, 4002 | 4003) {
-                    return Err(Error::PairingInactive {
+                    return Err(Error::ClientInactive {
                         code,
                         reason: reason.to_owned(),
                     });
                 }
-                recovery
+                retry
                     .failed_with(format!("relay closed the WebSocket ({code} {reason})"))
                     .await?;
                 return Ok(None);
@@ -549,14 +543,14 @@ impl Relay {
                     .await
                 {
                     self.socket = None;
-                    recovery.failed_with(error.to_string()).await?;
+                    retry.failed_with(error.to_string()).await?;
                     return Ok(None);
                 }
-                recovery.succeeded();
+                retry.succeeded();
                 continue;
             }
             if message.is_pong() {
-                recovery.succeeded();
+                retry.succeeded();
                 continue;
             }
             let Some(text) = message.as_text() else {
@@ -564,15 +558,15 @@ impl Relay {
                     "relay sent a binary WebSocket frame".into(),
                 ));
             };
-            let incoming: Incoming = serde_json::from_str(text).map_err(Error::InvalidJson)?;
+            let incoming: IncomingFrame = serde_json::from_str(text).map_err(Error::InvalidJson)?;
             if !incoming.is_retryable_error() {
-                recovery.succeeded();
+                retry.succeeded();
             }
             return Ok(Some(incoming));
         }
     }
 
-    fn validate(&self, incoming: Incoming) -> Result<Incoming, Error> {
+    fn validate(&self, incoming: IncomingFrame) -> Result<IncomingFrame, Error> {
         if let Some(client_id) = incoming.client_id()
             && client_id != self.client_id
         {
@@ -647,14 +641,14 @@ impl OutgoingMessage {
     }
 }
 
-struct Recovery {
+struct RetryState {
     policy: RetryPolicy,
     first_failure: Option<Instant>,
     failures: usize,
     last_error: String,
 }
 
-impl Recovery {
+impl RetryState {
     fn new(policy: RetryPolicy) -> Self {
         Self {
             policy,
@@ -706,7 +700,7 @@ pub(crate) enum MessageKind {
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Outgoing<'a, B: ?Sized> {
+enum OutgoingFrame<'a, B: ?Sized> {
     Message {
         client_id: &'a str,
         request_id: &'a str,
@@ -726,7 +720,7 @@ enum Outgoing<'a, B: ?Sized> {
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Incoming {
+enum IncomingFrame {
     Ack {
         client_id: String,
         request_id: String,
@@ -770,7 +764,7 @@ enum Incoming {
     },
 }
 
-impl Incoming {
+impl IncomingFrame {
     fn is_retryable_error(&self) -> bool {
         matches!(
             self,
@@ -859,7 +853,7 @@ pub(crate) enum Error {
     Inactive { kind: Option<MessageKind> },
 
     #[error("paired client is not active ({code} {reason})")]
-    PairingInactive { code: u16, reason: String },
+    ClientInactive { code: u16, reason: String },
 
     #[error("relay remained unavailable after {failures} consecutive failures: {last_error}")]
     RetriesExhausted { failures: usize, last_error: String },

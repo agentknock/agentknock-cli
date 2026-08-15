@@ -23,8 +23,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub(crate) struct Pairing {
     #[serde(default)]
     pending: bool,
-    device_id: RelayId,
-    client_id: RelayId,
+    device_id: CanonicalUlid,
+    client_id: CanonicalUlid,
     #[serde(deserialize_with = "deserialize_client_token")]
     client_token: String,
     #[serde(deserialize_with = "deserialize_base64")]
@@ -37,14 +37,14 @@ pub(crate) struct Pairing {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct Identifier(u128);
+pub(crate) struct AddressId(u128);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) struct RelayId(Ulid);
+pub(crate) struct CanonicalUlid(Ulid);
 
 pub(crate) struct PendingPairing {
-    device_id: RelayId,
-    client_id: RelayId,
+    device_id: CanonicalUlid,
+    client_id: CanonicalUlid,
     client_token: String,
     client_psk: Vec<u8>,
     device_key: Vec<u8>,
@@ -96,13 +96,13 @@ impl Pairing {
     }
 }
 
-impl Identifier {
+impl AddressId {
     pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(u128::from_be_bytes(bytes))
     }
 }
 
-impl RelayId {
+impl CanonicalUlid {
     pub(crate) fn new(id: Ulid) -> Self {
         Self(id)
     }
@@ -114,8 +114,8 @@ impl RelayId {
 
 impl PendingPairing {
     pub(crate) fn new(
-        device_id: RelayId,
-        client_id: RelayId,
+        device_id: CanonicalUlid,
+        client_id: CanonicalUlid,
         client_token: String,
         client_psk: Vec<u8>,
         device_key: Vec<u8>,
@@ -130,19 +130,19 @@ impl PendingPairing {
     }
 }
 
-impl fmt::Display for Identifier {
+impl fmt::Display for AddressId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{:032x}", self.0)
     }
 }
 
-impl fmt::Display for RelayId {
+impl fmt::Display for CanonicalUlid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
 }
 
-impl<'de> Deserialize<'de> for Identifier {
+impl<'de> Deserialize<'de> for AddressId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -159,12 +159,12 @@ impl<'de> Deserialize<'de> for Identifier {
         }
 
         u128::from_str_radix(&encoded, 16)
-            .map(Identifier)
+            .map(AddressId)
             .map_err(serde::de::Error::custom)
     }
 }
 
-impl Serialize for Identifier {
+impl Serialize for AddressId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -173,7 +173,7 @@ impl Serialize for Identifier {
     }
 }
 
-impl<'de> Deserialize<'de> for RelayId {
+impl<'de> Deserialize<'de> for CanonicalUlid {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -189,7 +189,7 @@ impl<'de> Deserialize<'de> for RelayId {
     }
 }
 
-impl Serialize for RelayId {
+impl Serialize for CanonicalUlid {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -688,8 +688,8 @@ where
 #[derive(Serialize)]
 struct PendingPairingFile<'a> {
     pending: bool,
-    device_id: RelayId,
-    client_id: RelayId,
+    device_id: CanonicalUlid,
+    client_id: CanonicalUlid,
     client_token: &'a str,
     #[serde(serialize_with = "serialize_base64")]
     client_psk: &'a [u8],

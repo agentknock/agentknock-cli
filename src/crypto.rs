@@ -14,7 +14,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::config::{Identifier, Pairing, PendingPairing, RelayId};
+use crate::config::{AddressId, CanonicalUlid, Pairing, PendingPairing};
 
 const BASE_DERIVATION_SALT: &[u8] = b"agentknock-v1";
 const ADDRESS_DERIVATION_INFO: &[u8] = b"agentknock-v1 address";
@@ -31,7 +31,7 @@ type Kdf = HkdfSha256;
 type Kem = X25519HkdfSha256;
 type SenderContext = AeadCtxS<Aead, Kdf, Kem>;
 type ResponseAead = <Aead as HpkeAeadTrait>::AeadImpl;
-type ExporterSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
+type KdfSizedBytes = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 type ResponseKey = AeadKey<ResponseAead>;
 type ResponseNonce = AeadNonce<ResponseAead>;
 
@@ -49,7 +49,7 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn new(pairing: &Pairing, request_id: &Ulid) -> Result<Self, Error> {
-        let (encapped_key, sender_context) = setup_pairing_sender(pairing, request_id.to_bytes())?;
+        let (encapped_key, sender_context) = setup_psk_sender(pairing, request_id.to_bytes())?;
 
         Ok(Self {
             encapped_key,
@@ -79,7 +79,7 @@ impl Session {
         salt.extend_from_slice(&self.encapped_key);
         salt.extend_from_slice(&public_nonce);
 
-        let mut exported_secret = ExporterSecret::default();
+        let mut exported_secret = KdfSizedBytes::default();
         self.sender_context
             .export(RESPONSE_EXPORT_CONTEXT, &mut exported_secret)?;
         let hkdf = Hkdf::<Sha256>::new(Some(&salt), &exported_secret);
@@ -114,8 +114,8 @@ impl Session {
 }
 
 pub(crate) fn derive_psk_rotation(pairing: &Pairing) -> Result<PskRotation, Error> {
-    let (encapped_key, sender_context) = setup_pairing_sender(pairing, [0; 16])?;
-    let mut client_psk = ExporterSecret::default();
+    let (encapped_key, sender_context) = setup_psk_sender(pairing, [0; 16])?;
+    let mut client_psk = KdfSizedBytes::default();
     sender_context.export(PSK_EXPORT_CONTEXT, &mut client_psk)?;
 
     Ok(PskRotation {
@@ -124,7 +124,7 @@ pub(crate) fn derive_psk_rotation(pairing: &Pairing) -> Result<PskRotation, Erro
     })
 }
 
-fn setup_pairing_sender(
+fn setup_psk_sender(
     pairing: &Pairing,
     request_id: [u8; 16],
 ) -> Result<(Vec<u8>, SenderContext), Error> {
@@ -138,7 +138,7 @@ fn setup_pairing_sender(
 }
 
 pub(crate) fn seal_pairing(
-    client_id: RelayId,
+    client_id: CanonicalUlid,
     client_token: String,
     response: PairingResponse,
     client_random: &[u8],
@@ -151,12 +151,12 @@ pub(crate) fn seal_pairing(
     let (encapped_key, mut sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &device_key, &info)?;
     let ciphertext = sender_context.seal(plaintext, b"")?;
-    let mut client_psk = ExporterSecret::default();
+    let mut client_psk = KdfSizedBytes::default();
     sender_context.export(PSK_EXPORT_CONTEXT, &mut client_psk)?;
-    if response.device_random.len() != ExporterSecret::default().len() {
+    if response.device_random.len() != KdfSizedBytes::default().len() {
         return Err(Error::InvalidDeviceRandomLength {
             actual: response.device_random.len(),
-            expected: ExporterSecret::default().len(),
+            expected: KdfSizedBytes::default().len(),
         });
     }
     let mut sas_info = Vec::with_capacity(
@@ -188,22 +188,22 @@ pub(crate) fn seal_pairing(
     Ok((completion, pairing, sas))
 }
 
-pub(crate) fn derive_address_id(address: &str) -> Result<Identifier, Error> {
+pub(crate) fn derive_address_id(address: &str) -> Result<AddressId, Error> {
     let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), address.as_bytes());
     let mut address_id = [0; 16];
     hkdf.expand(ADDRESS_DERIVATION_INFO, &mut address_id)?;
-    Ok(Identifier::from_bytes(address_id))
+    Ok(AddressId::from_bytes(address_id))
 }
 
 pub(crate) fn generate_client_random() -> Result<Vec<u8>, Error> {
-    let mut client_random = ExporterSecret::default();
+    let mut client_random = KdfSizedBytes::default();
     getrandom::fill(&mut client_random)?;
     Ok(client_random.to_vec())
 }
 
 pub(crate) fn derive_pairing_commitment(address: &str) -> Result<Vec<u8>, Error> {
     let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), address.as_bytes());
-    let mut commitment = ExporterSecret::default();
+    let mut commitment = KdfSizedBytes::default();
     hkdf.expand(COMMITMENT_DERIVATION_INFO, &mut commitment)?;
     Ok(commitment.to_vec())
 }
@@ -247,7 +247,7 @@ pub(crate) struct Completion {
 
 #[derive(Deserialize)]
 pub(crate) struct PairingResponse {
-    device_id: RelayId,
+    device_id: CanonicalUlid,
     #[serde(deserialize_with = "deserialize_base64")]
     device_key: Vec<u8>,
     #[serde(deserialize_with = "deserialize_base64")]
@@ -365,13 +365,13 @@ mod tests {
     fn binds_request_to_protocol_version() {
         use hpke::{OpModeR, setup_receiver};
 
-        let (route_private_key, route_public_key) = Kem::gen_keypair();
+        let (device_private_key, device_public_key) = Kem::gen_keypair();
         let pairing: Pairing = serde_json::from_value(json!({
             "device_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
             "client_id": "01K2EP16NWNAGJYF8J1Q2V6P3X",
             "client_token": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x24; 32]),
             "client_psk": BASE64_STANDARD.encode([0x42; 32]),
-            "device_key": BASE64_STANDARD.encode(route_public_key.to_bytes()),
+            "device_key": BASE64_STANDARD.encode(device_public_key.to_bytes()),
             "rotated_at": 1_700_000_000,
         }))
         .unwrap();
@@ -394,7 +394,7 @@ mod tests {
         .concat();
         let mut receiver_context = setup_receiver::<Aead, Kdf, Kem>(
             &OpModeR::Psk(psk),
-            &route_private_key,
+            &device_private_key,
             &encapped_key,
             &info,
         )

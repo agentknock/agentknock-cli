@@ -11,16 +11,16 @@ use ulid::Ulid;
 use crate::{
     ConfigurationError, ProtocolError, RequestError,
     config::{
-        LockedPairing, RelayId, abort_pending_pairing, current_timestamp, ensure_pairing_absent,
-        finish_pending_pairing, lock_pairing_for_rotation, lock_pairing_if_rotated_before,
-        pairing_path, read_pairing, read_pairing_from, read_pending_pairing, remove_active_pairing,
-        remove_pairing, write_pending_pairing,
+        CanonicalUlid, LockedPairing, abort_pending_pairing, current_timestamp,
+        ensure_pairing_absent, finish_pending_pairing, lock_pairing_for_rotation,
+        lock_pairing_if_rotated_before, pairing_path, read_pairing, read_pairing_from,
+        read_pending_pairing, remove_active_pairing, remove_pairing, write_pending_pairing,
     },
     crypto::{
         self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
         derive_pairing_commitment, derive_psk_rotation, generate_client_random, seal_pairing,
     },
-    websocket::Relay,
+    websocket::RelayExchange,
 };
 
 const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
@@ -65,10 +65,10 @@ where
     let client_random = generate_client_random().map_err(ProtocolError::from)?;
     let commitment = derive_pairing_commitment(address).map_err(ProtocolError::from)?;
     let request_id = Ulid::generate();
-    let client_id = RelayId::new(request_id);
+    let client_id = CanonicalUlid::new(request_id);
     let client_token = generate_client_token()?;
     let address_id = derive_address_id(address).map_err(ProtocolError::from)?;
-    let mut relay = Relay::pairing(
+    let mut relay = RelayExchange::pairing(
         &address_id.to_string(),
         &request_id.to_string(),
         &client_token,
@@ -84,7 +84,7 @@ where
         })
         .await?;
     progress(PairingProgress::Completing);
-    let contents = PairingContents {
+    let contents = PairingCompletionPayload {
         client_random: BASE64_STANDARD.encode(&client_random),
         platform: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
@@ -130,7 +130,7 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let mut relay = Relay::authenticated(&pairing, &request_id.to_string())?;
+    let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = relay
         .request(&request, || {
@@ -191,7 +191,7 @@ where
 async fn prepare_unpair<P>(
     pairing: &crate::config::Pairing,
     progress: &mut P,
-) -> Result<(Relay, crypto::Completion), RequestError>
+) -> Result<(RelayExchange, crypto::Completion), RequestError>
 where
     P: FnMut(PairingProgress),
 {
@@ -202,7 +202,7 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(ProtocolError::from)?;
-    let mut relay = Relay::authenticated(pairing, &request_id.to_string())?;
+    let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = relay
         .request(&request, || {
@@ -309,7 +309,7 @@ enum FinishPairingResult {
 }
 
 #[derive(Serialize)]
-struct PairingContents {
+struct PairingCompletionPayload {
     client_random: String,
     platform: &'static str,
     architecture: &'static str,
@@ -393,7 +393,7 @@ mod tests {
         type Aead = ChaCha20Poly1305;
         type Kdf = HkdfSha256;
         type Kem = X25519HkdfSha256;
-        type ExporterSecret = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
+        type KdfSizedBytes = Array<u8, <Kdf as HpkeKdfTrait>::Nh>;
 
         const DEVICE_ID: &str = "01K2ENXDTW1P3XAR4J7V7C9D0H";
         const CLIENT_ID: &str = "01K2EP16NWNAGJYF8J1Q2V6P3X";
@@ -467,7 +467,7 @@ mod tests {
             &info,
         )
         .unwrap();
-        let mut expected_psk = ExporterSecret::default();
+        let mut expected_psk = KdfSizedBytes::default();
         receiver_context
             .export(PSK_EXPORT_CONTEXT, &mut expected_psk)
             .unwrap();
