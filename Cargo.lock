@@ -25,6 +25,7 @@ dependencies = [
  "hkdf",
  "hpke",
  "http",
+ "libc",
  "rustls",
  "serde",
  "serde_json",

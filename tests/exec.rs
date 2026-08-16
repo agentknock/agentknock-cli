@@ -1,15 +1,19 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 mod support;
 
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt as _,
     process::{Command, Stdio},
     sync::mpsc,
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::SinkExt as _;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio_websockets::Message;
 
 use support::{
@@ -38,6 +42,15 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
         assert_eq!(plaintext["profiles"], json!(["github", "cloudflare"]));
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
+        assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
+        let executable_path = plaintext["operation"]["executable_path"].as_str().unwrap();
+        let executable_hash = BASE64_STANDARD
+            .decode(plaintext["operation"]["executable_hash"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            executable_hash,
+            Sha256::digest(fs::read(executable_path).unwrap()).as_slice()
+        );
         assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
 
         send_json(
@@ -131,6 +144,290 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
     );
     assert_eq!(output.stderr, b"");
     server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reports_and_executes_a_shebang_script() {
+    let home = TestHome::active();
+    let script = home.path().join("script");
+    let script_contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n";
+    fs::write(&script, script_contents).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let expected_path = script.to_str().unwrap().to_owned();
+    let expected_hash = BASE64_STANDARD.encode(Sha256::digest(script_contents));
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap().to_owned();
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, &request_id, &request["payload"]);
+        assert_eq!(plaintext["operation"]["executable_mode"], "SCRIPT");
+        assert_eq!(plaintext["operation"]["executable_path"], expected_path);
+        assert_eq!(plaintext["operation"]["executable_hash"], expected_hash);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({
+                        "result": "APPROVED",
+                        "environment": {"AGENTKNOCK_SCRIPT_TEST": "approved"},
+                    }),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        assert_eq!(
+            open_completion(&mut context, &completion["payload"])["result"],
+            "APPROVED"
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["--exec", "test", "--", script.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"script:approved");
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executes_the_selected_native_file_after_its_path_is_replaced() {
+    let home = TestHome::active();
+    let selected_path = home.path().join("selected-native");
+    let replacement_path = home.path().join("replacement-native");
+    fs::copy(std::env::current_exe().unwrap(), &selected_path).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_agentknock"), &replacement_path).unwrap();
+    let server_selected_path = selected_path.clone();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap().to_owned();
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, &request_id, &request["payload"]);
+        assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
+        assert_eq!(
+            plaintext["operation"]["executable_path"],
+            server_selected_path.to_str().unwrap()
+        );
+        fs::rename(&replacement_path, &server_selected_path).unwrap();
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({
+                        "result": "APPROVED",
+                        "environment": {
+                            "AGENTKNOCK_PINNED_EXEC_TEST": "selected",
+                            "PATH": "/agentknock-returned-path-must-not-be-searched",
+                        },
+                    }),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        let _: Value = open_completion(&mut context, &completion["payload"]);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("PATH", home.path())
+        .arg("--exec")
+        .arg("test")
+        .arg("--")
+        .arg("selected-native")
+        .args(["--exact", "native_exec_probe", "--nocapture"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("PINNED_EXECUTABLE=selected")
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restores_sigpipe_before_executing_the_command() {
+    let home = TestHome::active();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap().to_owned();
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, _) =
+            open_request(&device_private_key, &request_id, &request["payload"]);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({"result": "APPROVED", "environment": {}}),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        let _: Value = open_completion(&mut context, &completion["payload"]);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args([
+            "--exec",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "kill -PIPE $$; printf survived",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("survived")
+    );
+    server.await.unwrap();
+}
+
+#[test]
+fn native_exec_probe() {
+    if let Ok(value) = std::env::var("AGENTKNOCK_PINNED_EXEC_TEST") {
+        println!("PINNED_EXECUTABLE={value}");
+    }
+}
+
+#[test]
+fn rejects_a_missing_command_before_requesting_credentials() {
+    let home = TestHome::active();
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", "ws://127.0.0.1:1")
+        .args([
+            "--exec",
+            "test",
+            "--",
+            "agentknock-command-that-does-not-exist",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("could not select the command"), "{stderr}");
+    assert!(
+        stderr.contains("The credentials request did not start."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("relay"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

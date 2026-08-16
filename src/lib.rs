@@ -8,8 +8,8 @@ mod websocket;
 
 pub use config::ConfigurationError;
 pub use credentials::{
-    CredentialRequest, CredentialRequestProgress, Credentials, DenialReason, ProtocolError,
-    RequestError, RequestOperation, StreamKind, request_credentials,
+    CredentialRequest, CredentialRequestProgress, Credentials, DenialReason, ExecutableMode,
+    ProtocolError, RequestError, RequestOperation, StreamKind, request_credentials,
     request_credentials_until_cancelled, request_credentials_with_progress,
 };
 pub use pairing::{

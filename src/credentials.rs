@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -33,11 +34,20 @@ pub enum RequestOperation<'a> {
         command: &'a str,
         arguments: &'a [String],
         working_directory: &'a str,
-        resolved_path: Option<&'a str>,
+        executable_path: &'a str,
+        executable_hash: Option<&'a [u8; 32]>,
+        executable_mode: ExecutableMode,
         stdin: StreamKind,
         stdout: StreamKind,
         stderr: StreamKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutableMode {
+    Binary,
+    Script,
 }
 
 pub struct Credentials {
@@ -198,7 +208,9 @@ where
             command,
             arguments,
             working_directory,
-            resolved_path,
+            executable_path,
+            executable_hash,
+            executable_mode,
             stdin,
             stdout,
             stderr,
@@ -206,7 +218,9 @@ where
             command,
             arguments,
             working_directory,
-            resolved_path,
+            executable_path,
+            executable_hash: executable_hash.map(|hash| BASE64_STANDARD.encode(hash)),
+            executable_mode,
             stdin: stdin.into(),
             stdout: stdout.into(),
             stderr: stderr.into(),
@@ -428,8 +442,10 @@ enum OperationMessage<'a> {
         command: &'a str,
         arguments: &'a [String],
         working_directory: &'a str,
+        executable_path: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
-        resolved_path: Option<&'a str>,
+        executable_hash: Option<String>,
+        executable_mode: ExecutableMode,
         stdin: StreamKindMessage,
         stdout: StreamKindMessage,
         stderr: StreamKindMessage,

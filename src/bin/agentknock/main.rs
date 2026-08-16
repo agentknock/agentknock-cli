@@ -1,10 +1,13 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("the agentknock CLI currently supports Linux only");
+
+mod executable;
+
 use std::{
     cell::Cell,
-    env,
     future::Future,
     io::{self, IsTerminal as _},
-    path::Path,
-    process::{Command as ProcessCommand, ExitCode},
+    process::ExitCode,
     rc::Rc,
     time::Duration,
 };
@@ -16,15 +19,11 @@ use agentknock::{
     force_unpair, list_profiles_with_progress, start_pairing_with_progress, unpair_with_progress,
 };
 use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
+use executable::{SelectedExecutable, SignalState};
+use futures_util::FutureExt as _;
 
-#[cfg(not(unix))]
-use agentknock::request_credentials;
-#[cfg(unix)]
 use agentknock::request_credentials_with_progress;
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-#[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt as _, process::CommandExt};
 
 const REQUEST_STATUS_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
@@ -150,8 +149,9 @@ enum PairingOperation {
 #[derive(Debug)]
 enum CommandError {
     ExecRequest(RequestError),
-    ExecContext(io::Error),
+    ExecSelection { program: String, source: io::Error },
     ExecSignal(io::Error),
+    ExecInterrupted,
     ExecProcess { program: String, source: io::Error },
     StartPairing(RequestError),
     FinishPairing(RequestError),
@@ -238,16 +238,23 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             command,
         } => {
             let (program, arguments) = command.split_first().expect("command is required");
-            let working_directory = working_directory().map_err(CommandError::ExecContext)?;
-            let resolved_path = resolve_command_path(program, Path::new(&working_directory));
+            let selected = SelectedExecutable::select(program).map_err(|source| {
+                CommandError::ExecSelection {
+                    program: program.clone(),
+                    source,
+                }
+            })?;
+            let signal_state = SignalState::capture().map_err(CommandError::ExecSignal)?;
             let launcher_chain = launcher_chain();
             let request = CredentialRequest {
                 profiles: &profiles,
                 operation: RequestOperation::Exec {
                     command: program,
                     arguments,
-                    working_directory: &working_directory,
-                    resolved_path: resolved_path.as_deref(),
+                    working_directory: selected.working_directory(),
+                    executable_path: selected.path(),
+                    executable_hash: selected.hash(),
+                    executable_mode: selected.mode(),
                     stdin: standard_stream_kind(0, io::stdin().is_terminal()),
                     stdout: standard_stream_kind(1, io::stdout().is_terminal()),
                     stderr: standard_stream_kind(2, io::stderr().is_terminal()),
@@ -255,19 +262,32 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 reason: reason.as_deref(),
                 launcher_chain: &launcher_chain,
             };
-            #[cfg(unix)]
-            let credentials = request_exec_credentials(request, output).await?;
-            #[cfg(not(unix))]
-            let credentials = request_credentials(request)
-                .await
-                .map_err(CommandError::ExecRequest)?;
+            let mut signals = ExecSignals::new().map_err(CommandError::ExecSignal)?;
+            let credentials = request_exec_credentials(request, output, &mut signals).await?;
+            let blocked_signals = signal_state
+                .block_interrupts()
+                .map_err(CommandError::ExecSignal)?;
+            if signals.received()
+                || blocked_signals
+                    .interrupted()
+                    .map_err(CommandError::ExecSignal)?
+            {
+                return Err(CommandError::ExecInterrupted);
+            }
             if output == OutputMode::Verbose {
                 print_received_environment(&credentials);
                 print_message(format_args!("AgentKnock executes the command: {program}."));
             }
             let program = program.clone();
-            exec(command, credentials)
-                .map_err(|source| CommandError::ExecProcess { program, source })?;
+            selected
+                .execute(arguments, credentials, &signal_state, blocked_signals)
+                .map_err(|source| {
+                    if source.kind() == io::ErrorKind::Interrupted {
+                        CommandError::ExecInterrupted
+                    } else {
+                        CommandError::ExecProcess { program, source }
+                    }
+                })?;
         }
         Operation::StartPairing(address) => {
             let sas = start_pairing_for_cli(&address)
@@ -448,23 +468,41 @@ fn pairing_progress_message(
     }
 }
 
-#[cfg(unix)]
+struct ExecSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ExecSignals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    fn received(&mut self) -> bool {
+        self.interrupt.recv().now_or_never().flatten().is_some()
+            || self.terminate.recv().now_or_never().flatten().is_some()
+    }
+}
+
 async fn request_exec_credentials(
     request: CredentialRequest<'_>,
     output: OutputMode,
+    signals: &mut ExecSignals,
 ) -> Result<Credentials, CommandError> {
-    use tokio::{
-        signal::unix::{SignalKind, signal},
-        time::{Instant, sleep},
-    };
+    use tokio::time::{Instant, sleep};
 
-    let mut interrupt = signal(SignalKind::interrupt()).map_err(CommandError::ExecSignal)?;
-    let mut terminate = signal(SignalKind::terminate()).map_err(CommandError::ExecSignal)?;
     let current_progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&current_progress);
+    let interrupt = &mut signals.interrupt;
+    let terminate = &mut signals.terminate;
     let request = request_credentials_with_progress(
         request,
-        async move {
+        async {
             tokio::select! {
                 _ = interrupt.recv() => {}
                 _ = terminate.recv() => {}
@@ -510,22 +548,11 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::ExecRequest(error) if output != OutputMode::Quiet => {
             print_exec_request_error(error);
         }
-        CommandError::ExecContext(source) if output != OutputMode::Quiet => {
+        CommandError::ExecSelection { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "AgentKnock could not inspect the invocation context: {source}."
+                "AgentKnock could not select the command {program:?}: {source}."
             ));
             print_message("The credentials request did not start.");
-        }
-        CommandError::ExecSignal(source) if output != OutputMode::Quiet => {
-            print_message(format_args!(
-                "A signal-handling error stopped the credentials request: {source}."
-            ));
-            print_message("The command did not start.");
-        }
-        CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
-            print_message(format_args!(
-                "The device approved the credentials request. AgentKnock did not execute the command {program:?}: {source}."
-            ));
             match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message("Suggested action: Correct the command name or path.");
@@ -538,9 +565,37 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                 _ => {}
             }
         }
+        CommandError::ExecSignal(source) if output != OutputMode::Quiet => {
+            print_message(format_args!(
+                "A signal-handling error stopped the credentials request: {source}."
+            ));
+            print_message("The command did not start.");
+        }
+        CommandError::ExecInterrupted if output != OutputMode::Quiet => {
+            print_message("A signal interrupted AgentKnock. The command did not start.");
+        }
+        CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
+            print_message(format_args!(
+                "The device approved the credentials request. AgentKnock did not execute the command {program:?}: {source}."
+            ));
+            match source.kind() {
+                io::ErrorKind::NotFound => {
+                    print_message(
+                        "Suggested action: Check the selected script path or executable interpreter.",
+                    );
+                }
+                io::ErrorKind::PermissionDenied => {
+                    print_message(
+                        "Suggested action: Make the command executable or correct its access permissions.",
+                    );
+                }
+                _ => {}
+            }
+        }
         CommandError::ExecRequest(_)
-        | CommandError::ExecContext(_)
+        | CommandError::ExecSelection { .. }
         | CommandError::ExecSignal(_)
+        | CommandError::ExecInterrupted
         | CommandError::ExecProcess { .. } => {}
         CommandError::StartPairing(error) => print_start_pairing_error(error),
         CommandError::FinishPairing(error) => print_finish_pairing_error(error),
@@ -1012,19 +1067,6 @@ fn print_profiles(profiles: &Profiles) {
     );
 }
 
-fn working_directory() -> io::Result<String> {
-    env::current_dir()?
-        .into_os_string()
-        .into_string()
-        .map_err(|path| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("working directory is not valid UTF-8: {path:?}"),
-            )
-        })
-}
-
-#[cfg(target_os = "linux")]
 fn standard_stream_kind(file_descriptor: u8, terminal: bool) -> StreamKind {
     if terminal {
         return StreamKind::Terminal;
@@ -1051,72 +1093,6 @@ fn standard_stream_kind(file_descriptor: u8, terminal: bool) -> StreamKind {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn standard_stream_kind(_file_descriptor: u8, terminal: bool) -> StreamKind {
-    if terminal {
-        StreamKind::Terminal
-    } else {
-        StreamKind::Unknown
-    }
-}
-
-#[cfg(unix)]
-fn resolve_command_path(command: &str, working_directory: &Path) -> Option<String> {
-    if command.contains('/') {
-        let command = Path::new(command);
-        let candidate = if command.is_absolute() {
-            command.to_owned()
-        } else {
-            working_directory.join(command)
-        };
-        return resolve_executable(&candidate);
-    }
-
-    let path = env::var_os("PATH")?;
-    for directory in env::split_paths(&path) {
-        let directory = if directory.is_absolute() {
-            directory
-        } else {
-            working_directory.join(directory)
-        };
-        let candidate = directory.join(command);
-        if is_executable(&candidate) {
-            return std::fs::canonicalize(candidate)
-                .ok()?
-                .into_os_string()
-                .into_string()
-                .ok();
-        }
-    }
-
-    None
-}
-
-#[cfg(unix)]
-fn resolve_executable(path: &Path) -> Option<String> {
-    if !is_executable(path) {
-        return None;
-    }
-
-    std::fs::canonicalize(path)
-        .ok()?
-        .into_os_string()
-        .into_string()
-        .ok()
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn resolve_command_path(_command: &str, _working_directory: &Path) -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "linux")]
 fn launcher_chain() -> Vec<String> {
     let mut launchers = Vec::new();
     let mut process_id = std::process::id();
@@ -1147,7 +1123,6 @@ fn launcher_chain() -> Vec<String> {
     launchers
 }
 
-#[cfg(target_os = "linux")]
 fn parent_id(status: &str) -> Option<u32> {
     status
         .lines()
@@ -1155,11 +1130,6 @@ fn parent_id(status: &str) -> Option<u32> {
         .trim()
         .parse()
         .ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn launcher_chain() -> Vec<String> {
-    Vec::new()
 }
 
 fn progress_message(progress: CredentialRequestProgress) -> &'static str {
@@ -1182,23 +1152,6 @@ fn print_message(message: impl std::fmt::Display) {
     for line in message.to_string().lines() {
         eprintln!("AGENTKNOCK: {line}");
     }
-}
-
-#[cfg(unix)]
-fn exec(command: Vec<String>, credentials: Credentials) -> io::Result<()> {
-    let (program, arguments) = command.split_first().expect("command is required");
-    Err(ProcessCommand::new(program)
-        .args(arguments)
-        .envs(credentials.into_environment())
-        .exec())
-}
-
-#[cfg(not(unix))]
-fn exec(_command: Vec<String>, _credentials: Credentials) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "exec is only supported on Unix",
-    ))
 }
 
 #[cfg(test)]
