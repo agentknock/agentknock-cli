@@ -19,6 +19,6 @@ pub use pairing::{
 };
 pub use profiles::{
     EnvironmentProfile, Profile, ProfileListProgress, ProfileUploadError, ProfileUploadMode,
-    ProfileUploadProgress, Profiles, ValueSource, list_profiles, list_profiles_with_progress,
-    upload_profile, upload_profile_with_progress,
+    ProfileUploadProgress, Profiles, list_profiles, list_profiles_with_progress, upload_profile,
+    upload_profile_with_progress,
 };

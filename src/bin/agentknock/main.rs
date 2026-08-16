@@ -22,9 +22,9 @@ use agentknock::{
     ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
     EnvironmentProfile, PairingProgress, PairingRemoveError, PairingSas, Profile,
     ProfileListProgress, ProfileUploadError, ProfileUploadMode, ProfileUploadProgress, Profiles,
-    RequestError, RequestOperation, StreamKind, ValueSource, abort_pairing,
-    finish_pairing_with_progress, force_remove_pairing, list_profiles_with_progress,
-    remove_pairing_with_progress, start_pairing_with_progress, upload_profile_with_progress,
+    RequestError, RequestOperation, StreamKind, abort_pairing, finish_pairing_with_progress,
+    force_remove_pairing, list_profiles_with_progress, remove_pairing_with_progress,
+    start_pairing_with_progress, upload_profile_with_progress,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
@@ -42,7 +42,7 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
 #[command(
     name = "agentknock",
     version,
-    about = "AgentKnock requests credentials and runs commands.",
+    about = "AgentKnock requests profile access and runs commands.",
     arg_required_else_help = true,
     subcommand_required = true,
     disable_help_subcommand = true,
@@ -55,7 +55,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
-    /// Run a command with credentials from one or more profiles.
+    /// Run a command with access provided by one or more profiles.
     #[command(visible_alias = "x")]
     Exec(ExecCommand),
 
@@ -84,7 +84,7 @@ enum Command {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 struct ExecCommand {
-    /// Request credentials from this profile. Repeat for each profile.
+    /// Request access from this profile. Repeat for each profile.
     #[arg(
         short = 'p',
         long = "profile",
@@ -95,7 +95,7 @@ struct ExecCommand {
     )]
     profiles: Vec<String>,
 
-    /// Give the reason for the credentials request.
+    /// Give the reason for the profile access request.
     #[arg(
         long,
         value_name = "REASON",
@@ -107,7 +107,7 @@ struct ExecCommand {
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
 
-    /// Show each credentials-request state change immediately.
+    /// Show each profile access request state change immediately.
     #[arg(long, conflicts_with = "quiet")]
     verbose: bool,
 
@@ -518,7 +518,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             finish_pairing_for_cli()
                 .await
                 .map_err(CommandError::FinishPairing)?;
-            println!("AgentKnock finished pairing. AgentKnock is ready to provide credentials.");
+            println!("AgentKnock finished pairing. AgentKnock is ready for use.");
         }
         Operation::AbortPairing => {
             abort_pairing().map_err(CommandError::AbortPairing)?;
@@ -552,7 +552,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 "AgentKnock delivered profile proposal {:?} to the device.",
                 profile.name
             );
-            println!("The profile is not in the vault until it is accepted on the device.");
+            println!("The profile proposal has not been accepted on the device.");
             println!("Suggested action: Review the profile proposal on the device.");
         }
     }
@@ -942,7 +942,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             print_message(format_args!(
                 "AgentKnock could not select the command {program:?}: {source}."
             ));
-            print_message("The credentials request did not start.");
+            print_message("The profile access request did not start.");
             match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message("Suggested action: Correct the command name or path.");
@@ -957,7 +957,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecSignal(source) if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "A signal-handling error stopped the credentials request: {source}."
+                "A signal-handling error stopped the profile access request: {source}."
             ));
             print_message("The command did not start.");
         }
@@ -966,7 +966,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "The device approved the credentials request. AgentKnock did not execute the command {program:?}: {source}."
+                "The device approved the profile access request. AgentKnock did not execute the command {program:?}: {source}."
             ));
             match source.kind() {
                 io::ErrorKind::NotFound => {
@@ -1115,7 +1115,7 @@ fn print_exec_request_error(error: &RequestError) {
             message,
         } => {
             print_message(format_args!(
-                "The credentials request was denied on the device: {message}"
+                "The profile access request was denied on the device: {message}"
             ));
             print_message("The command did not start.");
         }
@@ -1124,7 +1124,7 @@ fn print_exec_request_error(error: &RequestError) {
             message,
         } => {
             print_message(format_args!(
-                "The policy denied the credentials request: {message}"
+                "The policy denied the profile access request: {message}"
             ));
             print_message("The command did not start.");
         }
@@ -1133,7 +1133,7 @@ fn print_exec_request_error(error: &RequestError) {
             message,
         } => {
             print_message(format_args!(
-                "The credentials request was invalid: {message}"
+                "The profile access request was invalid: {message}"
             ));
             print_message("The command did not start.");
         }
@@ -1142,13 +1142,13 @@ fn print_exec_request_error(error: &RequestError) {
             message,
         } => {
             print_message(format_args!(
-                "The credentials request was denied: {message}"
+                "The profile access request was denied: {message}"
             ));
             print_message("The command did not start.");
         }
         RequestError::Interrupted => {
             print_message(
-                "A signal interrupted the credentials request. The command did not start.",
+                "A signal interrupted the profile access request. The command did not start.",
             );
         }
         RequestError::RelayUnavailable { failures } => {
@@ -1161,7 +1161,7 @@ fn print_exec_request_error(error: &RequestError) {
             );
         }
         RequestError::Relay(source) => {
-            print_message(format_args!("The credentials request failed: {source}."));
+            print_message(format_args!("The profile access request failed: {source}."));
             print_message("The command did not start.");
         }
         RequestError::Unauthenticated { code, message } => {
@@ -1178,7 +1178,7 @@ fn print_exec_request_error(error: &RequestError) {
         }
         RequestError::Protocol(source) => {
             print_message(format_args!(
-                "A protocol error stopped the credentials request: {source}."
+                "A protocol error stopped the profile access request: {source}."
             ));
             print_message("The command did not start.");
         }
@@ -1255,7 +1255,7 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error("Pairing is already in progress.");
         }
         RequestError::Configuration(ConfigurationError::PairingExists { .. }) => {
-            print_plain_error("AgentKnock is already paired and ready to provide credentials.");
+            print_plain_error("AgentKnock is already paired and ready for use.");
             print_plain_error("AgentKnock did not change the existing pairing.");
         }
         RequestError::Configuration(error) => {
@@ -1297,7 +1297,7 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
         RequestError::Configuration(ConfigurationError::PairingNotPending { .. }) => {
-            print_plain_error("Pairing is complete. AgentKnock is ready to provide credentials.");
+            print_plain_error("Pairing is complete. AgentKnock is ready for use.");
         }
         RequestError::Configuration(error) => {
             print_plain_error(format_args!("AgentKnock did not finish pairing: {error}."));
@@ -1496,25 +1496,11 @@ fn print_profiles(profiles: &Profiles) {
                 Profile::Environment {
                     description,
                     variables,
-                } => {
-                    let variables = variables
-                        .iter()
-                        .map(|(name, source)| {
-                            (
-                                name,
-                                match source {
-                                    ValueSource::Stored => "STORED",
-                                    ValueSource::Issued => "ISSUED",
-                                },
-                            )
-                        })
-                        .collect::<BTreeMap<_, _>>();
-                    serde_json::json!({
-                        "description": description,
-                        "type": "environment",
-                        "variables": variables,
-                    })
-                }
+                } => serde_json::json!({
+                    "description": description,
+                    "type": "environment",
+                    "variables": variables,
+                }),
             };
             (name, output)
         })
@@ -1593,17 +1579,17 @@ fn parent_id(status: &str) -> Option<u32> {
 
 fn progress_message(progress: CredentialRequestProgress) -> &'static str {
     match progress {
-        CredentialRequestProgress::Preparing => "AgentKnock prepares the credentials request.",
+        CredentialRequestProgress::Preparing => "AgentKnock prepares the profile access request.",
         CredentialRequestProgress::WaitingForDelivery => {
-            "AgentKnock waits for the device to receive the credentials request."
+            "AgentKnock waits for the device to receive the profile access request."
         }
         CredentialRequestProgress::WaitingForResponse => {
-            "The device received the credentials request. AgentKnock waits for a response from the device."
+            "The device received the profile access request. AgentKnock waits for a response from the device."
         }
         CredentialRequestProgress::Completing => {
-            "AgentKnock received the credentials response. AgentKnock completes the request."
+            "AgentKnock received a response to the profile access request. AgentKnock completes the request."
         }
-        CredentialRequestProgress::Completed => "AgentKnock completed the credentials request.",
+        CredentialRequestProgress::Completed => "AgentKnock completed the profile access request.",
     }
 }
 
@@ -1735,15 +1721,15 @@ mod tests {
 
         assert_eq!(
             progress_message(WaitingForDelivery),
-            "AgentKnock waits for the device to receive the credentials request."
+            "AgentKnock waits for the device to receive the profile access request."
         );
         assert_eq!(
             progress_message(WaitingForResponse),
-            "The device received the credentials request. AgentKnock waits for a response from the device."
+            "The device received the profile access request. AgentKnock waits for a response from the device."
         );
         assert_eq!(
             progress_message(Completing),
-            "AgentKnock received the credentials response. AgentKnock completes the request."
+            "AgentKnock received a response to the profile access request. AgentKnock completes the request."
         );
     }
 

@@ -374,7 +374,7 @@ where
 }
 
 fn credentials_from_profiles(
-    profiles: BTreeMap<String, ProfileMessage<SecretValueMessage>>,
+    profiles: BTreeMap<String, ProfileMessage<BTreeMap<String, SecretValueMessage>>>,
     requested_profiles: &[String],
 ) -> Result<Credentials, ProtocolError> {
     let mut environment = BTreeMap::new();
@@ -533,7 +533,7 @@ impl From<StreamKind> for StreamKindMessage {
 enum RequestResult {
     Approved {
         #[serde(skip_serializing_if = "Option::is_none")]
-        profiles: Option<BTreeMap<String, ProfileMessage<SecretValueMessage>>>,
+        profiles: Option<BTreeMap<String, ProfileMessage<BTreeMap<String, SecretValueMessage>>>>,
     },
     Denied {
         reason: DenialReason,
@@ -610,7 +610,7 @@ mod tests {
 
     fn environment_profile<const N: usize>(
         variables: [(&str, &str); N],
-    ) -> ProfileMessage<SecretValueMessage> {
+    ) -> ProfileMessage<BTreeMap<String, SecretValueMessage>> {
         ProfileMessage {
             description: None,
             contents: ProfileContentsMessage::Environment {

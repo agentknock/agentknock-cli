@@ -466,7 +466,7 @@ fn rejects_a_missing_command_before_requesting_credentials() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("could not select the command"), "{stderr}");
     assert!(
-        stderr.contains("The credentials request did not start."),
+        stderr.contains("The profile access request did not start."),
         "{stderr}"
     );
     assert!(!stderr.contains("relay"), "{stderr}");

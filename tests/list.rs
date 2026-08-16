@@ -52,15 +52,12 @@ async fn lists_profile_metadata_without_secret_values() {
                             "github": {
                                 "description": "GitHub API access",
                                 "type": "environment",
-                                "variables": {"GH_TOKEN": "STORED"},
+                                "variables": ["GH_TOKEN"],
                             },
                             "cloudflare": {
                                 "description": "Cloudflare deployment access",
                                 "type": "environment",
-                                "variables": {
-                                    "CF_ACCOUNT_ID": "STORED",
-                                    "CF_API_TOKEN": "ISSUED",
-                                },
+                                "variables": ["CF_API_TOKEN", "CF_ACCOUNT_ID"],
                             },
                         },
                     }),
@@ -108,15 +105,12 @@ async fn lists_profile_metadata_without_secret_values() {
                 "cloudflare": {
                     "description": "Cloudflare deployment access",
                     "type": "environment",
-                    "variables": {
-                        "CF_ACCOUNT_ID": "STORED",
-                        "CF_API_TOKEN": "ISSUED",
-                    },
+                    "variables": ["CF_ACCOUNT_ID", "CF_API_TOKEN"],
                 },
                 "github": {
                     "description": "GitHub API access",
                     "type": "environment",
-                    "variables": {"GH_TOKEN": "STORED"},
+                    "variables": ["GH_TOKEN"],
                 },
             },
         })

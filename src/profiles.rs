@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,17 +17,11 @@ use crate::{
 pub enum Profile {
     Environment {
         description: Option<String>,
-        variables: BTreeMap<String, ValueSource>,
+        variables: Vec<String>,
     },
 }
 
 pub type Profiles = BTreeMap<String, Profile>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ValueSource {
-    Stored,
-    Issued,
-}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct EnvironmentProfile {
@@ -204,15 +198,6 @@ fn prepare_request() -> Result<(), RequestError> {
     Ok(())
 }
 
-impl fmt::Display for ValueSource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Stored => "stored",
-            Self::Issued => "issued on request",
-        })
-    }
-}
-
 #[derive(Serialize)]
 struct ListRequest {
     method: Method,
@@ -223,21 +208,14 @@ struct EmptyMessage {}
 
 #[derive(Deserialize)]
 struct ListResponse {
-    profiles: BTreeMap<String, ProfileMessage<ValueSourceMessage>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum ValueSourceMessage {
-    Stored,
-    Issued,
+    profiles: BTreeMap<String, ProfileMessage<Vec<String>>>,
 }
 
 #[derive(Serialize)]
 struct UploadRequest {
     method: Method,
     mode: ProfileUploadModeMessage,
-    profile: NamedProfileMessage<SecretValueMessage>,
+    profile: NamedProfileMessage<BTreeMap<String, SecretValueMessage>>,
 }
 
 #[derive(Serialize)]
@@ -276,7 +254,7 @@ pub(crate) struct ProfileMessage<T> {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ProfileContentsMessage<T> {
-    Environment { variables: BTreeMap<String, T> },
+    Environment { variables: T },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -291,7 +269,7 @@ struct NamedProfileMessage<T> {
     profile: ProfileMessage<T>,
 }
 
-impl From<&EnvironmentProfile> for NamedProfileMessage<SecretValueMessage> {
+impl From<&EnvironmentProfile> for NamedProfileMessage<BTreeMap<String, SecretValueMessage>> {
     fn from(profile: &EnvironmentProfile) -> Self {
         Self {
             name: profile.name.clone(),
@@ -316,25 +294,17 @@ impl From<&EnvironmentProfile> for NamedProfileMessage<SecretValueMessage> {
     }
 }
 
-impl From<ProfileMessage<ValueSourceMessage>> for Profile {
-    fn from(profile: ProfileMessage<ValueSourceMessage>) -> Self {
+impl From<ProfileMessage<Vec<String>>> for Profile {
+    fn from(profile: ProfileMessage<Vec<String>>) -> Self {
         match profile.contents {
-            ProfileContentsMessage::Environment { variables } => Self::Environment {
-                description: profile.description,
-                variables: variables
-                    .into_iter()
-                    .map(|(name, source)| (name, source.into()))
-                    .collect(),
-            },
-        }
-    }
-}
-
-impl From<ValueSourceMessage> for ValueSource {
-    fn from(source: ValueSourceMessage) -> Self {
-        match source {
-            ValueSourceMessage::Stored => Self::Stored,
-            ValueSourceMessage::Issued => Self::Issued,
+            ProfileContentsMessage::Environment { mut variables } => {
+                variables.sort();
+                variables.dedup();
+                Self::Environment {
+                    description: profile.description,
+                    variables,
+                }
+            }
         }
     }
 }

@@ -122,7 +122,7 @@ async fn uploads_an_environment_profile_from_multiple_sources() {
         String::from_utf8(output.stdout).unwrap(),
         concat!(
             "AgentKnock delivered profile proposal \"bootstrap\" to the device.\n",
-            "The profile is not in the vault until it is accepted on the device.\n",
+            "The profile proposal has not been accepted on the device.\n",
             "Suggested action: Review the profile proposal on the device.\n",
         )
     );
