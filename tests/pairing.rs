@@ -247,7 +247,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
     let start = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
-        .args(["--start-pairing", "yup-its-free"])
+        .args(["pairing", "start", "yup-its-free"])
         .output()
         .unwrap();
     assert!(
@@ -275,7 +275,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
     let finish = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
-        .arg("--finish-pairing")
+        .args(["pairing", "finish"])
         .output()
         .unwrap();
     assert!(
@@ -316,7 +316,7 @@ fn abort_pairing_removes_only_a_pending_pairing() {
     let home = TestHome::pending();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
-        .arg("--abort-pairing")
+        .args(["pairing", "abort"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -381,7 +381,7 @@ async fn unpairs_after_an_authenticated_device_response() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .arg("--unpair")
+        .args(["pairing", "remove"])
         .output()
         .unwrap();
     assert!(

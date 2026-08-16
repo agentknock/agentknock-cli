@@ -91,7 +91,7 @@ async fn lists_profile_metadata_without_secret_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .arg("--list")
+        .args(["profile", "list"])
         .output()
         .unwrap();
     assert!(
@@ -125,7 +125,7 @@ fn reports_when_no_pairing_exists() {
     let home = TestHome::empty();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
-        .arg("--list")
+        .args(["profile", "list"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -151,7 +151,7 @@ async fn reports_inactive_client_without_suggesting_recovery() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .arg("--list")
+        .args(["profile", "list"])
         .output()
         .unwrap();
     assert!(!output.status.success());

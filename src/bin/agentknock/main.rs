@@ -5,6 +5,7 @@ mod executable;
 
 use std::{
     cell::Cell,
+    ffi::{OsStr, OsString},
     future::Future,
     io::{self, IsTerminal as _},
     process::ExitCode,
@@ -18,7 +19,7 @@ use agentknock::{
     StreamKind, UnpairError, ValueSource, abort_pairing, finish_pairing_with_progress,
     force_unpair, list_profiles_with_progress, start_pairing_with_progress, unpair_with_progress,
 };
-use clap::{ArgAction, ArgGroup, Parser, builder::NonEmptyStringValueParser};
+use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
 
@@ -35,85 +36,105 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
     version,
     about = "AgentKnock requests credentials and runs commands.",
     arg_required_else_help = true,
-    group(
-        ArgGroup::new("command")
-            .required(true)
-            .multiple(false)
-            .args([
-                "exec",
-                "start_pairing",
-                "finish_pairing",
-                "abort_pairing",
-                "unpair",
-                "list",
-            ])
-    )
+    subcommand_required = true,
+    disable_help_subcommand = true,
+    propagate_version = true
 )]
 struct Cli {
-    /// Do not show AgentKnock runtime output.
-    #[arg(long, conflicts_with = "verbose", requires = "exec")]
-    quiet: bool,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Show each credentials-request state change immediately.
-    #[arg(long, conflicts_with = "quiet", requires = "exec")]
-    verbose: bool,
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+enum Command {
+    /// Run a command with credentials from one or more profiles.
+    #[command(visible_alias = "x")]
+    Exec(ExecCommand),
 
-    /// Run a command with credentials from the specified profiles.
-    #[arg(
-        long,
-        action = ArgAction::Set,
-        value_delimiter = ',',
-        value_name = "PROFILE",
-        value_parser = NonEmptyStringValueParser::new(),
-        requires = "command_to_run"
+    /// Manage the pairing with an AgentKnock device.
+    #[command(
+        arg_required_else_help = true,
+        subcommand_required = true,
+        disable_help_subcommand = true
     )]
-    exec: Option<Vec<String>>,
+    Pairing {
+        #[command(subcommand)]
+        command: PairingCommand,
+    },
+
+    /// Manage profiles from the paired device.
+    #[command(
+        arg_required_else_help = true,
+        subcommand_required = true,
+        disable_help_subcommand = true
+    )]
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+struct ExecCommand {
+    /// Request credentials from this profile. Repeat for each profile.
+    #[arg(
+        short = 'p',
+        long = "profile",
+        action = ArgAction::Append,
+        required = true,
+        value_name = "PROFILE",
+        value_parser = parse_profile
+    )]
+    profiles: Vec<String>,
 
     /// Give the reason for the credentials request.
     #[arg(
         long,
         value_name = "REASON",
-        value_parser = NonEmptyStringValueParser::new(),
-        requires = "exec"
+        value_parser = NonEmptyStringValueParser::new()
     )]
     reason: Option<String>,
 
-    /// Start pairing with an AgentKnock service.
-    #[arg(
-        long,
-        value_name = "PAIRING_ADDRESS",
-        value_parser = parse_pairing_address
-    )]
-    start_pairing: Option<String>,
+    /// Do not show AgentKnock runtime output.
+    #[arg(long, conflicts_with = "verbose")]
+    quiet: bool,
 
-    /// Finish a pending pairing with an AgentKnock service.
-    #[arg(long)]
-    finish_pairing: bool,
+    /// Show each credentials-request state change immediately.
+    #[arg(long, conflicts_with = "quiet")]
+    verbose: bool,
 
-    /// Abort a pending AgentKnock pairing.
-    #[arg(long)]
-    abort_pairing: bool,
+    /// Command and arguments to run. The `--` separator is required.
+    #[arg(last = true, num_args = 1.., required = true, value_name = "COMMAND")]
+    command: Vec<String>,
+}
 
-    /// Remove an active AgentKnock pairing.
-    #[arg(long)]
-    unpair: bool,
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+enum PairingCommand {
+    /// Start pairing with an AgentKnock device.
+    Start {
+        /// Pairing address shown by the device.
+        #[arg(value_name = "PAIRING_ADDRESS", value_parser = parse_pairing_address)]
+        address: String,
+    },
 
-    /// Remove only the local pairing, without contacting the device.
-    #[arg(long, requires = "unpair")]
-    force: bool,
+    /// Finish a pending pairing after approval on the device.
+    Finish,
 
+    /// Abort a pending pairing.
+    Abort,
+
+    /// Remove an active pairing.
+    Remove {
+        /// Remove only the local pairing, without contacting the device.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+enum ProfileCommand {
     /// List the profiles available from the paired device.
-    #[arg(long)]
-    list: bool,
-
-    /// Command and arguments that AgentKnock runs.
-    #[arg(
-        last = true,
-        num_args = 1..,
-        value_name = "COMMAND",
-        requires = "exec"
-    )]
-    command_to_run: Vec<String>,
+    List,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -126,10 +147,10 @@ enum Operation {
     StartPairing(String),
     FinishPairing,
     AbortPairing,
-    Unpair {
+    RemovePairing {
         force: bool,
     },
-    List,
+    ListProfiles,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,7 +164,7 @@ enum OutputMode {
 enum PairingOperation {
     Start,
     Finish,
-    Unpair,
+    Remove,
 }
 
 #[derive(Debug)]
@@ -156,9 +177,21 @@ enum CommandError {
     StartPairing(RequestError),
     FinishPairing(RequestError),
     AbortPairing(ConfigurationError),
-    ForceUnpair(ConfigurationError),
-    Unpair(UnpairError),
-    List(RequestError),
+    ForceRemovePairing(ConfigurationError),
+    RemovePairing(UnpairError),
+    ListProfiles(RequestError),
+}
+
+fn parse_profile(profile: &str) -> Result<String, &'static str> {
+    if profile.is_empty() {
+        Err("the profile name must not be empty")
+    } else if profile.contains(',') {
+        Err(
+            "a profile name must not contain a comma; use a separate -p or --profile option for each profile",
+        )
+    } else {
+        Ok(profile.to_owned())
+    }
 }
 
 fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
@@ -174,6 +207,39 @@ fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
 }
 
 impl Cli {
+    fn into_operation(self) -> (Operation, OutputMode) {
+        match self.command {
+            Command::Exec(command) => {
+                let output = command.output_mode();
+                (
+                    Operation::Exec {
+                        profiles: command.profiles,
+                        reason: command.reason,
+                        command: command.command,
+                    },
+                    output,
+                )
+            }
+            Command::Pairing {
+                command: PairingCommand::Start { address },
+            } => (Operation::StartPairing(address), OutputMode::Normal),
+            Command::Pairing {
+                command: PairingCommand::Finish,
+            } => (Operation::FinishPairing, OutputMode::Normal),
+            Command::Pairing {
+                command: PairingCommand::Abort,
+            } => (Operation::AbortPairing, OutputMode::Normal),
+            Command::Pairing {
+                command: PairingCommand::Remove { force },
+            } => (Operation::RemovePairing { force }, OutputMode::Normal),
+            Command::Profile {
+                command: ProfileCommand::List,
+            } => (Operation::ListProfiles, OutputMode::Normal),
+        }
+    }
+}
+
+impl ExecCommand {
     fn output_mode(&self) -> OutputMode {
         if self.quiet {
             OutputMode::Quiet
@@ -183,45 +249,46 @@ impl Cli {
             OutputMode::Normal
         }
     }
+}
 
-    fn into_operation(self) -> Operation {
-        if let Some(profiles) = self.exec {
-            return Operation::Exec {
-                profiles,
-                reason: self.reason,
-                command: self.command_to_run,
-            };
-        }
-
-        if let Some(address) = self.start_pairing {
-            return Operation::StartPairing(address);
-        }
-
-        if self.finish_pairing {
-            return Operation::FinishPairing;
-        }
-
-        if self.abort_pairing {
-            return Operation::AbortPairing;
-        }
-
-        if self.unpair {
-            return Operation::Unpair { force: self.force };
-        }
-
-        if self.list {
-            return Operation::List;
-        }
-
-        unreachable!("clap requires exactly one operation")
+fn exec_is_missing_separator(arguments: &[OsString]) -> bool {
+    let Some(command) = arguments.get(1).and_then(|argument| argument.to_str()) else {
+        return false;
+    };
+    if command != "exec" && command != "x" {
+        return false;
     }
+
+    let arguments = &arguments[2..];
+    !arguments
+        .iter()
+        .any(|argument| argument == OsStr::new("--"))
+        && !arguments.iter().any(|argument| {
+            matches!(
+                argument.to_str(),
+                Some("-h" | "--help" | "-V" | "--version")
+            )
+        })
+}
+
+fn print_missing_exec_separator() {
+    eprintln!("error: `--` is required before the command to execute");
+    eprintln!();
+    eprintln!("Usage: agentknock exec -p <PROFILE>... -- <COMMAND> [ARGUMENT]...");
+    eprintln!();
+    eprintln!("For more information, try '--help'.");
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let output = cli.output_mode();
-    match run(cli.into_operation(), output).await {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if exec_is_missing_separator(&arguments) {
+        print_missing_exec_separator();
+        return ExitCode::from(2);
+    }
+
+    let (operation, output) = Cli::parse_from(arguments).into_operation();
+    match run(operation, output).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             print_command_error(&error, output);
@@ -305,19 +372,23 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             abort_pairing().map_err(CommandError::AbortPairing)?;
             println!("AgentKnock aborted the pending pairing. AgentKnock is not paired.");
         }
-        Operation::Unpair { force } => {
+        Operation::RemovePairing { force } => {
             if force {
-                force_unpair().map_err(CommandError::ForceUnpair)?;
+                force_unpair().map_err(CommandError::ForceRemovePairing)?;
                 println!(
                     "AgentKnock removed the local pairing. The device-side pairing was not changed."
                 );
             } else {
-                unpair_for_cli().await.map_err(CommandError::Unpair)?;
-                println!("AgentKnock unpaired this installation.");
+                remove_pairing_for_cli()
+                    .await
+                    .map_err(CommandError::RemovePairing)?;
+                println!("AgentKnock removed this pairing.");
             }
         }
-        Operation::List => {
-            let profiles = list_profiles_for_cli().await.map_err(CommandError::List)?;
+        Operation::ListProfiles => {
+            let profiles = list_profiles_for_cli()
+                .await
+                .map_err(CommandError::ListProfiles)?;
             print_profiles(&profiles);
         }
     }
@@ -349,14 +420,14 @@ async fn finish_pairing_for_cli() -> Result<(), RequestError> {
     .await
 }
 
-async fn unpair_for_cli() -> Result<(), UnpairError> {
+async fn remove_pairing_for_cli() -> Result<(), UnpairError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
     let request = unpair_with_progress(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
-        pairing_progress_message(PairingOperation::Unpair, progress)
+        pairing_progress_message(PairingOperation::Remove, progress)
     })
     .await
 }
@@ -450,20 +521,20 @@ fn pairing_progress_message(
         (PairingOperation::Finish, PairingProgress::Completed) => {
             "AgentKnock completed the pairing confirmation."
         }
-        (PairingOperation::Unpair, PairingProgress::Preparing) => {
-            "AgentKnock prepares the unpair request."
+        (PairingOperation::Remove, PairingProgress::Preparing) => {
+            "AgentKnock prepares the pairing removal request."
         }
-        (PairingOperation::Unpair, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the device to receive the unpair request."
+        (PairingOperation::Remove, PairingProgress::WaitingForDelivery) => {
+            "AgentKnock waits for the device to receive the pairing removal request."
         }
-        (PairingOperation::Unpair, PairingProgress::WaitingForResponse) => {
-            "The device received the unpair request. AgentKnock waits for a response from the device."
+        (PairingOperation::Remove, PairingProgress::WaitingForResponse) => {
+            "The device received the pairing removal request. AgentKnock waits for a response from the device."
         }
-        (PairingOperation::Unpair, PairingProgress::Completing) => {
-            "The device accepted the unpair request. AgentKnock removes the local pairing."
+        (PairingOperation::Remove, PairingProgress::Completing) => {
+            "The device accepted the pairing removal request. AgentKnock removes the local pairing."
         }
-        (PairingOperation::Unpair, PairingProgress::Completed) => {
-            "AgentKnock completed the unpair request."
+        (PairingOperation::Remove, PairingProgress::Completed) => {
+            "AgentKnock completed the pairing removal request."
         }
     }
 }
@@ -540,7 +611,7 @@ fn print_start_pairing_success(sas: &PairingSas) {
     println!("Suggested action: Compare the verification code with the code on the device.");
     println!("Suggested action: If the codes match, approve the pairing on the device.");
     println!("Suggested action: After approval, run this command:");
-    println!("agentknock --finish-pairing");
+    println!("agentknock pairing finish");
 }
 
 fn print_command_error(error: &CommandError, output: OutputMode) {
@@ -600,9 +671,9 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::StartPairing(error) => print_start_pairing_error(error),
         CommandError::FinishPairing(error) => print_finish_pairing_error(error),
         CommandError::AbortPairing(error) => print_abort_pairing_error(error),
-        CommandError::ForceUnpair(error) => print_force_unpair_error(error),
-        CommandError::Unpair(error) => print_unpair_error(error),
-        CommandError::List(error) => print_list_error(error),
+        CommandError::ForceRemovePairing(error) => print_force_remove_pairing_error(error),
+        CommandError::RemovePairing(error) => print_remove_pairing_error(error),
+        CommandError::ListProfiles(error) => print_list_error(error),
     }
 }
 
@@ -612,7 +683,7 @@ fn print_list_error(error: &RequestError) {
             print_plain_error("AgentKnock is not paired. It cannot list profiles.");
             print_plain_error("Suggested action: Get a pairing address.");
             print_plain_error("Suggested action: Run this command:");
-            print_plain_error("agentknock --start-pairing <PAIRING_ADDRESS>");
+            print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error("Pairing is in progress. AgentKnock cannot list profiles yet.");
@@ -624,7 +695,7 @@ fn print_list_error(error: &RequestError) {
         RequestError::RelayUnavailable { .. } => {
             print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
             print_plain_error("Suggested action: After relay connectivity is restored, run:");
-            print_plain_error("agentknock --list");
+            print_plain_error("agentknock profile list");
         }
         RequestError::Relay(_) => {
             print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
@@ -752,7 +823,7 @@ fn print_exec_configuration_error(error: &ConfigurationError) {
             print_message("AgentKnock is not paired. The command did not start.");
             print_message("Suggested action: Get a pairing address.");
             print_message("Suggested action: Run this command:");
-            print_message("agentknock --start-pairing <PAIRING_ADDRESS>");
+            print_message("agentknock pairing start <PAIRING_ADDRESS>");
             print_message("Suggested action: Complete pairing.");
             print_message("Suggested action: Run the original command again.");
         }
@@ -840,7 +911,7 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error("No pairing is in progress.");
             print_plain_error("Suggested action: Get a pairing address.");
             print_plain_error("Suggested action: Run this command:");
-            print_plain_error("agentknock --start-pairing <PAIRING_ADDRESS>");
+            print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
         RequestError::Configuration(ConfigurationError::PairingNotPending { .. }) => {
             print_plain_error("Pairing is complete. AgentKnock is ready to provide credentials.");
@@ -883,9 +954,7 @@ fn print_abort_pairing_error(error: &ConfigurationError) {
             print_plain_error("AgentKnock has no pairing to abort.");
         }
         ConfigurationError::PairingNotPending { .. } => {
-            print_plain_error(
-                "Pairing is active. The --abort-pairing option does not remove the active pairing.",
-            );
+            print_plain_error("Pairing is active. AgentKnock can abort only a pending pairing.");
             print_plain_error("AgentKnock did not change the active pairing.");
         }
         _ => {
@@ -897,7 +966,7 @@ fn print_abort_pairing_error(error: &ConfigurationError) {
     }
 }
 
-fn print_unpair_error(error: &UnpairError) {
+fn print_remove_pairing_error(error: &UnpairError) {
     match error {
         UnpairError::Configuration(ConfigurationError::NoPairing { .. }) => {
             print_plain_error("AgentKnock is not paired. There is no active pairing to remove.");
@@ -907,10 +976,12 @@ fn print_unpair_error(error: &UnpairError) {
                 "Pairing is in progress. AgentKnock did not remove the pending pairing.",
             );
             print_plain_error("Suggested action: To abort the pending pairing, run this command:");
-            print_plain_error("agentknock --abort-pairing");
+            print_plain_error("agentknock pairing abort");
         }
         UnpairError::Configuration(error) => {
-            print_plain_error(format_args!("AgentKnock did not start unpairing: {error}."));
+            print_plain_error(format_args!(
+                "AgentKnock did not start pairing removal: {error}."
+            ));
             print_plain_configuration_action(error);
         }
         UnpairError::Request(error) => {
@@ -926,7 +997,7 @@ fn print_unpair_error(error: &UnpairError) {
                 }
                 _ => {
                     print_plain_error(format_args!(
-                        "AgentKnock did not receive a valid unpair response: {error}."
+                        "AgentKnock did not receive a valid pairing removal response: {error}."
                     ));
                 }
             }
@@ -934,13 +1005,13 @@ fn print_unpair_error(error: &UnpairError) {
         }
         UnpairError::LocalState(ConfigurationError::PairingChanged { .. }) => {
             print_plain_error(
-                "The device accepted the unpair request, but the local pairing changed.",
+                "The device accepted the pairing removal request, but the local pairing changed.",
             );
             print_plain_error("AgentKnock did not remove the current local pairing.");
         }
         UnpairError::LocalState(error) => {
             print_plain_error(format_args!(
-                "The device accepted the unpair request, but AgentKnock did not remove the local pairing: {error}."
+                "The device accepted the pairing removal request, but AgentKnock did not remove the local pairing: {error}."
             ));
             print_plain_configuration_action(error);
         }
@@ -981,7 +1052,7 @@ fn print_plain_unauthenticated_action(code: &str) {
     }
 }
 
-fn print_force_unpair_error(error: &ConfigurationError) {
+fn print_force_remove_pairing_error(error: &ConfigurationError) {
     match error {
         ConfigurationError::NoPairing { .. } => {
             print_plain_error("AgentKnock is not paired. There is no local pairing to remove.");
@@ -1158,7 +1229,7 @@ fn print_message(message: impl std::fmt::Display) {
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Operation, OutputMode, progress_message};
+    use super::{Cli, Operation, OutputMode, exec_is_missing_separator, progress_message};
 
     #[cfg(target_os = "linux")]
     use super::parent_id;
@@ -1167,8 +1238,11 @@ mod tests {
     fn parses_exec_command() {
         let cli = Cli::try_parse_from([
             "agentknock",
-            "--exec",
-            "gh-token,cf-wrangler",
+            "exec",
+            "-p",
+            "gh-token",
+            "--profile",
+            "cf-wrangler",
             "--reason",
             "needed by the deployment agent",
             "--",
@@ -1180,13 +1254,33 @@ mod tests {
 
         assert_eq!(
             cli.into_operation(),
-            Operation::Exec {
-                profiles: vec!["gh-token".into(), "cf-wrangler".into()],
-                reason: Some("needed by the deployment agent".into()),
-                command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
-                    .map(String::from)
-                    .to_vec(),
-            }
+            (
+                Operation::Exec {
+                    profiles: vec!["gh-token".into(), "cf-wrangler".into()],
+                    reason: Some("needed by the deployment agent".into()),
+                    command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
+                        .map(String::from)
+                        .to_vec(),
+                },
+                OutputMode::Normal,
+            )
+        );
+    }
+
+    #[test]
+    fn parses_exec_alias() {
+        let cli = Cli::try_parse_from(["agentknock", "x", "-p", "github", "--", "true"]).unwrap();
+
+        assert_eq!(
+            cli.into_operation(),
+            (
+                Operation::Exec {
+                    profiles: vec!["github".into()],
+                    reason: None,
+                    command: vec!["true".into()],
+                },
+                OutputMode::Normal,
+            )
         );
     }
 
@@ -1200,26 +1294,41 @@ mod tests {
     #[test]
     fn parses_output_modes() {
         let normal =
-            Cli::try_parse_from(["agentknock", "--exec", "profile", "--", "true"]).unwrap();
-        let quiet =
-            Cli::try_parse_from(["agentknock", "--quiet", "--exec", "profile", "--", "true"])
-                .unwrap();
-        let verbose =
-            Cli::try_parse_from(["agentknock", "--verbose", "--exec", "profile", "--", "true"])
-                .unwrap();
+            Cli::try_parse_from(["agentknock", "exec", "-p", "profile", "--", "true"]).unwrap();
+        let quiet = Cli::try_parse_from([
+            "agentknock",
+            "exec",
+            "--quiet",
+            "-p",
+            "profile",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let verbose = Cli::try_parse_from([
+            "agentknock",
+            "exec",
+            "--verbose",
+            "-p",
+            "profile",
+            "--",
+            "true",
+        ])
+        .unwrap();
 
-        assert_eq!(normal.output_mode(), OutputMode::Normal);
-        assert_eq!(quiet.output_mode(), OutputMode::Quiet);
-        assert_eq!(verbose.output_mode(), OutputMode::Verbose);
+        assert_eq!(normal.into_operation().1, OutputMode::Normal);
+        assert_eq!(quiet.into_operation().1, OutputMode::Quiet);
+        assert_eq!(verbose.into_operation().1, OutputMode::Verbose);
     }
 
     #[test]
     fn rejects_quiet_and_verbose_together() {
         let error = Cli::try_parse_from([
             "agentknock",
+            "exec",
             "--quiet",
             "--verbose",
-            "--exec",
+            "-p",
             "profile",
             "--",
             "true",
@@ -1249,12 +1358,15 @@ mod tests {
 
     #[test]
     fn parses_start_pairing_command() {
-        let cli =
-            Cli::try_parse_from(["agentknock", "--start-pairing", "pairing-address-name"]).unwrap();
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "start", "pairing-address-name"])
+            .unwrap();
 
         assert_eq!(
             cli.into_operation(),
-            Operation::StartPairing("pairing-address-name".into())
+            (
+                Operation::StartPairing("pairing-address-name".into()),
+                OutputMode::Normal,
+            )
         );
     }
 
@@ -1262,7 +1374,7 @@ mod tests {
     fn rejects_invalid_pairing_address() {
         for address in ["Yup-its-free", "yup_its_free", "yup-its-frée"] {
             let error =
-                Cli::try_parse_from(["agentknock", "--start-pairing", address]).unwrap_err();
+                Cli::try_parse_from(["agentknock", "pairing", "start", address]).unwrap_err();
 
             assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }
@@ -1270,50 +1382,61 @@ mod tests {
 
     #[test]
     fn parses_finish_pairing_command() {
-        let cli = Cli::try_parse_from(["agentknock", "--finish-pairing"]).unwrap();
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "finish"]).unwrap();
 
-        assert_eq!(cli.into_operation(), Operation::FinishPairing);
+        assert_eq!(
+            cli.into_operation(),
+            (Operation::FinishPairing, OutputMode::Normal)
+        );
     }
 
     #[test]
     fn parses_abort_pairing_command() {
-        let cli = Cli::try_parse_from(["agentknock", "--abort-pairing"]).unwrap();
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "abort"]).unwrap();
 
-        assert_eq!(cli.into_operation(), Operation::AbortPairing);
+        assert_eq!(
+            cli.into_operation(),
+            (Operation::AbortPairing, OutputMode::Normal)
+        );
     }
 
     #[test]
-    fn parses_unpair_command() {
-        let cli = Cli::try_parse_from(["agentknock", "--unpair"]).unwrap();
+    fn parses_remove_pairing_command() {
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "remove"]).unwrap();
 
-        assert_eq!(cli.into_operation(), Operation::Unpair { force: false });
+        assert_eq!(
+            cli.into_operation(),
+            (
+                Operation::RemovePairing { force: false },
+                OutputMode::Normal
+            )
+        );
     }
 
     #[test]
-    fn parses_forced_unpair_command() {
-        let cli = Cli::try_parse_from(["agentknock", "--unpair", "--force"]).unwrap();
+    fn parses_forced_remove_pairing_command() {
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "remove", "--force"]).unwrap();
 
-        assert_eq!(cli.into_operation(), Operation::Unpair { force: true });
+        assert_eq!(
+            cli.into_operation(),
+            (Operation::RemovePairing { force: true }, OutputMode::Normal)
+        );
     }
 
     #[test]
-    fn parses_list_command() {
-        let cli = Cli::try_parse_from(["agentknock", "--list"]).unwrap();
+    fn parses_profile_list_command() {
+        let cli = Cli::try_parse_from(["agentknock", "profile", "list"]).unwrap();
 
-        assert_eq!(cli.into_operation(), Operation::List);
-    }
-
-    #[test]
-    fn rejects_force_without_unpair() {
-        let error = Cli::try_parse_from(["agentknock", "--force"]).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(
+            cli.into_operation(),
+            (Operation::ListProfiles, OutputMode::Normal)
+        );
     }
 
     #[test]
     fn rejects_finish_pairing_argument() {
         let error =
-            Cli::try_parse_from(["agentknock", "--finish-pairing", "unexpected"]).unwrap_err();
+            Cli::try_parse_from(["agentknock", "pairing", "finish", "unexpected"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
@@ -1321,14 +1444,15 @@ mod tests {
     #[test]
     fn rejects_abort_pairing_argument() {
         let error =
-            Cli::try_parse_from(["agentknock", "--abort-pairing", "unexpected"]).unwrap_err();
+            Cli::try_parse_from(["agentknock", "pairing", "abort", "unexpected"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]
-    fn rejects_unpair_argument() {
-        let error = Cli::try_parse_from(["agentknock", "--unpair", "unexpected"]).unwrap_err();
+    fn rejects_remove_pairing_argument() {
+        let error =
+            Cli::try_parse_from(["agentknock", "pairing", "remove", "unexpected"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
@@ -1344,26 +1468,52 @@ mod tests {
     }
 
     #[test]
-    fn rejects_repeated_exec_options() {
-        let error = Cli::try_parse_from([
-            "agentknock",
-            "--exec",
-            "gh-token",
-            "--exec",
-            "cf-wrangler",
-            "--",
-            "echo",
-        ])
-        .unwrap_err();
+    fn shows_help_without_a_pairing_command() {
+        let error = Cli::try_parse_from(["agentknock", "pairing"]).unwrap_err();
 
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]
-    fn rejects_space_separated_exec_values() {
+    fn shows_help_without_a_profile_command() {
+        let error = Cli::try_parse_from(["agentknock", "profile"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn does_not_define_help_subcommands() {
+        let root_error = Cli::try_parse_from(["agentknock", "help"]).unwrap_err();
+        let pairing_error = Cli::try_parse_from(["agentknock", "pairing", "help"]).unwrap_err();
+        let profile_error = Cli::try_parse_from(["agentknock", "profile", "help"]).unwrap_err();
+
+        assert_eq!(root_error.kind(), ErrorKind::InvalidSubcommand);
+        assert_eq!(pairing_error.kind(), ErrorKind::InvalidSubcommand);
+        assert_eq!(profile_error.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn accepts_help_as_a_pairing_address() {
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "start", "help"]).unwrap();
+
+        assert_eq!(
+            cli.into_operation(),
+            (Operation::StartPairing("help".into()), OutputMode::Normal,)
+        );
+    }
+
+    #[test]
+    fn rejects_space_separated_profiles() {
         let error = Cli::try_parse_from([
             "agentknock",
-            "--exec",
+            "exec",
+            "-p",
             "gh-token",
             "cf-wrangler",
             "--",
@@ -1375,25 +1525,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_command_without_delimiter() {
-        let error = Cli::try_parse_from(["agentknock", "--exec", "gh-token", "echo"]).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    fn identifies_exec_without_separator() {
+        assert!(exec_is_missing_separator(&[
+            "agentknock".into(),
+            "exec".into(),
+            "-p".into(),
+            "gh-token".into(),
+            "echo".into(),
+        ]));
+        assert!(exec_is_missing_separator(&[
+            "agentknock".into(),
+            "x".into(),
+            "-p".into(),
+            "gh-token".into(),
+            "echo".into(),
+        ]));
+        assert!(!exec_is_missing_separator(&[
+            "agentknock".into(),
+            "exec".into(),
+            "--help".into(),
+        ]));
     }
 
     #[test]
     fn rejects_empty_command_after_delimiter() {
-        let error = Cli::try_parse_from(["agentknock", "--exec", "gh-token", "--"]).unwrap_err();
+        let error =
+            Cli::try_parse_from(["agentknock", "exec", "-p", "gh-token", "--"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
-    fn rejects_empty_exec_value() {
-        let error =
-            Cli::try_parse_from(["agentknock", "--exec", "gh-token,", "--", "echo"]).unwrap_err();
+    fn rejects_comma_separated_profiles() {
+        let error = Cli::try_parse_from([
+            "agentknock",
+            "exec",
+            "-p",
+            "gh-token,cf-wrangler",
+            "--",
+            "echo",
+        ])
+        .unwrap_err();
 
-        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[cfg(unix)]
@@ -1405,21 +1579,24 @@ mod tests {
         let cases = [
             vec![
                 "agentknock".into(),
-                "--exec".into(),
+                "exec".into(),
+                "-p".into(),
                 invalid_utf8.clone(),
                 "--".into(),
                 "echo".into(),
             ],
             vec![
                 "agentknock".into(),
-                "--exec".into(),
+                "exec".into(),
+                "-p".into(),
                 "gh-token".into(),
                 "--".into(),
                 invalid_utf8.clone(),
             ],
             vec![
                 "agentknock".into(),
-                "--exec".into(),
+                "exec".into(),
+                "-p".into(),
                 "gh-token".into(),
                 "--".into(),
                 "echo".into(),

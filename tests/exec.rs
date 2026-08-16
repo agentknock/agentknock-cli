@@ -121,8 +121,11 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
-            "--exec",
-            "github,cloudflare",
+            "exec",
+            "-p",
+            "github",
+            "-p",
+            "cloudflare",
             "--reason",
             "integration test",
             "--",
@@ -216,7 +219,7 @@ async fn reports_and_executes_a_shebang_script() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["--exec", "test", "--", script.to_str().unwrap()])
+        .args(["exec", "-p", "test", "--", script.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -302,7 +305,8 @@ async fn executes_the_selected_native_file_after_its_path_is_replaced() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("PATH", home.path())
-        .arg("--exec")
+        .arg("exec")
+        .arg("-p")
         .arg("test")
         .arg("--")
         .arg("selected-native")
@@ -379,7 +383,8 @@ async fn restores_sigpipe_before_executing_the_command() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
-            "--exec",
+            "exec",
+            "-p",
             "test",
             "--",
             "sh",
@@ -412,7 +417,8 @@ fn rejects_a_missing_command_before_requesting_credentials() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", "ws://127.0.0.1:1")
         .args([
-            "--exec",
+            "exec",
+            "-p",
             "test",
             "--",
             "agentknock-command-that-does-not-exist",
@@ -428,6 +434,25 @@ fn rejects_a_missing_command_before_requesting_credentials() {
         "{stderr}"
     );
     assert!(!stderr.contains("relay"), "{stderr}");
+}
+
+#[test]
+fn explains_that_the_command_separator_is_required() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["exec", "-p", "github", "gh", "issue", "list"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: `--` is required before the command to execute\n\
+         \n\
+         Usage: agentknock exec -p <PROFILE>... -- <COMMAND> [ARGUMENT]...\n\
+         \n\
+         For more information, try '--help'.\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -493,7 +518,7 @@ async fn resends_the_exact_request_when_the_connection_closes_before_ack() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["--exec", "github", "--", "env"])
+        .args(["exec", "-p", "github", "--", "env"])
         .output()
         .unwrap();
     assert!(
@@ -600,7 +625,7 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["--exec", "github", "--", "env"])
+        .args(["exec", "-p", "github", "--", "env"])
         .output()
         .unwrap();
     assert!(
@@ -659,7 +684,7 @@ async fn signal_before_response_sends_an_aborted_completion() {
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["--exec", "github", "--", "env"])
+        .args(["exec", "-p", "github", "--", "env"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -741,7 +766,7 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["--exec", "github", "--", "env"])
+        .args(["exec", "-p", "github", "--", "env"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
