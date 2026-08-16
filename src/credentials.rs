@@ -163,8 +163,12 @@ pub enum ProtocolError {
     #[error("received an ABORTED result in a response")]
     AbortedResponse,
 
-    #[error("device random has length {actual}, expected {expected} bytes")]
-    InvalidDeviceRandomLength { actual: usize, expected: usize },
+    #[error("{field} has length {actual}, expected {expected} bytes")]
+    InvalidLength {
+        field: &'static str,
+        actual: usize,
+        expected: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -446,9 +450,15 @@ impl From<crypto::Error> for ProtocolError {
             crypto::Error::Random(error) => Self::Random(error),
             crypto::Error::KeyDerivation(error) => Self::KeyDerivation(error),
             crypto::Error::Decryption(error) => Self::Decryption(error),
-            crypto::Error::InvalidDeviceRandomLength { actual, expected } => {
-                Self::InvalidDeviceRandomLength { actual, expected }
-            }
+            crypto::Error::InvalidLength {
+                field,
+                actual,
+                expected,
+            } => Self::InvalidLength {
+                field,
+                actual,
+                expected,
+            },
         }
     }
 }

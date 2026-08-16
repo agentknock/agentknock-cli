@@ -1228,12 +1228,8 @@ fn print_exec_configuration_error(error: &ConfigurationError) {
         }
         ConfigurationError::Invalid { path, source } => {
             print_message(format_args!(
-                "The pairing configuration at {path:?} contains invalid JSON: {source}."
+                "The pairing configuration at {path:?} is invalid: {source}."
             ));
-            print_message("The command did not start.");
-        }
-        ConfigurationError::EmptyPsk { path } => {
-            print_message(format_args!("The pairing PSK in {path:?} is empty."));
             print_message("The command did not start.");
         }
         ConfigurationError::InvalidSystemTime(_) => {

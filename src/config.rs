@@ -19,6 +19,9 @@ use ulid::Ulid;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+const CLIENT_PSK_LENGTH: usize = 32;
+const ROTATION_KEY_LENGTH: usize = 32;
+
 #[derive(Deserialize)]
 pub(crate) struct Pairing {
     #[serde(default)]
@@ -27,12 +30,12 @@ pub(crate) struct Pairing {
     client_id: CanonicalUlid,
     #[serde(deserialize_with = "deserialize_client_token")]
     client_token: String,
-    #[serde(deserialize_with = "deserialize_base64")]
+    #[serde(deserialize_with = "deserialize_client_psk")]
     client_psk: Vec<u8>,
     #[serde(deserialize_with = "deserialize_base64")]
     device_key: Vec<u8>,
     rotated_at: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rotation_key")]
     rotation_key: Option<String>,
 }
 
@@ -220,9 +223,6 @@ pub enum ConfigurationError {
         source: serde_json::Error,
     },
 
-    #[error("{path} contains an empty client PSK")]
-    EmptyPsk { path: PathBuf },
-
     #[error("pairing in {path} is still pending")]
     PairingPending { path: PathBuf },
 
@@ -256,10 +256,6 @@ pub(crate) fn read_pending_pairing() -> Result<Pairing, ConfigurationError> {
             path: path.clone(),
             source,
         })?;
-    if pairing.client_psk.is_empty() {
-        return Err(ConfigurationError::EmptyPsk { path });
-    }
-
     Ok(pairing)
 }
 
@@ -627,12 +623,6 @@ fn validate_pairing(path: &Path, pairing: Pairing) -> Result<Pairing, Configurat
             path: path.to_owned(),
         });
     }
-    if pairing.client_psk.is_empty() {
-        return Err(ConfigurationError::EmptyPsk {
-            path: path.to_owned(),
-        });
-    }
-
     Ok(pairing)
 }
 
@@ -667,6 +657,39 @@ where
     BASE64_STANDARD
         .decode(encoded)
         .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_client_psk<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let client_psk = deserialize_base64(deserializer)?;
+    if client_psk.len() != CLIENT_PSK_LENGTH {
+        return Err(serde::de::Error::custom(format_args!(
+            "expected client_psk to contain {CLIENT_PSK_LENGTH} bytes, found {}",
+            client_psk.len(),
+        )));
+    }
+    Ok(client_psk)
+}
+
+fn deserialize_rotation_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let rotation_key = BASE64_STANDARD
+        .decode(&encoded)
+        .map_err(serde::de::Error::custom)?;
+    if rotation_key.len() != ROTATION_KEY_LENGTH {
+        return Err(serde::de::Error::custom(format_args!(
+            "expected rotation_key to contain {ROTATION_KEY_LENGTH} bytes, found {}",
+            rotation_key.len(),
+        )));
+    }
+    Ok(Some(encoded))
 }
 
 fn deserialize_client_token<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -707,4 +730,62 @@ where
     S: Serializer,
 {
     serializer.serialize_str(&BASE64_STANDARD.encode(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn rejects_a_client_psk_with_the_wrong_length() {
+        let mut value = pairing_value();
+        value["client_psk"] = BASE64_STANDARD.encode([0x42; 31]).into();
+
+        let error = serde_json::from_value::<Pairing>(value)
+            .err()
+            .expect("short client_psk must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected client_psk to contain 32 bytes, found 31")
+        );
+    }
+
+    #[test]
+    fn rejects_a_rotation_key_with_the_wrong_length() {
+        let mut value = pairing_value();
+        value["rotation_key"] = BASE64_STANDARD.encode([0x24; 31]).into();
+
+        let error = serde_json::from_value::<Pairing>(value)
+            .err()
+            .expect("short rotation_key must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected rotation_key to contain 32 bytes, found 31")
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_base64_in_a_rotation_key() {
+        let mut value = pairing_value();
+        value["rotation_key"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+
+        assert!(serde_json::from_value::<Pairing>(value).is_err());
+    }
+
+    fn pairing_value() -> Value {
+        json!({
+            "device_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+            "client_id": "01K2EP16NWNAGJYF8J1Q2V6P3X",
+            "client_token": BASE64_URL_SAFE.encode([0x11; 32]),
+            "client_psk": BASE64_STANDARD.encode([0x42; CLIENT_PSK_LENGTH]),
+            "device_key": BASE64_STANDARD.encode([0x33; 32]),
+            "rotated_at": 1_700_000_000,
+        })
+    }
 }

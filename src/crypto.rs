@@ -74,6 +74,11 @@ impl Session {
 
     pub(crate) fn open_response(&self, response: Response) -> Result<Vec<u8>, Error> {
         let public_nonce = BASE64_STANDARD.decode(response.nonce)?;
+        require_length(
+            "response random",
+            &public_nonce,
+            KdfSizedBytes::default().len(),
+        )?;
         let ciphertext = BASE64_STANDARD.decode(response.ciphertext)?;
         let mut salt = Vec::with_capacity(self.encapped_key.len() + public_nonce.len());
         salt.extend_from_slice(&self.encapped_key);
@@ -153,12 +158,11 @@ pub(crate) fn seal_pairing(
     let ciphertext = sender_context.seal(plaintext, b"")?;
     let mut client_psk = KdfSizedBytes::default();
     sender_context.export(PSK_EXPORT_CONTEXT, &mut client_psk)?;
-    if response.device_random.len() != KdfSizedBytes::default().len() {
-        return Err(Error::InvalidDeviceRandomLength {
-            actual: response.device_random.len(),
-            expected: KdfSizedBytes::default().len(),
-        });
-    }
+    require_length(
+        "device random",
+        &response.device_random,
+        KdfSizedBytes::default().len(),
+    )?;
     let mut sas_info = Vec::with_capacity(
         SAS_DERIVATION_INFO.len()
             + device_id_bytes.len()
@@ -283,8 +287,24 @@ pub(crate) enum Error {
     #[error("response decryption failed")]
     Decryption(#[from] chacha20poly1305::aead::Error),
 
-    #[error("device random has length {actual}, expected {expected} bytes")]
-    InvalidDeviceRandomLength { actual: usize, expected: usize },
+    #[error("{field} has length {actual}, expected {expected} bytes")]
+    InvalidLength {
+        field: &'static str,
+        actual: usize,
+        expected: usize,
+    },
+}
+
+fn require_length(field: &'static str, value: &[u8], expected: usize) -> Result<(), Error> {
+    if value.len() == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidLength {
+            field,
+            actual: value.len(),
+            expected,
+        })
+    }
 }
 
 fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -357,6 +377,24 @@ mod tests {
             Err(Error::MessageOrder {
                 operation: "seal completion",
                 state: "completion sealed",
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_response_random_with_the_wrong_length() {
+        let session = test_session();
+        let response = Response {
+            nonce: BASE64_STANDARD.encode([0; 12]),
+            ciphertext: BASE64_STANDARD.encode([0; 16]),
+        };
+
+        assert!(matches!(
+            session.open_response(response),
+            Err(Error::InvalidLength {
+                field: "response random",
+                actual: 12,
+                expected: 32,
             })
         ));
     }
