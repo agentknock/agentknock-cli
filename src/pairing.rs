@@ -14,12 +14,14 @@ use crate::{
         CanonicalUlid, LockedPairing, abort_pending_pairing, current_timestamp,
         ensure_pairing_absent, finish_pending_pairing, lock_pairing_for_rotation,
         lock_pairing_if_rotated_before, pairing_path, read_pairing, read_pairing_from,
-        read_pending_pairing, remove_active_pairing, remove_pairing, write_pending_pairing,
+        read_pending_pairing, remove_active_pairing, remove_pairing as remove_pairing_file,
+        write_pending_pairing,
     },
     crypto::{
         self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
         derive_pairing_commitment, derive_psk_rotation, generate_client_random, seal_pairing,
     },
+    protocol::Method,
     websocket::RelayExchange,
 };
 
@@ -122,8 +124,8 @@ where
     progress(PairingProgress::Preparing);
     let pairing = read_pending_pairing()?;
     let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(&FinishPairingRequest {
-        method: "FinishPairing",
+    let plaintext = crate::protocol::encode(&MethodRequest {
+        method: Method::PairingFinish,
     })
     .map_err(ProtocolError::from)?;
     let mut session = Session::new(&pairing, &request_id).map_err(ProtocolError::from)?;
@@ -163,32 +165,32 @@ pub fn abort_pairing() -> Result<(), ConfigurationError> {
     abort_pending_pairing()
 }
 
-pub fn force_unpair() -> Result<(), ConfigurationError> {
-    remove_pairing()
+pub fn force_remove_pairing() -> Result<(), ConfigurationError> {
+    remove_pairing_file()
 }
 
-pub async fn unpair() -> Result<(), UnpairError> {
-    unpair_with_progress(|_| {}).await
+pub async fn remove_pairing() -> Result<(), PairingRemoveError> {
+    remove_pairing_with_progress(|_| {}).await
 }
 
-pub async fn unpair_with_progress<P>(mut progress: P) -> Result<(), UnpairError>
+pub async fn remove_pairing_with_progress<P>(mut progress: P) -> Result<(), PairingRemoveError>
 where
     P: FnMut(PairingProgress),
 {
     progress(PairingProgress::Preparing);
-    let pairing = read_pairing().map_err(UnpairError::Configuration)?;
+    let pairing = read_pairing().map_err(PairingRemoveError::Configuration)?;
     let device_id = pairing.device_id_bytes();
     let client_id = pairing.client_id_bytes();
-    let (mut relay, completion) = prepare_unpair(&pairing, &mut progress)
+    let (mut relay, completion) = prepare_pairing_removal(&pairing, &mut progress)
         .await
-        .map_err(UnpairError::Request)?;
-    remove_active_pairing(device_id, client_id).map_err(UnpairError::LocalState)?;
+        .map_err(PairingRemoveError::Request)?;
+    remove_active_pairing(device_id, client_id).map_err(PairingRemoveError::LocalState)?;
     let _ = relay.complete_briefly(&completion).await;
     progress(PairingProgress::Completed);
     Ok(())
 }
 
-async fn prepare_unpair<P>(
+async fn prepare_pairing_removal<P>(
     pairing: &crate::config::Pairing,
     progress: &mut P,
 ) -> Result<(RelayExchange, crypto::Completion), RequestError>
@@ -196,8 +198,10 @@ where
     P: FnMut(PairingProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(&UnpairRequest { method: "Unpair" })
-        .map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&MethodRequest {
+        method: Method::PairingRemove,
+    })
+    .map_err(ProtocolError::from)?;
     let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
     let request = session
         .seal_request(&plaintext)
@@ -265,14 +269,14 @@ pub enum RotationError {
 }
 
 #[derive(Debug, Error)]
-pub enum UnpairError {
+pub enum PairingRemoveError {
     #[error(transparent)]
     Configuration(ConfigurationError),
 
     #[error(transparent)]
     Request(RequestError),
 
-    #[error("device accepted unpairing, but local pairing removal failed: {0}")]
+    #[error("device accepted pairing removal, but local pairing removal failed: {0}")]
     LocalState(ConfigurationError),
 }
 
@@ -288,13 +292,8 @@ struct PairingRequest {
 }
 
 #[derive(Serialize)]
-struct FinishPairingRequest {
-    method: &'static str,
-}
-
-#[derive(Serialize)]
-struct UnpairRequest {
-    method: &'static str,
+struct MethodRequest {
+    method: Method,
 }
 
 #[derive(Deserialize, Serialize)]

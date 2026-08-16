@@ -5,23 +5,31 @@ mod executable;
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
+    env,
     ffi::{OsStr, OsString},
+    fs,
     future::Future,
-    io::{self, IsTerminal as _},
+    io::{self, IsTerminal as _, Read as _},
+    path::{Path, PathBuf},
     process::ExitCode,
     rc::Rc,
+    str::FromStr,
     time::Duration,
 };
 
 use agentknock::{
     ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
-    PairingProgress, PairingSas, ProfileListProgress, Profiles, RequestError, RequestOperation,
-    StreamKind, UnpairError, ValueSource, abort_pairing, finish_pairing_with_progress,
-    force_unpair, list_profiles_with_progress, start_pairing_with_progress, unpair_with_progress,
+    EnvironmentProfile, PairingProgress, PairingRemoveError, PairingSas, Profile,
+    ProfileListProgress, ProfileUploadError, ProfileUploadMode, ProfileUploadProgress, Profiles,
+    RequestError, RequestOperation, StreamKind, ValueSource, abort_pairing,
+    finish_pairing_with_progress, force_remove_pairing, list_profiles_with_progress,
+    remove_pairing_with_progress, start_pairing_with_progress, upload_profile_with_progress,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
+use thiserror::Error;
 
 use agentknock::request_credentials_with_progress;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -135,6 +143,53 @@ enum PairingCommand {
 enum ProfileCommand {
     /// List the profiles available from the paired device.
     List,
+
+    /// Upload a profile to the paired device.
+    Upload(ProfileUploadCommand),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+struct ProfileUploadCommand {
+    /// New profile name, or existing profile name with --replace or --update.
+    ///
+    /// The device can rename a new profile before it accepts the profile.
+    #[arg(value_name = "NAME", value_parser = parse_profile)]
+    name: String,
+
+    /// Profile description to send to the device.
+    #[arg(long, value_name = "DESCRIPTION")]
+    description: Option<String>,
+
+    /// Replace the complete existing profile with this name.
+    #[arg(long, conflicts_with = "update")]
+    replace: bool,
+
+    /// Update only the supplied fields in the existing profile with this name.
+    #[arg(long, conflicts_with = "replace")]
+    update: bool,
+
+    #[command(flatten, next_help_heading = "Environment profile input")]
+    environment: EnvironmentProfileInput,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+#[group(required = true, multiple = true)]
+struct EnvironmentProfileInput {
+    /// Add environment variable NAME from the current environment.
+    #[arg(long, action = ArgAction::Append, value_name = "NAME", value_parser = parse_environment_name)]
+    from_env: Vec<String>,
+
+    /// Add environment variable NAME from the contents of PATH. Use NAME=- for standard input.
+    #[arg(long, action = ArgAction::Append, value_name = "NAME=PATH")]
+    from_file: Vec<VariableFile>,
+
+    /// Prompt for environment variable NAME without showing its value.
+    #[arg(long, action = ArgAction::Append, value_name = "NAME", value_parser = parse_environment_name)]
+    from_prompt: Vec<String>,
+
+    /// Add environment variables from a dotenv file. Use - for standard input.
+    #[arg(long, action = ArgAction::Append, value_name = "PATH", value_parser = parse_path)]
+    from_env_file: Vec<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +206,7 @@ enum Operation {
         force: bool,
     },
     ListProfiles,
+    UploadProfile(ProfileUploadCommand),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,8 +234,61 @@ enum CommandError {
     FinishPairing(RequestError),
     AbortPairing(ConfigurationError),
     ForceRemovePairing(ConfigurationError),
-    RemovePairing(UnpairError),
+    RemovePairing(PairingRemoveError),
     ListProfiles(RequestError),
+    ProfileInput(ProfileInputError),
+    UploadProfile(ProfileUploadError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VariableFile {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Error)]
+enum ProfileInputError {
+    #[error("standard input can be used by only one profile source")]
+    MultipleStdinSources,
+
+    #[error("environment variable {name:?} is not set")]
+    MissingEnvironmentVariable { name: String },
+
+    #[error("environment variable {name:?} is not valid UTF-8")]
+    NonUtf8EnvironmentVariable { name: String },
+
+    #[error("could not read {source_name}: {source}")]
+    Read {
+        source_name: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("environment file {source_name} is invalid")]
+    EnvironmentFile {
+        source_name: String,
+        #[source]
+        source: dotenvy::Error,
+    },
+
+    #[error("environment variable name {name:?} is not a portable shell identifier")]
+    InvalidEnvironmentVariableName { name: String },
+
+    #[error("environment variable {name:?} was provided more than once")]
+    DuplicateEnvironmentVariable { name: String },
+
+    #[error("environment variable {name:?} contains a null byte")]
+    NullEnvironmentVariable { name: String },
+
+    #[error("the environment profile contains no variables")]
+    NoEnvironmentVariables,
+
+    #[error("could not read environment variable {name:?} from the terminal: {source}")]
+    Prompt {
+        name: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
 fn parse_profile(profile: &str) -> Result<String, &'static str> {
@@ -191,6 +300,46 @@ fn parse_profile(profile: &str) -> Result<String, &'static str> {
         )
     } else {
         Ok(profile.to_owned())
+    }
+}
+
+fn parse_environment_name(name: &str) -> Result<String, &'static str> {
+    if valid_environment_name(name) {
+        Ok(name.to_owned())
+    } else {
+        Err("the environment variable name must be a portable shell identifier")
+    }
+}
+
+fn parse_path(path: &str) -> Result<PathBuf, &'static str> {
+    if path.is_empty() {
+        Err("the path must not be empty")
+    } else {
+        Ok(path.into())
+    }
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+impl FromStr for VariableFile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (name, path) = value
+            .split_once('=')
+            .ok_or_else(|| "expected NAME=PATH".to_owned())?;
+        parse_environment_name(name).map_err(str::to_owned)?;
+        if path.is_empty() {
+            return Err("the value path must not be empty".into());
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            path: path.into(),
+        })
     }
 }
 
@@ -235,6 +384,9 @@ impl Cli {
             Command::Profile {
                 command: ProfileCommand::List,
             } => (Operation::ListProfiles, OutputMode::Normal),
+            Command::Profile {
+                command: ProfileCommand::Upload(command),
+            } => (Operation::UploadProfile(command), OutputMode::Normal),
         }
     }
 }
@@ -374,7 +526,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
         }
         Operation::RemovePairing { force } => {
             if force {
-                force_unpair().map_err(CommandError::ForceRemovePairing)?;
+                force_remove_pairing().map_err(CommandError::ForceRemovePairing)?;
                 println!(
                     "AgentKnock removed the local pairing. The device-side pairing was not changed."
                 );
@@ -390,6 +542,18 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 .await
                 .map_err(CommandError::ListProfiles)?;
             print_profiles(&profiles);
+        }
+        Operation::UploadProfile(command) => {
+            let (profile, mode) = read_profile(command).map_err(CommandError::ProfileInput)?;
+            upload_profile_for_cli(&profile, mode)
+                .await
+                .map_err(CommandError::UploadProfile)?;
+            println!(
+                "AgentKnock delivered profile proposal {:?} to the device.",
+                profile.name
+            );
+            println!("The profile is not in the vault until it is accepted on the device.");
+            println!("Suggested action: Review the profile proposal on the device.");
         }
     }
 
@@ -420,10 +584,10 @@ async fn finish_pairing_for_cli() -> Result<(), RequestError> {
     .await
 }
 
-async fn remove_pairing_for_cli() -> Result<(), UnpairError> {
+async fn remove_pairing_for_cli() -> Result<(), PairingRemoveError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = unpair_with_progress(move |current| {
+    let request = remove_pairing_with_progress(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -439,6 +603,143 @@ async fn list_profiles_for_cli() -> Result<Profiles, RequestError> {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, profile_list_progress_message).await
+}
+
+async fn upload_profile_for_cli(
+    profile: &EnvironmentProfile,
+    mode: ProfileUploadMode,
+) -> Result<(), ProfileUploadError> {
+    let progress = Rc::new(Cell::new(None));
+    let observed_progress = Rc::clone(&progress);
+    let request = upload_profile_with_progress(profile, mode, move |current| {
+        observed_progress.set(Some(current));
+    });
+    monitor_operation(request, progress, profile_upload_progress_message).await
+}
+
+fn read_profile(
+    command: ProfileUploadCommand,
+) -> Result<(EnvironmentProfile, ProfileUploadMode), ProfileInputError> {
+    let stdin_sources = command
+        .environment
+        .from_file
+        .iter()
+        .filter(|source| source.path == Path::new("-"))
+        .count()
+        + command
+            .environment
+            .from_env_file
+            .iter()
+            .filter(|path| path.as_path() == Path::new("-"))
+            .count();
+    if stdin_sources > 1 {
+        return Err(ProfileInputError::MultipleStdinSources);
+    }
+
+    let mut variables = BTreeMap::new();
+    for name in command.environment.from_env {
+        let value = match env::var(&name) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => {
+                return Err(ProfileInputError::MissingEnvironmentVariable { name });
+            }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(ProfileInputError::NonUtf8EnvironmentVariable { name });
+            }
+        };
+        insert_environment_variable(&mut variables, name, value)?;
+    }
+    for source in command.environment.from_file {
+        let value = read_profile_source(&source.path)?;
+        insert_environment_variable(&mut variables, source.name, value)?;
+    }
+    for path in command.environment.from_env_file {
+        let source_name = profile_source_name(&path);
+        let contents = read_profile_source(&path)?;
+        for entry in dotenvy::from_read_iter(contents.as_bytes()) {
+            let (name, value) = entry.map_err(|source| ProfileInputError::EnvironmentFile {
+                source_name: source_name.clone(),
+                source,
+            })?;
+            if !valid_environment_name(&name) {
+                return Err(ProfileInputError::InvalidEnvironmentVariableName { name });
+            }
+            insert_environment_variable(&mut variables, name, value)?;
+        }
+    }
+    for name in command.environment.from_prompt {
+        if variables.contains_key(&name) {
+            return Err(ProfileInputError::DuplicateEnvironmentVariable { name });
+        }
+        let value =
+            rpassword::prompt_password(format!("Value for {name}: ")).map_err(|source| {
+                ProfileInputError::Prompt {
+                    name: name.clone(),
+                    source,
+                }
+            })?;
+        insert_environment_variable(&mut variables, name, value)?;
+    }
+    if variables.is_empty() {
+        return Err(ProfileInputError::NoEnvironmentVariables);
+    }
+
+    let mode = if command.replace {
+        ProfileUploadMode::Replace
+    } else if command.update {
+        ProfileUploadMode::Update
+    } else {
+        ProfileUploadMode::Create
+    };
+    Ok((
+        EnvironmentProfile {
+            name: command.name,
+            description: command.description,
+            variables,
+        },
+        mode,
+    ))
+}
+
+fn read_profile_source(path: &Path) -> Result<String, ProfileInputError> {
+    let source_name = profile_source_name(path);
+    if path == Path::new("-") {
+        let mut contents = String::new();
+        io::stdin()
+            .read_to_string(&mut contents)
+            .map_err(|source| ProfileInputError::Read {
+                source_name,
+                source,
+            })?;
+        Ok(contents)
+    } else {
+        fs::read_to_string(path).map_err(|source| ProfileInputError::Read {
+            source_name,
+            source,
+        })
+    }
+}
+
+fn profile_source_name(path: &Path) -> String {
+    if path == Path::new("-") {
+        "standard input".into()
+    } else {
+        format!("{path:?}")
+    }
+}
+
+fn insert_environment_variable(
+    variables: &mut BTreeMap<String, String>,
+    name: String,
+    value: String,
+) -> Result<(), ProfileInputError> {
+    if value.contains('\0') {
+        return Err(ProfileInputError::NullEnvironmentVariable { name });
+    }
+    if variables.insert(name.clone(), value).is_some() {
+        return Err(ProfileInputError::DuplicateEnvironmentVariable { name });
+    }
+    Ok(())
 }
 
 async fn monitor_operation<T, E, F, P, M>(
@@ -483,6 +784,24 @@ fn profile_list_progress_message(progress: ProfileListProgress) -> &'static str 
             "AgentKnock received the profile list. AgentKnock confirms receipt."
         }
         ProfileListProgress::Completed => "AgentKnock completed the profile list request.",
+    }
+}
+
+fn profile_upload_progress_message(progress: ProfileUploadProgress) -> &'static str {
+    match progress {
+        ProfileUploadProgress::Preparing => "AgentKnock prepares the profile proposal.",
+        ProfileUploadProgress::WaitingForDelivery => {
+            "AgentKnock waits for the device to receive the profile proposal."
+        }
+        ProfileUploadProgress::WaitingForResponse => {
+            "The device received the profile proposal. AgentKnock waits for durable receipt confirmation."
+        }
+        ProfileUploadProgress::Completing => {
+            "The device stored the profile proposal. AgentKnock confirms receipt."
+        }
+        ProfileUploadProgress::Completed => {
+            "AgentKnock completed delivery of the profile proposal."
+        }
     }
 }
 
@@ -674,6 +993,70 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::ForceRemovePairing(error) => print_force_remove_pairing_error(error),
         CommandError::RemovePairing(error) => print_remove_pairing_error(error),
         CommandError::ListProfiles(error) => print_list_error(error),
+        CommandError::ProfileInput(error) => {
+            print_plain_error(format_args!(
+                "AgentKnock could not read the profile proposal: {error}."
+            ));
+        }
+        CommandError::UploadProfile(error) => print_upload_error(error),
+    }
+}
+
+fn print_upload_error(error: &ProfileUploadError) {
+    match error {
+        ProfileUploadError::Rejected { message } => {
+            print_plain_error(format_args!(
+                "The device rejected the profile proposal: {message}"
+            ));
+            print_plain_error("AgentKnock did not deliver the profile proposal.");
+        }
+        ProfileUploadError::Request(RequestError::Configuration(
+            ConfigurationError::NoPairing { .. },
+        )) => {
+            print_plain_error("AgentKnock is not paired. It cannot upload a profile.");
+            print_plain_error("Suggested action: Get a pairing address.");
+            print_plain_error("Suggested action: Run this command:");
+            print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
+        }
+        ProfileUploadError::Request(RequestError::Configuration(
+            ConfigurationError::PairingPending { .. },
+        )) => {
+            print_plain_error("Pairing is in progress. AgentKnock cannot upload a profile yet.");
+        }
+        ProfileUploadError::Request(RequestError::Configuration(error)) => {
+            print_plain_error(format_args!(
+                "AgentKnock did not deliver the profile proposal: {error}."
+            ));
+            print_plain_configuration_action(error);
+        }
+        ProfileUploadError::Request(RequestError::RelayUnavailable { .. }) => {
+            print_plain_error(format_args!(
+                "AgentKnock did not deliver the profile proposal: {error}."
+            ));
+            print_plain_error(
+                "Suggested action: After relay connectivity is restored, run the original command again.",
+            );
+        }
+        ProfileUploadError::Request(RequestError::Unauthenticated { code, message }) => {
+            print_plain_unauthenticated_report(code, message);
+            print_plain_error("AgentKnock did not deliver the profile proposal.");
+            print_plain_unauthenticated_action(code);
+        }
+        ProfileUploadError::Request(RequestError::ClientInactive { message }) => {
+            print_plain_error(format_args!(
+                "The relay reports that this paired client is not active: {message}"
+            ));
+            print_plain_error("AgentKnock did not deliver the profile proposal.");
+        }
+        ProfileUploadError::Request(RequestError::InvalidTestRelayUrl) => {
+            print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
+            print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
+        }
+        ProfileUploadError::Request(error) => {
+            print_plain_error(format_args!(
+                "AgentKnock did not deliver the profile proposal: {error}."
+            ));
+        }
     }
 }
 
@@ -966,25 +1349,25 @@ fn print_abort_pairing_error(error: &ConfigurationError) {
     }
 }
 
-fn print_remove_pairing_error(error: &UnpairError) {
+fn print_remove_pairing_error(error: &PairingRemoveError) {
     match error {
-        UnpairError::Configuration(ConfigurationError::NoPairing { .. }) => {
+        PairingRemoveError::Configuration(ConfigurationError::NoPairing { .. }) => {
             print_plain_error("AgentKnock is not paired. There is no active pairing to remove.");
         }
-        UnpairError::Configuration(ConfigurationError::PairingPending { .. }) => {
+        PairingRemoveError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error(
                 "Pairing is in progress. AgentKnock did not remove the pending pairing.",
             );
             print_plain_error("Suggested action: To abort the pending pairing, run this command:");
             print_plain_error("agentknock pairing abort");
         }
-        UnpairError::Configuration(error) => {
+        PairingRemoveError::Configuration(error) => {
             print_plain_error(format_args!(
                 "AgentKnock did not start pairing removal: {error}."
             ));
             print_plain_configuration_action(error);
         }
-        UnpairError::Request(error) => {
+        PairingRemoveError::Request(error) => {
             match error {
                 RequestError::Unauthenticated { code, message } => {
                     print_plain_unauthenticated_report(code, message);
@@ -1003,13 +1386,13 @@ fn print_remove_pairing_error(error: &UnpairError) {
             }
             print_plain_error("The local pairing is unchanged. The device-side result is unknown.");
         }
-        UnpairError::LocalState(ConfigurationError::PairingChanged { .. }) => {
+        PairingRemoveError::LocalState(ConfigurationError::PairingChanged { .. }) => {
             print_plain_error(
                 "The device accepted the pairing removal request, but the local pairing changed.",
             );
             print_plain_error("AgentKnock did not remove the current local pairing.");
         }
-        UnpairError::LocalState(error) => {
+        PairingRemoveError::LocalState(error) => {
             print_plain_error(format_args!(
                 "The device accepted the pairing removal request, but AgentKnock did not remove the local pairing: {error}."
             ));
@@ -1109,28 +1492,33 @@ fn print_profiles(profiles: &Profiles) {
     let profiles = profiles
         .iter()
         .map(|(name, profile)| {
-            let environment = profile
-                .environment
-                .iter()
-                .map(|(name, source)| {
-                    (
-                        name,
-                        match source {
-                            ValueSource::Stored => "STORED",
-                            ValueSource::Issued => "ISSUED",
-                        },
-                    )
-                })
-                .collect::<std::collections::BTreeMap<_, _>>();
-            (
-                name,
-                serde_json::json!({
-                    "description": profile.description,
-                    "environment": environment,
-                }),
-            )
+            let output = match profile {
+                Profile::Environment {
+                    description,
+                    variables,
+                } => {
+                    let variables = variables
+                        .iter()
+                        .map(|(name, source)| {
+                            (
+                                name,
+                                match source {
+                                    ValueSource::Stored => "STORED",
+                                    ValueSource::Issued => "ISSUED",
+                                },
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    serde_json::json!({
+                        "description": description,
+                        "type": "environment",
+                        "variables": variables,
+                    })
+                }
+            };
+            (name, output)
         })
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
     let output = serde_json::json!({"profiles": profiles});
     println!(
         "{}",
@@ -1229,7 +1617,10 @@ fn print_message(message: impl std::fmt::Display) {
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Operation, OutputMode, exec_is_missing_separator, progress_message};
+    use super::{
+        Cli, EnvironmentProfileInput, Operation, OutputMode, ProfileUploadCommand, VariableFile,
+        exec_is_missing_separator, progress_message,
+    };
 
     #[cfg(target_os = "linux")]
     use super::parent_id;
@@ -1434,6 +1825,88 @@ mod tests {
     }
 
     #[test]
+    fn parses_profile_upload_command() {
+        let cli = Cli::try_parse_from([
+            "agentknock",
+            "profile",
+            "upload",
+            "github",
+            "--description",
+            "GitHub API access",
+            "--update",
+            "--from-env",
+            "GH_TOKEN",
+            "--from-file",
+            "GH_HOST=host",
+            "--from-env-file",
+            "shared.env",
+            "--from-prompt",
+            "GH_SECRET",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.into_operation(),
+            (
+                Operation::UploadProfile(ProfileUploadCommand {
+                    name: "github".into(),
+                    description: Some("GitHub API access".into()),
+                    replace: false,
+                    update: true,
+                    environment: EnvironmentProfileInput {
+                        from_env: vec!["GH_TOKEN".into()],
+                        from_file: vec![VariableFile {
+                            name: "GH_HOST".into(),
+                            path: "host".into(),
+                        }],
+                        from_prompt: vec!["GH_SECRET".into()],
+                        from_env_file: vec!["shared.env".into()],
+                    },
+                }),
+                OutputMode::Normal,
+            )
+        );
+    }
+
+    #[test]
+    fn describes_profile_upload_without_assuming_an_environment_profile() {
+        let help = Cli::try_parse_from(["agentknock", "profile", "upload", "--help"]).unwrap_err();
+
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        assert!(help.contains("Upload a profile to the paired device"));
+        assert!(help.contains("Environment profile input:"));
+        assert!(
+            help.contains("New profile name, or existing profile name with --replace or --update.")
+        );
+        assert!(!help.contains("Suggested profile name"));
+    }
+
+    #[test]
+    fn requires_a_profile_upload_source() {
+        let error = Cli::try_parse_from(["agentknock", "profile", "upload", "github"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn rejects_multiple_profile_upload_modes() {
+        let error = Cli::try_parse_from([
+            "agentknock",
+            "profile",
+            "upload",
+            "github",
+            "--replace",
+            "--update",
+            "--from-env",
+            "GH_TOKEN",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn rejects_finish_pairing_argument() {
         let error =
             Cli::try_parse_from(["agentknock", "pairing", "finish", "unexpected"]).unwrap_err();
@@ -1601,6 +2074,14 @@ mod tests {
                 "--".into(),
                 "echo".into(),
                 invalid_utf8,
+            ],
+            vec![
+                "agentknock".into(),
+                "profile".into(),
+                "upload".into(),
+                "test".into(),
+                "--from-env-file".into(),
+                OsString::from_vec(vec![0xff]),
             ],
         ];
 

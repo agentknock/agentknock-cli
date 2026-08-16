@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    future::Future,
+    pin::Pin,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
@@ -9,6 +14,8 @@ use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
     pairing::{RotationError, maybe_rotate_psk},
+    profiles::{ProfileContentsMessage, ProfileMessage, SecretValueMessage},
+    protocol::Method,
     websocket::{self, RelayExchange},
 };
 
@@ -141,8 +148,17 @@ pub enum ProtocolError {
     #[error("relay response state did not include a response message")]
     MissingResponse,
 
-    #[error("approved response did not contain an environment mapping")]
-    MissingEnvironment,
+    #[error("approved response did not contain profiles")]
+    MissingProfiles,
+
+    #[error("approved profiles contain different values for environment variable {name:?}")]
+    ConflictingEnvironmentVariable { name: String },
+
+    #[error("approved response contains profiles {received:?}, expected {expected:?}")]
+    UnexpectedProfiles {
+        expected: Vec<String>,
+        received: Vec<String>,
+    },
 
     #[error("received an ABORTED result in a response")]
     AbortedResponse,
@@ -227,7 +243,7 @@ where
         },
     };
     let request_payload = CredentialRequestPayload {
-        method: "CredentialRequest",
+        method: Method::CredentialRequest,
         profiles: request.profiles,
         reason: request.reason,
         operation,
@@ -302,17 +318,23 @@ where
     let result: RequestResult = serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
     let (completion_result, exchange_result) = match result {
         RequestResult::Approved {
-            environment: Some(environment),
-        } => (
-            RequestResult::Approved { environment: None },
-            Ok(Credentials { environment }),
-        ),
-        RequestResult::Approved { environment: None } => (
+            profiles: Some(profiles),
+        } => match credentials_from_profiles(profiles, request_payload.profiles) {
+            Ok(credentials) => (RequestResult::Approved { profiles: None }, Ok(credentials)),
+            Err(error) => (
+                RequestResult::Aborted {
+                    reason: AbortReason::InvalidResponse,
+                    message: error.to_string(),
+                },
+                Err(error.into()),
+            ),
+        },
+        RequestResult::Approved { profiles: None } => (
             RequestResult::Aborted {
                 reason: AbortReason::InvalidResponse,
-                message: ProtocolError::MissingEnvironment.to_string(),
+                message: ProtocolError::MissingProfiles.to_string(),
             },
-            Err(ProtocolError::MissingEnvironment.into()),
+            Err(ProtocolError::MissingProfiles.into()),
         ),
         RequestResult::Denied { reason, message } => (
             RequestResult::Denied {
@@ -349,6 +371,36 @@ where
     }
 
     exchange_result
+}
+
+fn credentials_from_profiles(
+    profiles: BTreeMap<String, ProfileMessage<SecretValueMessage>>,
+    requested_profiles: &[String],
+) -> Result<Credentials, ProtocolError> {
+    let mut environment = BTreeMap::new();
+    let received_profiles = profiles.keys().cloned().collect::<BTreeSet<_>>();
+    for profile in profiles.into_values() {
+        match profile.contents {
+            ProfileContentsMessage::Environment { variables } => {
+                for (name, variable) in variables {
+                    if let Some(previous) = environment.get(&name)
+                        && previous != &variable.value
+                    {
+                        return Err(ProtocolError::ConflictingEnvironmentVariable { name });
+                    }
+                    environment.insert(name, variable.value);
+                }
+            }
+        }
+    }
+    let expected_profiles = requested_profiles.iter().cloned().collect::<BTreeSet<_>>();
+    if received_profiles != expected_profiles {
+        return Err(ProtocolError::UnexpectedProfiles {
+            expected: expected_profiles.into_iter().collect(),
+            received: received_profiles.into_iter().collect(),
+        });
+    }
+    Ok(Credentials { environment })
 }
 
 fn abort_reason(error: &websocket::Error) -> AbortReason {
@@ -427,7 +479,7 @@ impl From<websocket::Error> for RequestError {
 
 #[derive(Serialize)]
 struct CredentialRequestPayload<'a> {
-    method: &'static str,
+    method: Method,
     profiles: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
@@ -481,7 +533,7 @@ impl From<StreamKind> for StreamKindMessage {
 enum RequestResult {
     Approved {
         #[serde(skip_serializing_if = "Option::is_none")]
-        environment: Option<BTreeMap<String, String>>,
+        profiles: Option<BTreeMap<String, ProfileMessage<SecretValueMessage>>>,
     },
     Denied {
         reason: DenialReason,
@@ -501,4 +553,79 @@ enum AbortReason {
     InvalidResponse,
     ClientError,
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_equal_environment_values_from_different_profiles() {
+        let profiles = BTreeMap::from([
+            ("first".into(), environment_profile([("TOKEN", "same")])),
+            (
+                "second".into(),
+                environment_profile([("TOKEN", "same"), ("OTHER", "value")]),
+            ),
+        ]);
+        let requested = vec!["first".into(), "second".into()];
+
+        let credentials = credentials_from_profiles(profiles, &requested).unwrap();
+
+        assert_eq!(
+            credentials.environment,
+            BTreeMap::from([
+                ("OTHER".into(), "value".into()),
+                ("TOKEN".into(), "same".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_environment_values() {
+        let profiles = BTreeMap::from([
+            ("first".into(), environment_profile([("TOKEN", "one")])),
+            ("second".into(), environment_profile([("TOKEN", "two")])),
+        ]);
+        let requested = vec!["first".into(), "second".into()];
+
+        assert!(matches!(
+            credentials_from_profiles(profiles, &requested),
+            Err(ProtocolError::ConflictingEnvironmentVariable { name }) if name == "TOKEN"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_different_profile_set() {
+        let profiles =
+            BTreeMap::from([("other".into(), environment_profile([("TOKEN", "value")]))]);
+        let requested = vec!["requested".into()];
+
+        assert!(matches!(
+            credentials_from_profiles(profiles, &requested),
+            Err(ProtocolError::UnexpectedProfiles { expected, received })
+                if expected == ["requested"] && received == ["other"]
+        ));
+    }
+
+    fn environment_profile<const N: usize>(
+        variables: [(&str, &str); N],
+    ) -> ProfileMessage<SecretValueMessage> {
+        ProfileMessage {
+            description: None,
+            contents: ProfileContentsMessage::Environment {
+                variables: variables
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.into(),
+                            SecretValueMessage {
+                                value: value.into(),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        }
+    }
 }

@@ -24,7 +24,7 @@ async fn lists_profile_metadata_without_secret_values() {
         let request_id = frame["request_id"].as_str().unwrap().to_owned();
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &frame["payload"]);
-        assert_eq!(plaintext["method"], "List");
+        assert_eq!(plaintext["method"], "ProfileList");
         assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
 
         send_json(
@@ -51,11 +51,13 @@ async fn lists_profile_metadata_without_secret_values() {
                         "profiles": {
                             "github": {
                                 "description": "GitHub API access",
-                                "environment": {"GH_TOKEN": "STORED"},
+                                "type": "environment",
+                                "variables": {"GH_TOKEN": "STORED"},
                             },
                             "cloudflare": {
                                 "description": "Cloudflare deployment access",
-                                "environment": {
+                                "type": "environment",
+                                "variables": {
                                     "CF_ACCOUNT_ID": "STORED",
                                     "CF_API_TOKEN": "ISSUED",
                                 },
@@ -105,14 +107,16 @@ async fn lists_profile_metadata_without_secret_values() {
             "profiles": {
                 "cloudflare": {
                     "description": "Cloudflare deployment access",
-                    "environment": {
+                    "type": "environment",
+                    "variables": {
                         "CF_ACCOUNT_ID": "STORED",
                         "CF_API_TOKEN": "ISSUED",
                     },
                 },
                 "github": {
                     "description": "GitHub API access",
-                    "environment": {"GH_TOKEN": "STORED"},
+                    "type": "environment",
+                    "variables": {"GH_TOKEN": "STORED"},
                 },
             },
         })

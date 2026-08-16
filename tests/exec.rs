@@ -21,6 +21,23 @@ use support::{
     open_request, receive_json, send_json, websocket_server,
 };
 
+fn approved_environment(profile: &str, variables: serde_json::Map<String, Value>) -> Value {
+    let profile_name = profile.to_owned();
+    let variables = variables
+        .into_iter()
+        .map(|(name, value)| (name, json!({"value": value})))
+        .collect::<serde_json::Map<_, _>>();
+    let profile = json!({
+        "description": null,
+        "type": "environment",
+        "variables": variables,
+    });
+    json!({
+        "result": "APPROVED",
+        "profiles": serde_json::Map::from_iter([(profile_name, profile)]),
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_credentials_and_executes_with_the_returned_environment() {
     let home = TestHome::active();
@@ -85,7 +102,20 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
                     &key,
                     &json!({
                         "result": "APPROVED",
-                        "environment": {"AGENTKNOCK_EXEC_TEST": "secret"},
+                        "profiles": {
+                            "github": {
+                                "description": "GitHub access",
+                                "type": "environment",
+                                "variables": {
+                                    "AGENTKNOCK_EXEC_TEST": {"value": "secret"},
+                                },
+                            },
+                            "cloudflare": {
+                                "description": "Cloudflare access",
+                                "type": "environment",
+                                "variables": {},
+                            }
+                        },
                     }),
                 ),
             }),
@@ -101,7 +131,7 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
         assert_eq!(completion["kind"], "completion");
         let completion_plaintext = open_completion(&mut context, &completion["payload"]);
         assert_eq!(completion_plaintext["result"], "APPROVED");
-        assert!(completion_plaintext.get("environment").is_none());
+        assert!(completion_plaintext.get("profiles").is_none());
         send_json(
             &mut socket,
             json!({
@@ -189,10 +219,13 @@ async fn reports_and_executes_a_shebang_script() {
                 "payload": encrypt_response(
                     &context,
                     &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "environment": {"AGENTKNOCK_SCRIPT_TEST": "approved"},
-                    }),
+                    &approved_environment(
+                        "test",
+                        serde_json::Map::from_iter([(
+                            "AGENTKNOCK_SCRIPT_TEST".into(),
+                            "approved".into(),
+                        )]),
+                    ),
                 ),
             }),
         )
@@ -274,13 +307,16 @@ async fn executes_the_selected_native_file_after_its_path_is_replaced() {
                 "payload": encrypt_response(
                     &context,
                     &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "environment": {
-                            "AGENTKNOCK_PINNED_EXEC_TEST": "selected",
-                            "PATH": "/agentknock-returned-path-must-not-be-searched",
-                        },
-                    }),
+                    &approved_environment(
+                        "test",
+                        serde_json::Map::from_iter([
+                            ("AGENTKNOCK_PINNED_EXEC_TEST".into(), "selected".into()),
+                            (
+                                "PATH".into(),
+                                "/agentknock-returned-path-must-not-be-searched".into(),
+                            ),
+                        ]),
+                    ),
                 ),
             }),
         )
@@ -358,7 +394,7 @@ async fn restores_sigpipe_before_executing_the_command() {
                 "payload": encrypt_response(
                     &context,
                     &key,
-                    &json!({"result": "APPROVED", "environment": {}}),
+                    &approved_environment("test", serde_json::Map::new()),
                 ),
             }),
         )
@@ -494,7 +530,7 @@ async fn resends_the_exact_request_when_the_connection_closes_before_ack() {
                 "payload": encrypt_response(
                     &context,
                     &key,
-                    &json!({"result": "APPROVED", "environment": {}}),
+                    &approved_environment("github", serde_json::Map::new()),
                 ),
             }),
         )
@@ -580,7 +616,7 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
                 "payload": encrypt_response(
                     &context,
                     &key,
-                    &json!({"result": "APPROVED", "environment": {}}),
+                    &approved_environment("github", serde_json::Map::new()),
                 ),
             }),
         )
@@ -733,10 +769,13 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
                 "payload": encrypt_response(
                     &context,
                     &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "environment": {"AGENTKNOCK_MUST_NOT_EXEC": "yes"},
-                    }),
+                    &approved_environment(
+                        "github",
+                        serde_json::Map::from_iter([(
+                            "AGENTKNOCK_MUST_NOT_EXEC".into(),
+                            "yes".into(),
+                        )]),
+                    ),
                 ),
             }),
         )

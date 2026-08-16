@@ -69,6 +69,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
                 .unwrap();
             BASE64_STANDARD.encode(commitment)
         };
+        assert!(request_frame["payload"].get("method").is_none());
         assert_eq!(request_frame["payload"]["version"], "agentknock-v1");
         assert_eq!(request_frame["payload"]["commitment"], expected_commitment);
         send_json(
@@ -192,7 +193,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
             &finish_request_id,
             &finish_request["payload"],
         );
-        assert_eq!(finish_plaintext["method"], "FinishPairing");
+        assert_eq!(finish_plaintext["method"], "PairingFinish");
         send_json(
             &mut socket,
             json!({
@@ -324,7 +325,7 @@ fn abort_pairing_removes_only_a_pending_pairing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unpairs_after_an_authenticated_device_response() {
+async fn removes_pairing_after_an_authenticated_device_response() {
     let home = TestHome::active();
     let pairing_path = home.pairing_path();
     let device_private_key = home.device_private_key.clone();
@@ -336,7 +337,7 @@ async fn unpairs_after_an_authenticated_device_response() {
         let request_id = request["request_id"].as_str().unwrap().to_owned();
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &request["payload"]);
-        assert_eq!(plaintext["method"], "Unpair");
+        assert_eq!(plaintext["method"], "PairingRemove");
         send_json(
             &mut socket,
             json!({

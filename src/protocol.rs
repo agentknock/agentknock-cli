@@ -2,6 +2,15 @@ use serde::Serialize;
 
 pub(crate) const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone, Copy, Serialize)]
+pub(crate) enum Method {
+    CredentialRequest,
+    PairingFinish,
+    PairingRemove,
+    ProfileList,
+    ProfileUpload,
+}
+
 pub(crate) fn encode<T>(contents: &T) -> Result<Vec<u8>, serde_json::Error>
 where
     T: Serialize,
