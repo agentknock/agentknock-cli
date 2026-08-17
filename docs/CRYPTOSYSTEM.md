@@ -339,22 +339,26 @@ identifiers. Initial pairing uses `client_id = request_id`; a paired exchange
 uses `(client_id, request_id)`. Changing a routing identifier selects a
 different slot.
 
+Transport handling is separate from cryptographic acceptance. Receiving,
+storing, discarding, or acknowledging an envelope at the transport layer does
+not authenticate it or change trusted endpoint state. The transport may end an
+exchange after an invalid envelope or supply another candidate; this document
+does not prescribe that behavior.
+
 A receiver applies these rules in order:
 
 1. It looks up retained state before decoding the envelope. If the slot is
-   already filled or has a terminal disposition, the receiver handles the
-   delivery from retained state as though the accepted record had been
-   delivered again. It does not decode, authenticate, or compare the later
-   envelope, and it does not repeat an application action, response generation,
-   or cryptographic state transition.
-2. For an empty slot, the receiver performs all applicable decoding,
-   validation, and authentication. A protected candidate fills the slot only
-   after it authenticates successfully. A failed candidate leaves the slot
-   empty and cannot prevent a later candidate from being accepted. Section 7
-   defines the corresponding acceptance checks for the clear pairing messages.
-3. Lookup and acceptance are serialized. The first candidate that satisfies
-   the acceptance checks fills the slot; a candidate that loses a race is
-   handled from the resulting retained state.
+   already cryptographically accepted or has a terminal disposition, the
+   receiver handles the delivery from retained state. It does not decode,
+   authenticate, or compare the later envelope, and it does not repeat an
+   application action, response generation, or cryptographic state transition.
+2. Otherwise, the receiver performs all applicable decoding, validation, and
+   authentication. A protected record is accepted only after it authenticates
+   successfully. Failure causes no trusted state transition and exposes no
+   plaintext. Section 7 defines the acceptance checks for the clear pairing
+   messages.
+3. Lookup and acceptance are serialized. Once a record is accepted, any later
+   candidate is handled from the resulting retained state.
 
 A sender creates at most one cryptographic record for a slot. Redelivery uses
 the exact previously generated cryptographic values and ciphertext bytes; it
@@ -556,10 +560,10 @@ The member named `secret` carries `secret_ciphertext`, never the clear
 `application_ciphertext`, consistently with the other application-message
 envelopes in this document.
 
-The pairing completion occupies a completion slot under Section 5.6. An
-empty slot can be filled only for a retained attempt awaiting this message and
-only after the device completes the following validation. It reconstructs the
-receiver context and opens both records in order:
+The pairing completion occupies a completion slot under Section 5.6. It can be
+accepted only for a retained attempt awaiting this message and only after the
+device completes the following validation. It reconstructs the receiver
+context and opens both records in order:
 
 ```text
 pairing_context = SetupBaseR(
@@ -596,8 +600,7 @@ The device compares `recovered_commitment` with the commitment retained from
 the initial request. The comparison must be constant-time. If they differ, the
 device rejects the pairing completion without processing
 `application_plaintext`, deriving or storing a client PSK, or presenting a
-SAS. Any failure leaves the completion slot empty and the pairing attempt
-unchanged.
+SAS. Any failure leaves the pairing attempt unchanged.
 
 Only after the commitment matches does the device export:
 
@@ -681,10 +684,10 @@ request, response, and completion plaintext schemas are outside this document.
 
 ### 7.5. Client transcript retention
 
-For one `client_id`, the client fixes one `client_secret`, commitment, accepted
+For one `client_id`, the client fixes one `client_secret`, commitment,
 `(device_id, pkD, device_random)` response tuple, base-mode sender context,
 `enc`, `secret_ciphertext`, `application_ciphertext`, and exported
-`client_psk`. A response candidate is accepted only after its envelope,
+`client_psk`. The response tuple becomes fixed only after its envelope,
 lengths, X25519 input, and HPKE setup validate; later deliveries follow Section
 5.6.
 
@@ -758,7 +761,7 @@ When `rotation_enc` is present, the v1 JSON envelope mapping is:
 The JSON member named `rotation_key` must be absent when `rotation_enc` is
 absent.
 
-The device applies Section 5.6. To fill an empty request slot, it applies its
+The device applies Section 5.6. Before accepting a new request, it applies its
 freshness policy, selects the binding using `client_id`, checks the exact outer
 version, and runs:
 
@@ -861,10 +864,10 @@ The field named `nonce` contains `response_random`. It is public HKDF input;
 it is not the ChaCha20Poly1305 nonce. Its decoded length must be exactly 32
 bytes.
 
-The client applies Section 5.6. To validate a candidate for an empty response
-slot, it derives the same `response_secret`, `response_key`, and
-`response_aead_nonce` and attempts to open the ciphertext. Opening a response
-does not advance the HPKE record sequence.
+The client applies Section 5.6. Before accepting a response, it derives the
+same `response_secret`, `response_key`, and `response_aead_nonce` and attempts
+to open the ciphertext. Opening a response does not advance the HPKE record
+sequence.
 
 For a given request, the device must create at most one terminal
 `response_plaintext` and one `paired_response`. Before releasing the first
@@ -907,12 +910,12 @@ The completion does not repeat `version`, `enc`, `device_id`, `client_id`, or
 `request_id`; they are supplied by the original request and its context. In the
 v1 JSON encoding, this means that it contains no `version` or `key` member.
 
-The device applies Section 5.6. To validate a candidate for an empty completion
-slot, it reconstructs the receiver context from the accepted request, opens
-request sequence number 0, and then opens the completion as sequence number 1.
-Acceptance and any state transition caused by the completion plaintext form one
-serialized, crash-safe transition. Response derivation and encryption do not
-consume an HPKE record sequence number.
+The device applies Section 5.6. Before accepting a completion, it reconstructs
+the receiver context from the accepted request, opens request sequence number
+0, and then opens the completion as sequence number 1. Acceptance and any state
+transition caused by the completion plaintext form one serialized, crash-safe
+transition. Response derivation and encryption do not consume an HPKE record
+sequence number.
 
 A completion may report an application-level abort even if no response was
 obtained. Cryptographically, it can be generated only after the request was
@@ -1108,11 +1111,10 @@ An implementation must fail closed on any of the following:
   wrong length;
 - HPKE setup, open, seal, or export failure;
 - ChaCha20Poly1305 authentication failure;
-- a candidate for an empty record slot that is presented in the wrong
-  sequence.
+- a record presented in the wrong sequence before cryptographic acceptance.
 
-These checks apply to candidates for empty slots. Redelivery to a filled slot
-follows Section 5.6 without validating the later envelope.
+These checks apply before cryptographic acceptance. Later transport delivery
+for an accepted slot follows Section 5.6 without validating the new envelope.
 
 Every X25519 public key and encapsulated key must decode to exactly 32 bytes.
 When processing an X25519 input u-coordinate, the implementation follows RFC
@@ -1155,8 +1157,8 @@ secure endpoint state:
   number 1 in the original request context.
 - `version`, `device_id`, and `request_id` are bound through HPKE `info`, while
   `client_id` is bound through `psk_id`.
-- Modification or cross-context substitution of a protected candidate causes
-  authentication failure while its record slot is empty. After acceptance,
+- Modification or cross-context substitution of a protected record causes
+  authentication failure and no trusted state transition. After acceptance,
   later envelopes for that slot are ignored and cannot replace the accepted
   record or repeat its effects.
 
@@ -1204,8 +1206,8 @@ the client.
 
 Authenticated encryption does not invalidate a ciphertext replay. Section 5.6
 maps each slot to one operation and handles later envelopes from retained state.
-A modified protected candidate delivered before acceptance fails
-authentication and leaves the slot empty.
+A modified protected record fails authentication and causes no trusted state
+transition.
 
 Senders must still generate only one record per slot. Cloned or rolled-back
 HPKE state could otherwise seal different plaintexts at one sequence number,

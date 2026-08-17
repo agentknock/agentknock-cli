@@ -848,8 +848,8 @@ enum MessageState {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ApplicationResponse<R> {
-    Error(UnauthenticatedError),
     Message(R),
+    Error(UnauthenticatedError),
 }
 
 #[derive(Deserialize)]
@@ -905,9 +905,52 @@ pub(crate) enum Error {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::ApplicationResponse;
+
+    #[derive(Deserialize)]
+    struct ProtectedResponse {
+        nonce: String,
+        ciphertext: String,
+    }
+
     #[test]
     fn installs_rustls_crypto_provider() {
         super::ensure_rustls_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn ignores_error_members_in_a_protected_response() {
+        let response: ApplicationResponse<ProtectedResponse> = serde_json::from_value(json!({
+            "nonce": "response random",
+            "ciphertext": "protected contents",
+            "error": "UNKNOWN_EXTENSION",
+            "message": "ignored extension contents",
+        }))
+        .unwrap();
+
+        let ApplicationResponse::Message(response) = response else {
+            panic!("protected response was interpreted as an unauthenticated error");
+        };
+        assert_eq!(response.nonce, "response random");
+        assert_eq!(response.ciphertext, "protected contents");
+    }
+
+    #[test]
+    fn accepts_an_unauthenticated_error_without_a_protected_response() {
+        let response: ApplicationResponse<ProtectedResponse> = serde_json::from_value(json!({
+            "error": "CLIENT_INACTIVE",
+            "message": "client is inactive",
+        }))
+        .unwrap();
+
+        let ApplicationResponse::Error(error) = response else {
+            panic!("unauthenticated error was interpreted as a protected response");
+        };
+        assert_eq!(error.error, "CLIENT_INACTIVE");
+        assert_eq!(error.message, "client is inactive");
     }
 }
