@@ -129,6 +129,12 @@ async fn starts_and_finishes_pairing_over_websockets() {
             &info,
         )
         .unwrap();
+        let secret_ciphertext = BASE64_STANDARD
+            .decode(completion["secret"].as_str().unwrap())
+            .unwrap();
+        let client_secret = context.open(&secret_ciphertext, b"").unwrap();
+        assert_eq!(client_secret.len(), 32);
+
         let ciphertext = BASE64_STANDARD
             .decode(completion["ciphertext"].as_str().unwrap())
             .unwrap();
@@ -137,12 +143,9 @@ async fn starts_and_finishes_pairing_over_websockets() {
         assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(plaintext["platform"], std::env::consts::OS);
         assert_eq!(plaintext["architecture"], std::env::consts::ARCH);
-        let client_random = BASE64_STANDARD
-            .decode(plaintext["client_random"].as_str().unwrap())
-            .unwrap();
-        assert_eq!(client_random.len(), 32);
+        assert!(plaintext.get("client_secret").is_none());
         let expected_commitment = {
-            let hkdf = Hkdf::<Sha256>::new(Some(b"agentknock-v1"), &client_random);
+            let hkdf = Hkdf::<Sha256>::new(Some(b"agentknock-v1"), &client_secret);
             let mut commitment = Array::<u8, <HkdfSha256 as KdfTrait>::Nh>::default();
             hkdf.expand(b"agentknock-v1 commitment", &mut commitment)
                 .unwrap();
@@ -157,7 +160,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
         sas_info.extend_from_slice(&DEVICE_ID.parse::<Ulid>().unwrap().to_bytes());
         sas_info.extend_from_slice(&client_id.parse::<Ulid>().unwrap().to_bytes());
         sas_info.extend_from_slice(&device_public_key.to_bytes());
-        let hkdf = Hkdf::<Sha256>::new(Some(&DEVICE_RANDOM), &client_random);
+        let hkdf = Hkdf::<Sha256>::new(Some(&DEVICE_RANDOM), &client_secret);
         let mut sas = [0; 8];
         hkdf.expand(&sas_info, &mut sas).unwrap();
         let sas = u64::from_be_bytes(sas) % SAS_DECIMAL_MODULUS;

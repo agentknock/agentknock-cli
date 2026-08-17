@@ -146,16 +146,22 @@ pub(crate) fn seal_pairing(
     client_id: CanonicalUlid,
     client_token: String,
     response: PairingResponse,
-    client_random: &[u8],
-    plaintext: &[u8],
+    client_secret: &[u8],
+    application_plaintext: &[u8],
 ) -> Result<(PairingCompletion, PendingPairing, u64), Error> {
+    require_length(
+        "client secret",
+        client_secret,
+        KdfSizedBytes::default().len(),
+    )?;
     let device_key = <Kem as KemTrait>::PublicKey::from_bytes(&response.device_key)?;
     let device_id_bytes = response.device_id.to_bytes();
     let client_id_bytes = client_id.to_bytes();
     let info = [PROTOCOL_VERSION_INFO, device_id_bytes, client_id_bytes].concat();
     let (encapped_key, mut sender_context) =
         setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &device_key, &info)?;
-    let ciphertext = sender_context.seal(plaintext, b"")?;
+    let secret_ciphertext = sender_context.seal(client_secret, b"")?;
+    let ciphertext = sender_context.seal(application_plaintext, b"")?;
     let mut client_psk = KdfSizedBytes::default();
     sender_context.export(PSK_EXPORT_CONTEXT, &mut client_psk)?;
     require_length(
@@ -173,12 +179,13 @@ pub(crate) fn seal_pairing(
     sas_info.extend_from_slice(&device_id_bytes);
     sas_info.extend_from_slice(&client_id_bytes);
     sas_info.extend_from_slice(&response.device_key);
-    let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), client_random);
+    let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), client_secret);
     let mut sas = [0; 8];
     hkdf.expand(&sas_info, &mut sas)?;
     let sas = u64::from_be_bytes(sas) % SAS_DECIMAL_MODULUS;
     let completion = PairingCompletion {
         key: BASE64_STANDARD.encode(encapped_key.to_bytes()),
+        secret: BASE64_STANDARD.encode(secret_ciphertext),
         ciphertext: BASE64_STANDARD.encode(ciphertext),
     };
     let pairing = PendingPairing::new(
@@ -199,19 +206,19 @@ pub(crate) fn derive_address_id(address: &str) -> Result<AddressId, Error> {
     Ok(AddressId::from_bytes(address_id))
 }
 
-pub(crate) fn generate_client_random() -> Result<Vec<u8>, Error> {
-    let mut client_random = KdfSizedBytes::default();
-    getrandom::fill(&mut client_random)?;
-    Ok(client_random.to_vec())
+pub(crate) fn generate_client_secret() -> Result<Vec<u8>, Error> {
+    let mut client_secret = KdfSizedBytes::default();
+    getrandom::fill(&mut client_secret)?;
+    Ok(client_secret.to_vec())
 }
 
-pub(crate) fn derive_pairing_commitment(client_random: &[u8]) -> Result<Vec<u8>, Error> {
+pub(crate) fn derive_pairing_commitment(client_secret: &[u8]) -> Result<Vec<u8>, Error> {
     require_length(
-        "client random",
-        client_random,
+        "client secret",
+        client_secret,
         KdfSizedBytes::default().len(),
     )?;
-    let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), client_random);
+    let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), client_secret);
     let mut commitment = KdfSizedBytes::default();
     hkdf.expand(COMMITMENT_DERIVATION_INFO, &mut commitment)?;
     Ok(commitment.to_vec())
@@ -266,6 +273,7 @@ pub(crate) struct PairingResponse {
 #[derive(Serialize)]
 pub(crate) struct PairingCompletion {
     key: String,
+    secret: String,
     ciphertext: String,
 }
 
@@ -337,16 +345,16 @@ mod tests {
     }
 
     #[test]
-    fn derives_pairing_commitment_from_client_random() {
-        let client_random = (0_u8..32).collect::<Vec<_>>();
+    fn derives_pairing_commitment_from_client_secret() {
+        let client_secret = (0_u8..32).collect::<Vec<_>>();
         assert_eq!(
-            BASE64_STANDARD.encode(derive_pairing_commitment(&client_random).unwrap()),
+            BASE64_STANDARD.encode(derive_pairing_commitment(&client_secret).unwrap()),
             "Go4u3fpbdUdrgELIEo4ugJQDJ/Em1uftiV1/UdafzCw="
         );
     }
 
     #[test]
-    fn rejects_wrong_length_client_random_for_pairing_commitment() {
+    fn rejects_wrong_length_client_secret_for_pairing_commitment() {
         assert!(derive_pairing_commitment(&[0; 31]).is_err());
     }
 

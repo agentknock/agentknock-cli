@@ -19,7 +19,7 @@ use crate::{
     },
     crypto::{
         self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
-        derive_pairing_commitment, derive_psk_rotation, generate_client_random, seal_pairing,
+        derive_pairing_commitment, derive_psk_rotation, generate_client_secret, seal_pairing,
     },
     protocol::Method,
     websocket::RelayExchange,
@@ -64,8 +64,8 @@ where
 {
     progress(PairingProgress::Preparing);
     ensure_pairing_absent()?;
-    let client_random = generate_client_random().map_err(ProtocolError::from)?;
-    let commitment = derive_pairing_commitment(&client_random).map_err(ProtocolError::from)?;
+    let client_secret = generate_client_secret().map_err(ProtocolError::from)?;
+    let commitment = derive_pairing_commitment(&client_secret).map_err(ProtocolError::from)?;
     let request_id = Ulid::generate();
     let client_id = CanonicalUlid::new(request_id);
     let client_token = generate_client_token()?;
@@ -86,21 +86,20 @@ where
         })
         .await?;
     progress(PairingProgress::Completing);
-    let contents = PairingCompletionPayload {
-        client_random: BASE64_STANDARD.encode(&client_random),
+    let contents = PairingMetadata {
         platform: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
         hostname: read_trimmed("/etc/hostname"),
         machine_id: read_trimmed("/etc/machine-id"),
         os_version: os_version(),
     };
-    let plaintext = crate::protocol::encode(&contents).map_err(ProtocolError::from)?;
+    let application_plaintext = crate::protocol::encode(&contents).map_err(ProtocolError::from)?;
     let (completion, pairing, sas) = seal_pairing(
         client_id,
         client_token,
         response,
-        &client_random,
-        &plaintext,
+        &client_secret,
+        &application_plaintext,
     )
     .map_err(ProtocolError::from)?;
     write_pending_pairing(&pairing)?;
@@ -308,8 +307,7 @@ enum FinishPairingResult {
 }
 
 #[derive(Serialize)]
-struct PairingCompletionPayload {
-    client_random: String,
+struct PairingMetadata {
     platform: &'static str,
     architecture: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
