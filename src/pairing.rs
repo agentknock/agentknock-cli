@@ -62,6 +62,9 @@ pub async fn start_pairing_with_progress<P>(
 where
     P: FnMut(PairingProgress),
 {
+    if !is_valid_pairing_address(address) {
+        return Err(ProtocolError::InvalidPairingAddress.into());
+    }
     progress(PairingProgress::Preparing);
     ensure_pairing_absent()?;
     let client_secret = generate_client_secret().map_err(ProtocolError::from)?;
@@ -110,6 +113,12 @@ where
     }
     progress(PairingProgress::Completed);
     Ok(PairingSas(sas))
+}
+
+fn is_valid_pairing_address(address: &str) -> bool {
+    address
+        .split('-')
+        .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
 pub async fn finish_pairing() -> Result<(), RequestError> {
@@ -374,6 +383,7 @@ mod tests {
     #[cfg(unix)]
     use ulid::Ulid;
 
+    use super::is_valid_pairing_address;
     #[cfg(unix)]
     use super::{PSK_ROTATION_INTERVAL_SECONDS, RotationError, maybe_rotate_psk_at, rotate_psk_at};
     #[cfg(unix)]
@@ -382,6 +392,16 @@ mod tests {
     #[test]
     fn formats_sas_as_three_groups() {
         assert_eq!(format_sas(123_456_789), "0001 2345 6789");
+    }
+
+    #[test]
+    fn validates_pairing_addresses() {
+        for address in ["free", "yup-its-free"] {
+            assert!(is_valid_pairing_address(address));
+        }
+        for address in ["", "-", "--", "-free", "free-", "yup--its-free"] {
+            assert!(!is_valid_pairing_address(address));
+        }
     }
 
     #[cfg(unix)]

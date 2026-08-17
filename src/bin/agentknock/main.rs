@@ -344,14 +344,13 @@ impl FromStr for VariableFile {
 }
 
 fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
-    if !address.is_empty()
-        && address
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    if address
+        .split('-')
+        .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
     {
         Ok(address.to_owned())
     } else {
-        Err("the pairing address must contain only lowercase ASCII letters and hyphens")
+        Err("the pairing address must contain lowercase ASCII words separated by single hyphens")
     }
 }
 
@@ -1745,10 +1744,22 @@ mod tests {
 
     #[test]
     fn rejects_invalid_pairing_address() {
-        for address in ["Yup-its-free", "yup_its_free", "yup-its-frée"] {
+        for address in [
+            "yup-its-free-",
+            "yup--its-free",
+            "Yup-its-free",
+            "yup_its_free",
+            "yup-its-frée",
+        ] {
             let error =
                 Cli::try_parse_from(["agentknock", "pairing", "start", address]).unwrap_err();
 
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        }
+
+        for address in ["-", "--", "-yup-its-free", "--help"] {
+            let error =
+                Cli::try_parse_from(["agentknock", "pairing", "start", "--", address]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }
     }

@@ -121,6 +121,9 @@ pub enum RequestError {
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    #[error("pairing address must contain lowercase ASCII words separated by single hyphens")]
+    InvalidPairingAddress,
+
     #[error("invalid protocol JSON: {0}")]
     Json(#[from] serde_json::Error),
 

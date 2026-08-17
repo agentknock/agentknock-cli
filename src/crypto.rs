@@ -346,10 +346,10 @@ mod tests {
 
     #[test]
     fn derives_pairing_commitment_from_client_secret() {
-        let client_secret = (0_u8..32).collect::<Vec<_>>();
+        let client_secret = (0x60_u8..0x80).collect::<Vec<_>>();
         assert_eq!(
             BASE64_STANDARD.encode(derive_pairing_commitment(&client_secret).unwrap()),
-            "Go4u3fpbdUdrgELIEo4ugJQDJ/Em1uftiV1/UdafzCw="
+            "jUVTSBEimLz6OdfXAA4qxemm4hHyzzc5yOj1ZdzHsq4="
         );
     }
 
