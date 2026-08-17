@@ -62,16 +62,12 @@ async fn starts_and_finishes_pairing_over_websockets() {
         assert_eq!(request_frame["client_id"], client_id);
         assert_eq!(request_frame["request_id"], client_id);
         assert_eq!(request_frame["kind"], "request");
-        let expected_commitment = {
-            let hkdf = Hkdf::<Sha256>::new(Some(b"agentknock-v1"), b"yup-its-free");
-            let mut commitment = Array::<u8, <HkdfSha256 as KdfTrait>::Nh>::default();
-            hkdf.expand(b"agentknock-v1 commitment", &mut commitment)
-                .unwrap();
-            BASE64_STANDARD.encode(commitment)
-        };
         assert!(request_frame["payload"].get("method").is_none());
         assert_eq!(request_frame["payload"]["version"], "agentknock-v1");
-        assert_eq!(request_frame["payload"]["commitment"], expected_commitment);
+        let commitment = BASE64_STANDARD
+            .decode(request_frame["payload"]["commitment"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(commitment.len(), 32);
         send_json(
             &mut socket,
             json!({
@@ -145,6 +141,14 @@ async fn starts_and_finishes_pairing_over_websockets() {
             .decode(plaintext["client_random"].as_str().unwrap())
             .unwrap();
         assert_eq!(client_random.len(), 32);
+        let expected_commitment = {
+            let hkdf = Hkdf::<Sha256>::new(Some(b"agentknock-v1"), &client_random);
+            let mut commitment = Array::<u8, <HkdfSha256 as KdfTrait>::Nh>::default();
+            hkdf.expand(b"agentknock-v1 commitment", &mut commitment)
+                .unwrap();
+            commitment
+        };
+        assert_eq!(commitment.as_slice(), expected_commitment.as_slice());
         let mut client_psk = Array::<u8, <HkdfSha256 as KdfTrait>::Nh>::default();
         context.export(PSK_EXPORT_CONTEXT, &mut client_psk).unwrap();
 

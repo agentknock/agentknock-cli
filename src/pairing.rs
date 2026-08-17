@@ -65,7 +65,7 @@ where
     progress(PairingProgress::Preparing);
     ensure_pairing_absent()?;
     let client_random = generate_client_random().map_err(ProtocolError::from)?;
-    let commitment = derive_pairing_commitment(address).map_err(ProtocolError::from)?;
+    let commitment = derive_pairing_commitment(&client_random).map_err(ProtocolError::from)?;
     let request_id = Ulid::generate();
     let client_id = CanonicalUlid::new(request_id);
     let client_token = generate_client_token()?;

@@ -205,8 +205,13 @@ pub(crate) fn generate_client_random() -> Result<Vec<u8>, Error> {
     Ok(client_random.to_vec())
 }
 
-pub(crate) fn derive_pairing_commitment(address: &str) -> Result<Vec<u8>, Error> {
-    let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), address.as_bytes());
+pub(crate) fn derive_pairing_commitment(client_random: &[u8]) -> Result<Vec<u8>, Error> {
+    require_length(
+        "client random",
+        client_random,
+        KdfSizedBytes::default().len(),
+    )?;
+    let hkdf = Hkdf::<Sha256>::new(Some(BASE_DERIVATION_SALT), client_random);
     let mut commitment = KdfSizedBytes::default();
     hkdf.expand(COMMITMENT_DERIVATION_INFO, &mut commitment)?;
     Ok(commitment.to_vec())
@@ -332,11 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn derives_pairing_commitment_from_address() {
+    fn derives_pairing_commitment_from_client_random() {
+        let client_random = (0_u8..32).collect::<Vec<_>>();
         assert_eq!(
-            BASE64_STANDARD.encode(derive_pairing_commitment("yup-its-free").unwrap()),
-            "TSZ1lTkmAPehOPZpnWV5+O6AncZFD5TMKVfG30j6QVY="
+            BASE64_STANDARD.encode(derive_pairing_commitment(&client_random).unwrap()),
+            "Go4u3fpbdUdrgELIEo4ugJQDJ/Em1uftiV1/UdafzCw="
         );
+    }
+
+    #[test]
+    fn rejects_wrong_length_client_random_for_pairing_commitment() {
+        assert!(derive_pairing_commitment(&[0; 31]).is_err());
     }
 
     #[test]
