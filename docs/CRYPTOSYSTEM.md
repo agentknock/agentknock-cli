@@ -336,8 +336,7 @@ is therefore bound through `psk_id`; it is not duplicated in `info`.
 The surrounding protocol associates each request, response, and completion
 with a record slot selected by its message kind and transport-supplied
 identifiers. Initial pairing uses `client_id = request_id`; a paired exchange
-uses `(client_id, request_id)`. Changing a routing identifier selects a
-different slot.
+uses `(client_id, request_id)`.
 
 Transport handling is separate from cryptographic acceptance. Receiving,
 storing, discarding, or acknowledging an envelope at the transport layer does
@@ -369,8 +368,8 @@ cryptographically required.
 An endpoint retains idempotency state for at least as long as its freshness
 policy could accept the identifier if it were previously unseen, and longer
 while a live operation depends on it. State may be discarded after both
-conditions end; a later presentation is then rejected by the freshness policy
-rather than treated as a new operation.
+conditions end; subsequent handling then relies on the freshness policy rather
+than retained idempotency state.
 
 ## 6. Pairing-address derivation
 
@@ -1042,8 +1041,7 @@ period; cryptography cannot distinguish a delayed request from a newly created
 one.
 
 Only one previous generation is retained. Its overlap ends at the fixed
-deadline or upon a later rotation, whichever comes first. Another rotation is
-prohibited while the current one remains unconfirmed.
+deadline or upon a later rotation, whichever comes first.
 
 The trigger and application semantics for invalidating or removing an active
 binding are outside this document. Rotation overlap exists only while the
@@ -1210,9 +1208,10 @@ A modified protected record fails authentication and causes no trusted state
 transition.
 
 Senders must still generate only one record per slot. Cloned or rolled-back
-HPKE state could otherwise seal different plaintexts at one sequence number,
-and regenerating a response could encrypt different plaintexts under one
-derived key and nonce. Sections 7.5, 8.2, and 8.4 prohibit these cases.
+HPKE state could otherwise seal different plaintexts at one sequence number. A
+fixed response must not be replaced; changing its plaintext while retaining
+`response_random` would reuse the derived key and nonce. Sections 7.5, 8.2, and
+8.4 prohibit these cases.
 
 Rollback or cloning of endpoint state can fork a PSK lineage. Atomic writes
 prevent partial local transitions but cannot distinguish two independently
