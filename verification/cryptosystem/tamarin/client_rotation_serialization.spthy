@@ -1,0 +1,63 @@
+/*
+ * Agentknock v1: client rotation serialization (R01).
+ *
+ * Pending request sends are a stuttering transition for this property: they
+ * preserve ClientBinding and emit neither ClientRotationStarted nor
+ * ClientRotationConfirmed.  They are therefore omitted here.  Their fixed
+ * encapsulation invariant is proved separately in client_rotation_state.spthy.
+ */
+
+theory Agentknock_Client_Rotation_Serialization
+begin
+
+builtins: asymmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  exporter/2
+
+rule EstablishActiveBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk) ]
+  -->
+  [ ClientBinding(~client_id, ~device_id, pk(~skD),
+                  ~psk, 'none', 'none') ]
+
+rule ClientStartsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  old_psk, 'none', 'none'),
+    Fr(~rotation_seed) ]
+  --[ ClientRotationStarted(client_id, device_id, old_psk,
+                            new_psk, renc, rctx) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc) ]
+
+rule ClientConfirmsRotation:
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc),
+    Fr(~request_id) ]
+  --[ ClientRotationConfirmed(client_id, device_id,
+                              ~request_id, new_psk, renc) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'none', 'none') ]
+
+lemma R01_no_second_client_rotation_before_confirmation [use_induction]:
+  "All client_id device_id old1 new1 enc1 ctx1
+       old2 new2 enc2 ctx2 #i #j.
+       ClientRotationStarted(client_id, device_id,
+                             old1, new1, enc1, ctx1)@i
+     & ClientRotationStarted(client_id, device_id,
+                             old2, new2, enc2, ctx2)@j
+     & #i < #j
+     ==> (Ex rid #k.
+            ClientRotationConfirmed(client_id, device_id, rid,
+                                    new1, enc1)@k
+          & #i < #k & #k < #j)"
+
+end

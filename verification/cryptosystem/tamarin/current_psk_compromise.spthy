@@ -1,0 +1,76 @@
+/* Agentknock v1: a compromised current PSK can win a rotation race (C01). */
+
+theory Agentknock_Current_PSK_Compromise
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2
+
+rule EstablishBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~current_psk) ]
+  -->
+  [ !PublicDevice(~device_id, pk(~skD)),
+    !CurrentPSKCopy(~client_id, ~device_id, ~current_psk),
+    DeviceBinding(~client_id, ~device_id, ~skD, ~current_psk) ]
+
+rule RevealCurrentPSK:
+  [ !CurrentPSKCopy(client_id, device_id, current_psk) ]
+  --[ CurrentPSKRevealed(client_id, device_id, current_psk) ]->
+  [ !CompromisedPSK(client_id, device_id, current_psk),
+    Out(current_psk) ]
+
+rule CompromisedPSKStartsRotation:
+  let rctx = psk_context(~rotation_seed, current_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      candidate_psk = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(~request_seed, candidate_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc('attacker_rotation_request', record_key(ctx, 'record_0'))
+  in
+  [ !CompromisedPSK(client_id, device_id, current_psk),
+    !PublicDevice(device_id, pkD),
+    Fr(~rotation_seed), Fr(~request_seed), Fr(~request_id) ]
+  --[ CompromisedPSKRotationAttempt(client_id, device_id,
+                                   current_psk, candidate_psk,
+                                   renc, ~request_id, ctx) ]->
+  [ CompromisedRotationWire(client_id, device_id, ~request_id,
+                            enc, c0, renc) ]
+
+rule DeviceAdoptsCompromisedCandidate:
+  let rctx = psk_context(rotation_seed, current_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(rotation_seed, pk(skD))
+      candidate_psk = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(request_seed, candidate_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc('attacker_rotation_request', record_key(ctx, 'record_0'))
+  in
+  [ DeviceBinding(client_id, device_id, skD, current_psk),
+    CompromisedRotationWire(client_id, device_id, request_id,
+                            enc, c0, renc) ]
+  --[ DeviceCandidateAdopted(client_id, device_id, request_id,
+                            current_psk, candidate_psk,
+                            renc, rctx, ctx, <'none', 'none'>) ]->
+  [ ]
+
+lemma C01_compromised_current_psk_can_race_rotation:
+  exists-trace
+  "Ex client_id device_id old new renc rid
+      ctx rctx request_ctx prev #i #j #k.
+       CurrentPSKRevealed(client_id, device_id, old)@i
+     & CompromisedPSKRotationAttempt(client_id, device_id,
+                                    old, new, renc, rid, ctx)@j
+     & DeviceCandidateAdopted(client_id, device_id, rid,
+                             old, new, renc, rctx, request_ctx, prev)@k"
+
+end

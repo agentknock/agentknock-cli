@@ -1,0 +1,176 @@
+/*
+ * Agentknock v1: honest pairing-to-activation composition witness.
+ *
+ * This theory is deliberately limited to non-vacuity.  Internal wire facts
+ * represent faithful delivery of the exact terms emitted by the preceding
+ * role.  The active Dolev--Yao attacker, compromise rules, security lemmas,
+ * and negative controls remain in pairing_activation.spthy.  Keeping this
+ * reachability witness separate prevents adversarial source enumeration from
+ * obscuring the simple question whether all specified honest transitions and
+ * record schedules actually compose.
+ */
+
+theory Agentknock_Honest_Pairing_Activation
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption, hashing
+
+functions:
+  commitment/1,
+  hpke_info/3,
+  base_context/2,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  sas/5,
+  response_kdf/4
+
+rule RegisterDevice:
+  [ Fr(~skD), Fr(~device_id) ]
+  -->
+  [ !Device(~device_id, ~skD) ]
+
+rule ClientStartsPairing:
+  [ Fr(~client_id), Fr(~client_secret), Fr(~pairing_application) ]
+  -->
+  [ ClientWaitPairingResponse(~client_id, ~client_secret,
+                              ~pairing_application),
+    PairingRequestWire(~client_id, commitment(~client_secret)) ]
+
+rule DeviceSendsPairingResponse:
+  [ !Device(device_id, skD),
+    PairingRequestWire(client_id, commit),
+    Fr(~device_random) ]
+  -->
+  [ DeviceWaitPairingCompletion(client_id, device_id, skD,
+                                commit, ~device_random),
+    PairingResponseWire(client_id, device_id, pk(skD), ~device_random) ]
+
+rule ClientSendsPairingCompletion:
+  let info = hpke_info('agentknock-v1', device_id, client_id)
+      ctx = base_context(~pairing_seed, info)
+      enc = aenc(~pairing_seed, pkD)
+      c0 = senc(client_secret, record_key(ctx, 'record_0'))
+      c1 = senc(pairing_application, record_key(ctx, 'record_1'))
+      psk = exporter(ctx, 'agentknock-v1 psk')
+      code = sas(client_secret, device_random,
+                 device_id, client_id, pkD)
+  in
+  [ ClientWaitPairingResponse(client_id, client_secret,
+                              pairing_application),
+    PairingResponseWire(client_id, device_id, pkD, device_random),
+    Fr(~pairing_seed) ]
+  -->
+  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
+                  client_secret, psk, code),
+    PairingCompletionWire(client_id, enc, c0, c1) ]
+
+rule DeviceAcceptsPairingCompletion:
+  let info = hpke_info('agentknock-v1', device_id, client_id)
+      ctx = base_context(pairing_seed, info)
+      enc = aenc(pairing_seed, pk(skD))
+      c0 = senc(client_secret, record_key(ctx, 'record_0'))
+      c1 = senc(pairing_application, record_key(ctx, 'record_1'))
+      psk = exporter(ctx, 'agentknock-v1 psk')
+      code = sas(client_secret, device_random,
+                 device_id, client_id, pk(skD))
+  in
+  [ DeviceWaitPairingCompletion(client_id, device_id, skD,
+                                commitment(client_secret), device_random),
+    PairingCompletionWire(client_id, enc, c0, c1) ]
+  --[ HonestPairingCompletionAccepted(client_id, device_id, psk) ]->
+  [ DeviceWaitSAS(client_id, device_id, skD, device_random,
+                  client_secret, psk, code) ]
+
+rule UserVerifiesEqualSAS:
+  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
+                  client_secret, psk, code),
+    DeviceWaitSAS(client_id, device_id, skD, device_random,
+                  client_secret, psk, code) ]
+  --[ HonestSASVerified(client_id, device_id, psk) ]->
+  [ ClientPendingActivation(client_id, device_id, pkD, psk),
+    DevicePendingActivation(client_id, device_id, skD, psk) ]
+
+rule ClientSendsActivationRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx = psk_context(~activation_seed, psk, client_id, info)
+      enc = aenc(~activation_seed, pkD)
+      c0 = senc(~activation_request, record_key(ctx, 'record_0'))
+  in
+  [ ClientPendingActivation(client_id, device_id, pkD, psk),
+    Fr(~request_id), Fr(~activation_seed), Fr(~activation_request) ]
+  --[ HonestActivationRequestSent(client_id, device_id, ~request_id,
+                                  enc, ~activation_request) ]->
+  [ ClientWaitActivationResponse(client_id, device_id, psk,
+                                 ~request_id, enc, ctx),
+    ClientActivationCompletionReady(client_id, device_id, ~request_id,
+                                    ctx),
+    ActivationRequestWire(client_id, ~request_id, enc, c0) ]
+
+rule DeviceAcceptsActivationRequest:
+  let info = hpke_info('agentknock-v1', device_id, request_id)
+      ctx = psk_context(activation_seed, psk, client_id, info)
+      enc = aenc(activation_seed, pk(skD))
+      c0 = senc(activation_request, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~activation_response, <key, nonce>)
+  in
+  [ DevicePendingActivation(client_id, device_id, skD, psk),
+    ActivationRequestWire(client_id, request_id, enc, c0),
+    Fr(~response_random), Fr(~activation_response) ]
+  --[ HonestDeviceActivated(client_id, device_id, request_id, psk),
+      HonestActivationResponseFixed(client_id, request_id,
+                                    <~response_random, response_ct>,
+                                    ~activation_response) ]->
+  [ DeviceWaitActivationCompletion(client_id, device_id, request_id, ctx),
+    ActivationResponseWire(client_id, request_id,
+                           ~response_random, response_ct) ]
+
+rule ClientAcceptsActivationResponse:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientWaitActivationResponse(client_id, device_id, psk,
+                                 request_id, enc, ctx),
+    ActivationResponseWire(client_id, request_id, response_random,
+                           senc(response, <key, nonce>)) ]
+  --[ HonestClientActivated(client_id, device_id, request_id,
+                           psk, response) ]->
+  [ ]
+
+rule ClientSendsActivationCompletion:
+  let c1 = senc(~completion, record_key(ctx, 'record_1'))
+  in
+  [ ClientActivationCompletionReady(client_id, device_id,
+                                    request_id, ctx),
+    Fr(~completion) ]
+  --[ HonestActivationCompletionSent(client_id, device_id,
+                                     request_id, ~completion) ]->
+  [ ActivationCompletionWire(client_id, request_id, c1) ]
+
+rule DeviceAcceptsActivationCompletion:
+  [ DeviceWaitActivationCompletion(client_id, device_id, request_id, ctx),
+    ActivationCompletionWire(client_id, request_id,
+                             senc(completion, record_key(ctx, 'record_1'))) ]
+  --[ HonestActivationCompletionAccepted(client_id, device_id,
+                                         request_id, completion) ]->
+  [ ]
+
+lemma P01_honest_pairing_activation_executable:
+  exists-trace
+  "Ex client_id device_id request_id psk response completion
+      #p #s #d #r #c #a.
+       HonestPairingCompletionAccepted(client_id, device_id, psk)@p
+     & HonestSASVerified(client_id, device_id, psk)@s
+     & HonestDeviceActivated(client_id, device_id, request_id, psk)@d
+     & HonestClientActivated(client_id, device_id, request_id,
+                            psk, response)@r
+     & HonestActivationCompletionSent(client_id, device_id,
+                                      request_id, completion)@c
+     & HonestActivationCompletionAccepted(client_id, device_id,
+                                          request_id, completion)@a"
+
+end

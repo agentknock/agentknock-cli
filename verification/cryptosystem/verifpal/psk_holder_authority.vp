@@ -1,0 +1,144 @@
+// Constructive witness for C01.
+// PSKHolder represents an adversary after disclosure of the current binding
+// PSK.  It can create a fresh PSK-mode request and a competing rotation that
+// the device accepts.  This is not an attack-search counterexample: possession
+// of the PSK is the explicit compromise assumption being demonstrated.
+
+attacker[active]
+
+principal PSKHolder[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public psk_export_label, rotation_request_id
+	knows public device_id, client_id
+	knows private current_psk
+]
+
+principal Device[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public psk_export_label, rotation_request_id
+	knows public device_id, client_id
+	knows private current_psk, device_private_key
+	device_public_key = PUBKEY(device_private_key)
+]
+
+Device -> PSKHolder: [device_public_key]
+
+principal PSKHolder[
+	// Ordinary future impersonation with the disclosed current PSK.
+	generates request0_id, request0_kem_random, chosen_plaintext0
+	request0_kem_secret, request0_enc = KEM_ENCAP(
+		device_public_key,
+		request0_kem_random
+	)
+	request0_info = CONCAT(version_info, device_id, request0_id)
+	request0_binding = CONCAT(hpke_psk_label, request0_info, client_id)
+	request0_key = HKDF(
+		CONCAT(request0_kem_secret, current_psk),
+		request0_binding,
+		hpke_schedule_label
+	)
+	request0_ciphertext = AEAD_ENC(request0_key, chosen_plaintext0, nil)
+]
+
+PSKHolder -> Device: request0_id, request0_enc, request0_ciphertext
+
+principal Device[
+	request0_kem_secret_device = KEM_DECAP(device_private_key, request0_enc)?
+	request0_info_device = CONCAT(version_info, device_id, request0_id)
+	request0_binding_device = CONCAT(
+		hpke_psk_label,
+		request0_info_device,
+		client_id
+	)
+	request0_key_device = HKDF(
+		CONCAT(request0_kem_secret_device, current_psk),
+		request0_binding_device,
+		hpke_schedule_label
+	)
+	chosen_plaintext0_device = AEAD_DEC(
+		request0_key_device,
+		request0_ciphertext,
+		nil
+	)?
+]
+
+principal PSKHolder[
+	// Competing rotation from the same disclosed current generation.
+	generates rotation_kem_random
+	rotation_kem_secret, rotation_enc = KEM_ENCAP(
+		device_public_key,
+		rotation_kem_random
+	)
+	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
+	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
+	rotation_context = HKDF(
+		CONCAT(rotation_kem_secret, current_psk),
+		rotation_binding,
+		hpke_schedule_label
+	)
+	compromised_successor_psk = HKDF(
+		rotation_context,
+		psk_export_label,
+		nil
+	)
+	generates request1_id, request1_kem_random, chosen_plaintext1
+	request1_kem_secret, request1_enc = KEM_ENCAP(
+		device_public_key,
+		request1_kem_random
+	)
+	request1_info = CONCAT(version_info, device_id, request1_id)
+	request1_binding = CONCAT(hpke_psk_label, request1_info, client_id)
+	request1_key = HKDF(
+		CONCAT(request1_kem_secret, compromised_successor_psk),
+		request1_binding,
+		hpke_schedule_label
+	)
+	request1_ciphertext = AEAD_ENC(request1_key, chosen_plaintext1, nil)
+]
+
+PSKHolder -> Device: request1_id, request1_enc, request1_ciphertext, rotation_enc
+
+principal Device[
+	rotation_kem_secret_device = KEM_DECAP(
+		device_private_key,
+		rotation_enc
+	)?
+	rotation_info_device = CONCAT(version_info, device_id, rotation_request_id)
+	rotation_binding_device = CONCAT(
+		hpke_psk_label,
+		rotation_info_device,
+		client_id
+	)
+	rotation_context_device = HKDF(
+		CONCAT(rotation_kem_secret_device, current_psk),
+		rotation_binding_device,
+		hpke_schedule_label
+	)
+	device_candidate_psk = HKDF(
+		rotation_context_device,
+		psk_export_label,
+		nil
+	)
+	request1_kem_secret_device = KEM_DECAP(device_private_key, request1_enc)?
+	request1_info_device = CONCAT(version_info, device_id, request1_id)
+	request1_binding_device = CONCAT(
+		hpke_psk_label,
+		request1_info_device,
+		client_id
+	)
+	request1_key_device = HKDF(
+		CONCAT(request1_kem_secret_device, device_candidate_psk),
+		request1_binding_device,
+		hpke_schedule_label
+	)
+	chosen_plaintext1_device = AEAD_DEC(
+		request1_key_device,
+		request1_ciphertext,
+		nil
+	)?
+]
+
+queries[
+	equivalence? chosen_plaintext0, chosen_plaintext0_device
+	equivalence? chosen_plaintext1, chosen_plaintext1_device
+]

@@ -1,0 +1,145 @@
+/*
+ * Agentknock v1: ordered honest composition witness.
+ *
+ * This phase-indexed model connects base pairing, SAS, activation, an initial
+ * ordinary request, one candidate-authenticated rotation request, and a later
+ * request under the adopted successor.  It is a non-vacuity/composability
+ * witness; active-relay security is proved in the dedicated protocol theories.
+ */
+
+theory Agentknock_Honest_End_To_End_Trace
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  commitment/1,
+  hpke_info/3,
+  base_context/2,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  sas/5,
+  response_kdf/4
+
+rule CompleteBasePairing:
+  let commit = commitment(~client_secret)
+      ctx = base_context(~pair_seed,
+                         hpke_info('agentknock-v1', ~device_id,
+                                   ~client_id))
+      enc = aenc(~pair_seed, pk(~skD))
+      c0 = senc(~client_secret, record_key(ctx, 'record_0'))
+      c1 = senc(~pair_app, record_key(ctx, 'record_1'))
+      psk0 = exporter(ctx, 'agentknock-v1 psk')
+      code = sas(~client_secret, ~device_random,
+                 ~device_id, ~client_id, pk(~skD))
+  in
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id),
+    Fr(~client_secret), Fr(~pair_app), Fr(~device_random),
+    Fr(~pair_seed) ]
+  --[ E2EBasePairingChecked(~client_id, ~device_id, commit,
+                            enc, c0, c1, ctx, psk0) ]->
+  [ PendingSAS(~client_id, ~device_id, ~skD, psk0, code) ]
+
+rule VerifySAS:
+  [ PendingSAS(client_id, device_id, skD, psk0, code) ]
+  --[ E2ESASVerified(client_id, device_id, psk0, code) ]->
+  [ PendingActivation(client_id, device_id, skD, psk0) ]
+
+rule CompleteActivation:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx = psk_context(~request_seed, psk0, client_id, info)
+      enc = aenc(~request_seed, pk(skD))
+      c0 = senc(~request_plaintext, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response_plaintext, <key, nonce>)
+      c1 = senc(~completion_plaintext, record_key(ctx, 'record_1'))
+  in
+  [ PendingActivation(client_id, device_id, skD, psk0),
+    Fr(~request_id), Fr(~request_seed), Fr(~request_plaintext),
+    Fr(~response_random), Fr(~response_plaintext),
+    Fr(~completion_plaintext) ]
+  --[ E2EActivationExchangeChecked(client_id, device_id, ~request_id,
+                                   enc, c0,
+                                   <~response_random, response_ct>,
+                                   c1, ctx),
+      E2EDeviceActivated(client_id, device_id, ~request_id, psk0),
+      E2EClientActivated(client_id, device_id, ~request_id, psk0) ]->
+  [ ActiveInitialGeneration(client_id, device_id, skD, psk0) ]
+
+rule CompleteInitialRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx = psk_context(~request_seed, psk0, client_id, info)
+      enc = aenc(~request_seed, pk(skD))
+      c0 = senc(~request_plaintext, record_key(ctx, 'record_0'))
+  in
+  [ ActiveInitialGeneration(client_id, device_id, skD, psk0),
+    Fr(~request_id), Fr(~request_seed), Fr(~request_plaintext) ]
+  --[ E2EInitialRequestAccepted(client_id, device_id, ~request_id,
+                                ctx, psk0, enc, c0) ]->
+  [ ReadyToRotate(client_id, device_id, skD, psk0) ]
+
+rule StartRotationWithCandidateRequest:
+  let rinfo = hpke_info('agentknock-v1', device_id,
+                        'zero_request_id')
+      rctx = psk_context(~rotation_seed, psk0, client_id, rinfo)
+      renc = aenc(~rotation_seed, pk(skD))
+      psk1 = exporter(rctx, 'agentknock-v1 psk')
+      info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx = psk_context(~request_seed, psk1, client_id, info)
+      enc = aenc(~request_seed, pk(skD))
+      c0 = senc(~request_plaintext, record_key(ctx, 'record_0'))
+  in
+  [ ReadyToRotate(client_id, device_id, skD, psk0),
+    Fr(~rotation_seed), Fr(~request_id), Fr(~request_seed),
+    Fr(~request_plaintext) ]
+  --[ E2ERotationStarted(client_id, device_id,
+                         psk0, psk1, renc, rctx),
+      E2ERotationRequestAuthenticated(client_id, device_id,
+                                      ~request_id, psk1,
+                                      renc, enc, c0, ctx) ]->
+  [ PendingDeviceAdoption(client_id, device_id, skD,
+                          ~request_id, psk0, psk1,
+                          renc, rctx, ctx) ]
+
+rule AdoptSuccessor:
+  [ PendingDeviceAdoption(client_id, device_id, skD,
+                          request_id, psk0, psk1,
+                          renc, rctx, ctx) ]
+  --[ E2ESuccessorAdopted(client_id, device_id, request_id,
+                          psk0, psk1, renc, rctx, ctx) ]->
+  [ ActiveSuccessorGeneration(client_id, device_id, skD, psk1) ]
+
+rule CompletePostRotationRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx = psk_context(~request_seed, psk1, client_id, info)
+      enc = aenc(~request_seed, pk(skD))
+      c0 = senc(~request_plaintext, record_key(ctx, 'record_0'))
+  in
+  [ ActiveSuccessorGeneration(client_id, device_id, skD, psk1),
+    Fr(~request_id), Fr(~request_seed), Fr(~request_plaintext) ]
+  --[ E2EPostRotationRequestAccepted(client_id, device_id,
+                                     ~request_id, ctx, psk1,
+                                     enc, c0) ]->
+  [ ]
+
+lemma composition_pairing_activation_rotation_executable:
+  exists-trace
+  "Ex client_id device_id psk0 psk1 code activation_rid
+      initial_rid rotation_rid post_rid ctx0 renc rctx ctx1 ctx2
+      enc0 c00 enc2 c02 #a #b #c #d #e #f.
+       E2ESASVerified(client_id, device_id, psk0, code)@a
+     & E2EDeviceActivated(client_id, device_id, activation_rid, psk0)@b
+     & E2EInitialRequestAccepted(client_id, device_id,
+                                initial_rid, ctx0, psk0, enc0, c00)@c
+     & E2ERotationStarted(client_id, device_id,
+                         psk0, psk1, renc, rctx)@d
+     & E2ESuccessorAdopted(client_id, device_id, rotation_rid,
+                          psk0, psk1, renc, rctx, ctx1)@e
+     & E2EPostRotationRequestAccepted(client_id, device_id,
+                                     post_rid, ctx2, psk1, enc2, c02)@f
+     & #a < #b & #b < #c & #c < #d & #d < #e & #e < #f"
+
+end

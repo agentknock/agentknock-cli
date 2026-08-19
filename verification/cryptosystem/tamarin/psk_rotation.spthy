@@ -1,0 +1,427 @@
+/*
+ * Agentknock v1: PSK rotation, overlap, confirmation, and retained exchanges.
+ *
+ * The active binding is explicit linear state.  Separate flag/value fields
+ * represent one pending client encapsulation and at most one immediately
+ * previous device generation.  All request accepts
+ * atomically install a response cache and retain their original context.
+ * HPKE's KEM is an ideal public-key encapsulation aenc(kem_seed,pkD);
+ * concrete HPKE/KEM security remains assumption O01.
+ */
+
+theory Agentknock_PSK_Rotation
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  response_kdf/4
+
+rule RegisterDevice:
+  [ Fr(~skD), Fr(~device_id) ]
+  --[ DeviceRegistered(~device_id, pk(~skD)) ]->
+  [ !DeviceIdentity(~device_id, ~skD),
+    !PublicDevice(~device_id, pk(~skD)),
+    Out(< 'device_public', ~device_id, pk(~skD) >) ]
+
+/* One registered device may hold arbitrarily many independently indexed bindings. */
+rule EstablishActiveBinding:
+  [ !DeviceIdentity(device_id, skD), Fr(~client_id), Fr(~psk0) ]
+  --[ ActiveBindingEstablished(~client_id, device_id, ~psk0) ]->
+  [ ClientBinding(~client_id, device_id, pk(skD),
+                  ~psk0, 'none', 'none'),
+    DeviceBinding(~client_id, device_id, skD,
+                  ~psk0, 'none', 'none'),
+    Out(< 'binding_public', ~client_id, device_id, pk(skD) >) ]
+
+/* A client rotates only from the no-pending state. */
+rule ClientStartsRotation:
+  let rinfo = hpke_info('agentknock-v1', device_id,
+                        'zero_request_id')
+      rctx  = psk_context(~rotation_seed, old_psk,
+                          client_id, rinfo)
+      renc  = aenc(~rotation_seed, pkD)
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  old_psk, 'none', 'none'),
+    Fr(~rotation_seed) ]
+  --[ ClientRotationStarted(client_id, device_id, old_psk,
+                            new_psk, renc, rctx),
+      ClientBindingChanged(client_id, device_id, old_psk, new_psk) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc),
+    !ClientRotationRecord(client_id, device_id,
+                          old_psk, new_psk, renc, rctx) ]
+
+/* Every request while pending uses the successor and repeats the fixed renc. */
+rule ClientSendsPendingRotationRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx  = psk_context(~request_seed, new_psk,
+                         client_id, info)
+      enc  = aenc(~request_seed, pkD)
+      c0   = senc(~request_plaintext, record_key(ctx, 'record_0'))
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', rotation_enc),
+    !ClientRotationRecord(client_id, device_id,
+                          old_psk, new_psk, rotation_enc, rotation_ctx),
+    Fr(~request_id), Fr(~request_seed), Fr(~request_plaintext) ]
+  --[ ClientPendingRequestSent(client_id, device_id, ~request_id,
+                              new_psk, rotation_enc,
+                              enc, c0, ctx, ~request_plaintext),
+      HonestRequestID(~request_id) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', rotation_enc),
+    ClientWaitResponse(client_id, device_id, ~request_id,
+                       new_psk, enc, ctx, 'pending', rotation_enc),
+    ClientCompletionReady(client_id, device_id, ~request_id,
+                          new_psk, ctx),
+    Out(< 'paired_request', client_id, ~request_id,
+          'agentknock-v1', enc, c0, rotation_enc >) ]
+
+rule ClientSendsOrdinaryRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx  = psk_context(~request_seed, current_psk,
+                         client_id, info)
+      enc  = aenc(~request_seed, pkD)
+      c0   = senc(~request_plaintext, record_key(ctx, 'record_0'))
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  current_psk, 'none', 'none'),
+    Fr(~request_id), Fr(~request_seed), Fr(~request_plaintext) ]
+  --[ ClientOrdinaryRequestSent(client_id, device_id, ~request_id,
+                               current_psk, enc, c0, ctx,
+                               ~request_plaintext),
+      HonestRequestID(~request_id) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  current_psk, 'none', 'none'),
+    ClientWaitResponse(client_id, device_id, ~request_id,
+                       current_psk, enc, ctx, 'none', 'none'),
+    ClientCompletionReady(client_id, device_id, ~request_id,
+                          current_psk, ctx),
+    Out(< 'paired_request', client_id, ~request_id,
+          'agentknock-v1', enc, c0, 'no_rotation' >) ]
+
+/*
+ * Step 1: authentication under current_psk ignores the optional rotation
+ * field.  The rule preserves the device binding exactly.
+ */
+rule DeviceAcceptsUnderCurrentPSK:
+  let info = hpke_info('agentknock-v1', device_id, request_id)
+      ctx  = psk_context(kem_seed, current_psk, client_id, info)
+      enc  = aenc(kem_seed, pk(skD))
+      c0   = senc(request_plaintext, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key  = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response_plaintext, <key, nonce>)
+      response_msg = <~response_random, response_ct>
+  in
+  [ DeviceBinding(client_id, device_id, skD, current_psk,
+                  previous_flag, previous_psk),
+    In(< 'paired_request', client_id, request_id,
+         'agentknock-v1', enc, c0, rotation_field >),
+    Fr(~response_random), Fr(~response_plaintext) ]
+  --[ DeviceCurrentRequestAccepted(client_id, device_id, request_id,
+                                  current_psk, rotation_field, ctx),
+      DeviceRequestAccepted(client_id, device_id, request_id,
+                            current_psk, 'current', rotation_field,
+                            enc, c0, ctx, request_plaintext),
+      DeviceResponseFixed(client_id, request_id, current_psk,
+                          ctx, response_msg, ~response_plaintext),
+      ResponseReleased(client_id, device_id, request_id, response_msg) ]->
+  [ DeviceBinding(client_id, device_id, skD, current_psk,
+                  previous_flag, previous_psk),
+    DeviceWaitCompletion(client_id, device_id, request_id,
+                         current_psk, ctx),
+    !ResponseCache(client_id, device_id, request_id, response_msg),
+    Out(< 'paired_response', client_id, request_id,
+          ~response_random, response_ct >) ]
+
+/* Step 2: the immediately previous PSK authorizes only an ordinary open. */
+rule DeviceAcceptsUnderPreviousPSK:
+  let info = hpke_info('agentknock-v1', device_id, request_id)
+      ctx  = psk_context(kem_seed, old_psk, client_id, info)
+      enc  = aenc(kem_seed, pk(skD))
+      c0   = senc(request_plaintext, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key  = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response_plaintext, <key, nonce>)
+      response_msg = <~response_random, response_ct>
+  in
+  [ DeviceBinding(client_id, device_id, skD,
+                  current_psk, 'previous', old_psk),
+    In(< 'paired_request', client_id, request_id,
+         'agentknock-v1', enc, c0, rotation_field >),
+    Fr(~response_random), Fr(~response_plaintext) ]
+  --[ DevicePreviousRequestAccepted(client_id, device_id, request_id,
+                                   current_psk, old_psk,
+                                   rotation_field, ctx),
+      DeviceRequestAccepted(client_id, device_id, request_id,
+                            old_psk, 'previous', rotation_field,
+                            enc, c0, ctx, request_plaintext),
+      DeviceResponseFixed(client_id, request_id, old_psk,
+                          ctx, response_msg, ~response_plaintext),
+      ResponseReleased(client_id, device_id, request_id, response_msg) ]->
+  [ DeviceBinding(client_id, device_id, skD,
+                  current_psk, 'previous', old_psk),
+    DeviceWaitCompletion(client_id, device_id, request_id, old_psk, ctx),
+    !ResponseCache(client_id, device_id, request_id, response_msg),
+    Out(< 'paired_response', client_id, request_id,
+          ~response_random, response_ct >) ]
+
+/*
+ * Steps 3-6: derive from current_psk and the supplied encapsulation, then
+ * commit it only because the ordinary request record opens under candidate.
+ * Any older previous_state is atomically replaced by previous(current_psk).
+ */
+rule DeviceAuthenticatesAndAdoptsCandidate:
+  let rinfo = hpke_info('agentknock-v1', device_id,
+                        'zero_request_id')
+      rctx  = psk_context(rotation_seed, current_psk,
+                          client_id, rinfo)
+      rotation_enc = aenc(rotation_seed, pk(skD))
+      candidate_psk = exporter(rctx, 'agentknock-v1 psk')
+      info = hpke_info('agentknock-v1', device_id, request_id)
+      ctx  = psk_context(request_seed, candidate_psk, client_id, info)
+      enc  = aenc(request_seed, pk(skD))
+      c0   = senc(request_plaintext, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key  = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response_plaintext, <key, nonce>)
+      response_msg = <~response_random, response_ct>
+  in
+  [ DeviceBinding(client_id, device_id, skD, current_psk,
+                  previous_flag, previous_psk),
+    In(< 'paired_request', client_id, request_id,
+         'agentknock-v1', enc, c0, rotation_enc >),
+    Fr(~response_random), Fr(~response_plaintext) ]
+  --[ DeviceCandidateAdopted(client_id, device_id, request_id,
+                            current_psk, candidate_psk,
+                            rotation_enc, rctx, ctx,
+                            <previous_flag, previous_psk>),
+      DeviceBindingChanged(client_id, device_id,
+                           current_psk, candidate_psk),
+      DeviceBindingMutation(client_id, device_id),
+      DeviceRequestAccepted(client_id, device_id, request_id,
+                            candidate_psk, 'candidate', rotation_enc,
+                            enc, c0, ctx, request_plaintext),
+      DeviceResponseFixed(client_id, request_id, candidate_psk,
+                          ctx, response_msg, ~response_plaintext),
+      ResponseReleased(client_id, device_id, request_id, response_msg) ]->
+  [ DeviceBinding(client_id, device_id, skD,
+                  candidate_psk, 'previous', current_psk),
+    DeviceWaitCompletion(client_id, device_id, request_id,
+                         candidate_psk, ctx),
+    !ResponseCache(client_id, device_id, request_id, response_msg),
+    Out(< 'paired_response', client_id, request_id,
+          ~response_random, response_ct >) ]
+
+/* The overlap has a fixed endpoint; use never recreates or extends it. */
+rule DeviceExpiresPreviousPSK:
+  [ DeviceBinding(client_id, device_id, skD,
+                  current_psk, 'previous', old_psk) ]
+  --[ PreviousPSKExpired(client_id, device_id,
+                        current_psk, old_psk),
+      DeviceBindingMutation(client_id, device_id) ]->
+  [ DeviceBinding(client_id, device_id, skD,
+                  current_psk, 'none', 'none') ]
+
+/* Invalidation consumes all authority for new requests. */
+rule DeviceInvalidatesBinding:
+  [ DeviceBinding(client_id, device_id, skD, current_psk,
+                  previous_flag, previous_psk) ]
+  --[ BindingInvalidated(client_id, device_id,
+                        current_psk, <previous_flag, previous_psk>),
+      DeviceBindingMutation(client_id, device_id) ]->
+  [ !InvalidatedBinding(client_id, device_id) ]
+
+rule RedeliverFixedResponse:
+  [ !ResponseCache(client_id, device_id, request_id,
+                   <response_random, response_ct>),
+    In(< 'routed_request_candidate', device_id, client_id,
+         request_id, candidate_envelope >) ]
+  --[ ResponseRedelivered(client_id, device_id, request_id,
+                          <response_random, response_ct>),
+      ResponseReleased(client_id, device_id, request_id,
+                       <response_random, response_ct>) ]->
+  [ Out(< 'paired_response', client_id, request_id,
+          response_random, response_ct >) ]
+
+/*
+ * Confirmation clears only the still-matching pending encapsulation.  The
+ * response pattern is bound to the saved request context.
+ */
+rule ClientAcceptsResponseAndConfirmsMatchingRotation:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  used_psk, 'pending', rotation_enc),
+    ClientWaitResponse(client_id, device_id, request_id,
+                       used_psk, enc, ctx, 'pending', rotation_enc),
+    In(< 'paired_response', client_id, request_id, response_random,
+         senc(response_plaintext, <key, nonce>) >) ]
+  --[ ClientResponseAccepted(client_id, device_id, request_id,
+                             used_psk, ctx, response_plaintext),
+      ClientRotationConfirmed(client_id, device_id, request_id,
+                              used_psk, rotation_enc) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  used_psk, 'none', 'none') ]
+
+/* A late response when no rotation is pending cannot alter binding state. */
+rule ClientAcceptsResponseWithNoPendingRotation:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  current_psk, 'none', 'none'),
+    ClientWaitResponse(client_id, device_id, request_id,
+                       used_psk, enc, ctx, carried_flag, carried_enc),
+    In(< 'paired_response', client_id, request_id, response_random,
+         senc(response_plaintext, <key, nonce>) >) ]
+  --[ ClientResponseAccepted(client_id, device_id, request_id,
+                             used_psk, ctx, response_plaintext),
+      ResponseDidNotConfirmRotation(client_id, request_id,
+                                    <carried_flag, carried_enc>) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  current_psk, 'none', 'none') ]
+
+/* A response from another request cannot clear a newer pending rotation. */
+rule ClientAcceptsResponseWithoutClearingDifferentRotation:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  current_psk, 'pending', current_rotation_enc),
+    ClientWaitResponse(client_id, device_id, request_id,
+                       used_psk, enc, ctx, carried_flag, carried_enc),
+    In(< 'paired_response', client_id, request_id, response_random,
+         senc(response_plaintext, <key, nonce>) >) ]
+  --[ Neq(<'pending', current_rotation_enc>,
+          <carried_flag, carried_enc>),
+      ClientResponseAccepted(client_id, device_id, request_id,
+                             used_psk, ctx, response_plaintext),
+      ResponseDidNotConfirmRotation(client_id, request_id,
+                                    <carried_flag, carried_enc>) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  current_psk, 'pending', current_rotation_enc) ]
+
+/* Retained request context accepts record 1 independently of current state. */
+rule ClientSendsCompletion:
+  let c1 = senc(~completion_plaintext, record_key(ctx, 'record_1'))
+  in
+  [ ClientCompletionReady(client_id, device_id, request_id,
+                          used_psk, ctx),
+    Fr(~completion_plaintext) ]
+  --[ ClientCompletionSent(client_id, device_id, request_id,
+                          used_psk, ctx, ~completion_plaintext) ]->
+  [ Out(< 'paired_completion', client_id, request_id, c1 >) ]
+
+rule DeviceAcceptsRetainedCompletion:
+  [ DeviceWaitCompletion(client_id, device_id, request_id,
+                         used_psk, ctx),
+    In(< 'paired_completion', client_id, request_id,
+         senc(completion_plaintext, record_key(ctx, 'record_1')) >) ]
+  --[ DeviceRetainedCompletionAccepted(client_id, device_id,
+                                       request_id, used_psk,
+                                       ctx, completion_plaintext) ]->
+  [ !CompletionDisposition(client_id, device_id,
+                           request_id, 'accepted') ]
+
+/* ---------------------- Restrictions / state semantics ---------------- */
+
+restriction UnequalMeansUnequal:
+  "All x #i. Neq(x, x)@i ==> F"
+
+restriction UniqueDeviceRequestSlot:
+  "All client_id device_id request_id psk1 class1 rot1 enc1 c01 ctx1 x1
+       psk2 class2 rot2 enc2 c02 ctx2 x2 #i #j.
+     DeviceRequestAccepted(client_id, device_id, request_id,
+                           psk1, class1, rot1, enc1, c01, ctx1, x1)@i
+   & DeviceRequestAccepted(client_id, device_id, request_id,
+                           psk2, class2, rot2, enc2, c02, ctx2, x2)@j
+   ==> #i = #j"
+
+/* ----------------------- Device candidate handling (R02-R04) ---------- */
+
+lemma R02_adoption_requires_candidate_authenticated_request:
+  "All client_id device_id rid old new renc rctx ctx prev #i.
+       DeviceCandidateAdopted(client_id, device_id, rid,
+                             old, new, renc, rctx, ctx, prev)@i
+     ==> new = exporter(rctx, 'agentknock-v1 psk')
+       & (Ex enc c0 request #j.
+            DeviceRequestAccepted(client_id, device_id, rid,
+                                  new, 'candidate', renc,
+                                  enc, c0, ctx, request)@j
+          & #j = #i)"
+
+lemma R03_no_bare_rotation_state_change:
+  "All client_id device_id rid old new renc rctx ctx prev #i.
+       DeviceCandidateAdopted(client_id, device_id, rid,
+                             old, new, renc, rctx, ctx, prev)@i
+     ==> not (renc = 'no_rotation')"
+
+lemma R04_current_psk_success_ignores_rotation_field:
+  "All client_id device_id rid psk rotation ctx #i.
+     DeviceCurrentRequestAccepted(client_id, device_id, rid,
+                                    psk, rotation, ctx)@i
+     ==> not (Ex old new other_rotation rctx ctx2 prev #j.
+                 DeviceCandidateAdopted(client_id, device_id, rid,
+                                        old, new, other_rotation,
+                                        rctx, ctx2, prev)@j)"
+
+/* --------------------------- Previous overlap (R05/R08) --------------- */
+
+lemma R05_previous_request_does_not_rotate:
+  "All client_id device_id rid current old rotation ctx #i.
+       DevicePreviousRequestAccepted(client_id, device_id, rid,
+                                     current, old, rotation, ctx)@i
+     ==> not (Ex prior_current new other_rotation rctx ctx2 prev #j.
+                 DeviceCandidateAdopted(client_id, device_id, rid,
+                                        prior_current, new, other_rotation,
+                                        rctx, ctx2, prev)@j)"
+
+lemma R08_second_rotation_replaces_previous_state:
+  "All client_id device_id rid old new renc rctx ctx previous_state #i.
+       DeviceCandidateAdopted(client_id, device_id, rid,
+                             old, new, renc, rctx,
+                             ctx, previous_state)@i
+     ==> (Ex #j. DeviceBindingChanged(client_id, device_id,
+                                     old, new)@j & #j = #i)"
+
+/* ----------------- Active binding, invalidation, isolation (R09) ------- */
+
+lemma R09_rotation_changes_only_selected_binding:
+  "All client_id device_id old new #i.
+       DeviceBindingChanged(client_id, device_id, old, new)@i
+     ==> not (old = new)"
+
+/* ----------------------- Retained context across rotation (X08) -------- */
+
+lemma X08_completion_uses_accepted_request_generation:
+  "All client_id device_id rid used_psk ctx completion #i.
+       DeviceRetainedCompletionAccepted(client_id, device_id, rid,
+                                        used_psk, ctx, completion)@i
+     ==> (Ex class rotation enc c0 request #j.
+            DeviceRequestAccepted(client_id, device_id, rid,
+                                  used_psk, class, rotation,
+                                  enc, c0, ctx, request)@j
+          & #j < #i)"
+
+lemma honest_request_id_is_not_rotation_reserved_id:
+  "All request_id #i.
+       HonestRequestID(request_id)@i
+     ==> not (request_id = 'zero_request_id')"
+
+end

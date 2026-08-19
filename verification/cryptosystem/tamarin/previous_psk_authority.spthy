@@ -1,0 +1,60 @@
+/* Agentknock v1: a compromised previous PSK retains ordinary authority (R05). */
+
+theory Agentknock_Previous_PSK_Authority
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2
+
+rule EstablishOverlap:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id),
+    Fr(~current_psk), Fr(~old_psk) ]
+  -->
+  [ !PublicDevice(~device_id, pk(~skD)),
+    !PreviousPSKCopy(~client_id, ~device_id, ~old_psk),
+    DeviceOverlap(~client_id, ~device_id, ~skD,
+                  ~current_psk, ~old_psk) ]
+
+rule RevealPreviousPSK:
+  [ !PreviousPSKCopy(client_id, device_id, old_psk) ]
+  --[ PreviousPSKRevealed(client_id, device_id, old_psk) ]->
+  [ !CompromisedPreviousPSK(client_id, device_id, old_psk),
+    Out(old_psk) ]
+
+rule CompromisedPreviousSendsOrdinaryRequest:
+  let ctx = psk_context(~request_seed, old_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc('attacker_previous_request', record_key(ctx, 'record_0'))
+  in
+  [ !CompromisedPreviousPSK(client_id, device_id, old_psk),
+    !PublicDevice(device_id, pkD),
+    Fr(~request_seed), Fr(~request_id) ]
+  -->
+  [ PreviousOrdinaryWire(client_id, device_id, ~request_id, enc, c0) ]
+
+rule DeviceAcceptsPreviousOrdinaryRequest:
+  let ctx = psk_context(request_seed, old_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc('attacker_previous_request', record_key(ctx, 'record_0'))
+  in
+  [ DeviceOverlap(client_id, device_id, skD, current_psk, old_psk),
+    PreviousOrdinaryWire(client_id, device_id, request_id, enc, c0) ]
+  --[ DevicePreviousRequestAccepted(client_id, device_id, request_id,
+                                    current_psk, old_psk,
+                                    'no_rotation', ctx) ]->
+  [ ]
+
+lemma R05_previous_ordinary_use_is_executable:
+  exists-trace
+  "Ex client_id device_id old current rid rotation ctx #i #j.
+       PreviousPSKRevealed(client_id, device_id, old)@i
+     & DevicePreviousRequestAccepted(client_id, device_id, rid,
+                                     current, old, rotation, ctx)@j"
+
+end

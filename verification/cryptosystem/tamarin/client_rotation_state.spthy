@@ -1,0 +1,78 @@
+/*
+ * Agentknock v1: client-side pending-rotation state (R01).
+ *
+ * The exact successor HPKE/KDF terms are retained, while device acceptance
+ * and response cryptography remain in psk_rotation.spthy.  This focused
+ * transition system proves the client-only serialization claims without the
+ * unrelated Dolev--Yao deconstruction chains of the device model.
+ */
+
+theory Agentknock_Client_Rotation_State
+begin
+
+builtins: asymmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  exporter/2
+
+rule EstablishActiveBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk) ]
+  -->
+  [ ClientBinding(~client_id, ~device_id, pk(~skD),
+                  ~psk, 'none', 'none') ]
+
+rule ClientStartsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+  in
+  [ ClientBinding(client_id, device_id, pkD,
+                  old_psk, 'none', 'none'),
+    Fr(~rotation_seed) ]
+  --[ ClientRotationStarted(client_id, device_id, old_psk,
+                            new_psk, renc, rctx) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc),
+    !ClientRotationRecord(client_id, device_id,
+                          old_psk, new_psk, renc, rctx) ]
+
+rule ClientSendsPendingRequest:
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc),
+    !ClientRotationRecord(client_id, device_id,
+                          old_psk, new_psk, renc, rctx),
+    Fr(~request_id) ]
+  --[ ClientPendingRequestSent(client_id, device_id,
+                              ~request_id, new_psk, renc) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc) ]
+
+rule ClientConfirmsRotation:
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'pending', renc),
+    Fr(~request_id) ]
+  --[ ClientRotationConfirmed(client_id, device_id,
+                              ~request_id, new_psk, renc) ]->
+  [ ClientBinding(client_id, device_id, pkD,
+                  new_psk, 'none', 'none') ]
+
+lemma R01_successor_is_export_of_one_rotation_context:
+  "All client_id device_id old new renc rctx #i.
+       ClientRotationStarted(client_id, device_id,
+                             old, new, renc, rctx)@i
+     ==> new = exporter(rctx, 'agentknock-v1 psk')"
+
+lemma R01_pending_requests_repeat_fixed_encapsulation [use_induction]:
+  "All client_id device_id rid psk renc #i.
+       ClientPendingRequestSent(client_id, device_id,
+                               rid, psk, renc)@i
+     ==> (Ex old rctx #j.
+            ClientRotationStarted(client_id, device_id,
+                                  old, psk, renc, rctx)@j
+          & #j < #i)"
+
+end

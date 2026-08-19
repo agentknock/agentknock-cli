@@ -1,0 +1,85 @@
+(**
+  Negative control for X04/X05.
+
+  This deliberately omits version_info from the HPKE info.  The device still
+  accepts a public outer version field, so the relay can relabel an honest v1
+  ciphertext as v2 and violate version agreement.
+*)
+
+set preciseActions = true.
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free request_tag: bitstring.
+free version_v1: bitstring.
+free version_v2: bitstring.
+free sequence_zero: record_sequence.
+free request_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun flawed_hpke_info(bitstring, bitstring): bitstring.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+
+event ClientSend(bitstring, bitstring, bitstring, bitstring, bitstring).
+event DeviceAccept(bitstring, bitstring, bitstring, bitstring, bitstring).
+
+(** Expected attack: an honest v1 record is accepted under the v2 label. *)
+query version: bitstring, did: bitstring, cid: bitstring,
+      rid: bitstring, message: bitstring;
+  event(DeviceAccept(version, did, cid, rid, message)) ==>
+  event(ClientSend(version, did, cid, rid, message)).
+
+let Client(
+  public_key: device_public_key, device_id: bitstring,
+  client_id: bitstring, binding_psk: psk
+) =
+  new request_id: bitstring;
+  new ephemeral_key: ephemeral_secret_key;
+  let enc = encapsulate(ephemeral_key) in
+  let info = flawed_hpke_info(device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_sender(ephemeral_key, public_key), binding_psk, client_id, info
+  ) in
+  let ciphertext = hpke_seal(request_plaintext, context, sequence_zero) in
+  event ClientSend(version_v1, device_id, client_id, request_id, request_plaintext);
+  out(network,
+    (request_tag, client_id, request_id, version_v1, enc, ciphertext)).
+
+let Device(
+  secret_key: device_secret_key, device_id: bitstring,
+  binding_psk: psk
+) =
+  in(network,
+    (=request_tag, client_id: bitstring, request_id: bitstring,
+     version: bitstring, enc: encapsulated_key, ciphertext: bitstring));
+  let info = flawed_hpke_info(device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_receiver(enc, secret_key), binding_psk, client_id, info
+  ) in
+  let message = hpke_open(ciphertext, context, sequence_zero) in
+  event DeviceAccept(version, device_id, client_id, request_id, message).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  new client_id: bitstring;
+  new binding_psk: psk;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id, public_key));
+  ((!Client(public_key, device_id, client_id, binding_psk)) |
+   (!Device(secret_key, device_id, binding_psk)))

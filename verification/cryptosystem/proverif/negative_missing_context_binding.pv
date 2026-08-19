@@ -1,0 +1,84 @@
+(**
+  Negative control for X04/X05.
+
+  This deliberately omits device_id and request_id from HPKE info and replaces
+  psk_id/client_id with one public constant.  Two device aliases share the
+  same key and PSK so an intercepted ciphertext can be re-routed across device,
+  client, and request slots.  The correspondence query must fail.
+*)
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free version_v1: bitstring.
+free request_tag: bitstring.
+free deliberately_unbound_info: bitstring.
+free deliberately_unbound_psk_id: bitstring.
+free sequence_zero: record_sequence.
+free request_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+
+event ClientSendRequest(bitstring, bitstring, bitstring, bitstring).
+event DeviceAcceptRequest(bitstring, bitstring, bitstring, bitstring).
+
+(** Expected attack: routing substitution changes all three unbound IDs. *)
+query did: bitstring, cid: bitstring, rid: bitstring, message: bitstring;
+  event(DeviceAcceptRequest(did, cid, rid, message)) ==>
+  event(ClientSendRequest(did, cid, rid, message)).
+
+let Client(public_key: device_public_key, device_id: bitstring, binding_psk: psk) =
+  new client_id: bitstring;
+  new request_id: bitstring;
+  new ephemeral_key: ephemeral_secret_key;
+  let enc = encapsulate(ephemeral_key) in
+  let context = hpke_psk_context(
+    kem_sender(ephemeral_key, public_key), binding_psk,
+    deliberately_unbound_psk_id, deliberately_unbound_info
+  ) in
+  let ciphertext = hpke_seal(
+    request_plaintext, context, sequence_zero
+  ) in
+  event ClientSendRequest(
+    device_id, client_id, request_id, request_plaintext
+  );
+  out(network,
+    (request_tag, device_id, client_id, request_id,
+     version_v1, enc, ciphertext)).
+
+let Device(secret_key: device_secret_key, device_id: bitstring, binding_psk: psk) =
+  in(network,
+    (=request_tag, =device_id, client_id: bitstring, request_id: bitstring,
+     =version_v1, enc: encapsulated_key, ciphertext: bitstring));
+  let context = hpke_psk_context(
+    kem_receiver(enc, secret_key), binding_psk,
+    deliberately_unbound_psk_id, deliberately_unbound_info
+  ) in
+  let request = hpke_open(ciphertext, context, sequence_zero) in
+  event DeviceAcceptRequest(device_id, client_id, request_id, request).
+
+process
+  new secret_key: device_secret_key;
+  new binding_psk: psk;
+  new device_id_a: bitstring;
+  new device_id_b: bitstring;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id_a, device_id_b, public_key));
+  (Client(public_key, device_id_a, binding_psk) |
+   (!Device(secret_key, device_id_a, binding_psk)) |
+   (!Device(secret_key, device_id_b, binding_psk)))

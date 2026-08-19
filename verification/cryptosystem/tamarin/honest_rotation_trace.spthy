@@ -1,0 +1,100 @@
+/* Agentknock v1: phase-indexed honest rotation/adoption/confirmation trace. */
+
+theory Agentknock_Honest_Rotation_Trace
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  response_kdf/4
+
+rule EstablishBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~old_psk) ]
+  -->
+  [ ClientReady(~client_id, ~device_id, pk(~skD), ~old_psk),
+    DeviceReady(~client_id, ~device_id, ~skD, ~old_psk) ]
+
+rule ClientStartsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+  in
+  [ ClientReady(client_id, device_id, pkD, old_psk),
+    Fr(~rotation_seed) ]
+  --[ ClientRotationStarted(client_id, device_id, old_psk,
+                            new_psk, renc, rctx) ]->
+  [ ClientPending(client_id, device_id, pkD,
+                  old_psk, new_psk, renc, rctx) ]
+
+rule ClientSendsRotationRequest:
+  let ctx = psk_context(~request_seed, new_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc(~request, record_key(ctx, 'record_0'))
+  in
+  [ ClientPending(client_id, device_id, pkD,
+                  old_psk, new_psk, renc, rctx),
+    Fr(~request_id), Fr(~request_seed), Fr(~request) ]
+  -->
+  [ ClientWaitResponse(client_id, device_id, ~request_id,
+                       new_psk, renc, enc, ctx),
+    RotationRequestWire(client_id, device_id, ~request_id,
+                        enc, c0, renc) ]
+
+rule DeviceAdoptsCandidate:
+  let rctx = psk_context(rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(rotation_seed, pk(skD))
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(request_seed, new_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc(request, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response, <key, nonce>)
+  in
+  [ DeviceReady(client_id, device_id, skD, old_psk),
+    RotationRequestWire(client_id, device_id, request_id,
+                        enc, c0, renc),
+    Fr(~response_random), Fr(~response) ]
+  --[ DeviceCandidateAdopted(client_id, device_id, request_id,
+                            old_psk, new_psk, renc, rctx, ctx,
+                            <'none', 'none'>) ]->
+  [ RotationResponseWire(client_id, device_id, request_id,
+                         new_psk, renc, ctx,
+                         ~response_random, response_ct) ]
+
+rule ClientConfirmsRotation:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientWaitResponse(client_id, device_id, request_id,
+                       new_psk, renc, enc, ctx),
+    RotationResponseWire(client_id, device_id, request_id,
+                         new_psk, renc, ctx, response_random,
+                         senc(response, <key, nonce>)) ]
+  --[ ClientRotationConfirmed(client_id, device_id,
+                              request_id, new_psk, renc) ]->
+  [ ]
+
+lemma R00_honest_rotation_and_confirmation_executable:
+  exists-trace
+  "Ex client_id device_id old new renc rid rctx ctx previous_state #i #j #k.
+       ClientRotationStarted(client_id, device_id,
+                             old, new, renc, rctx)@i
+     & DeviceCandidateAdopted(client_id, device_id, rid,
+                             old, new, renc, rctx, ctx, previous_state)@j
+     & ClientRotationConfirmed(client_id, device_id, rid,
+                               new, renc)@k"
+
+end

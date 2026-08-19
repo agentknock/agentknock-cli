@@ -1,0 +1,253 @@
+// Agentknock v1 initial pairing, SAS gate, and activation.
+//
+// HPKE is abstracted as KEM_ENCAP/KEM_DECAP followed by an HKDF key schedule
+// and distinct AEAD keys for records 0 and 1.  The guarded SAS messages model
+// the integrity of the out-of-band comparison, not secrecy of the displayed
+// digits.  Verifpal treats the SAS as collision-free and cannot quantify the
+// 12-digit guessing event.
+
+attacker[active]
+
+principal Client[
+	knows public version_info, base_salt, commitment_label, hpke_base_label
+	knows public hpke_psk_label, hpke_schedule_label, psk_export_label
+	knows public sas_label, response_label, response_key_label
+	knows public response_nonce_label
+	generates client_id, client_secret, pairing_application
+	commitment = HKDF(base_salt, client_secret, commitment_label)
+]
+
+Client -> Device: client_id, commitment
+
+principal Device[
+	knows public version_info, base_salt, commitment_label, hpke_base_label
+	knows public hpke_psk_label, hpke_schedule_label, psk_export_label
+	knows public sas_label, response_label, response_key_label
+	knows public response_nonce_label
+	knows private device_private_key
+	device_public_key = PUBKEY(device_private_key)
+	device_public_key_view = CONCAT(device_public_key, version_info)
+	generates device_id, device_random
+]
+
+// This response is deliberately unguarded, as required by the specification.
+Device -> Client: device_id, device_public_key, device_random
+
+principal Client[
+	received_device_public_key_view = CONCAT(device_public_key, version_info)
+	generates pairing_kem_random
+	base_kem_secret, pairing_enc = KEM_ENCAP(device_public_key, pairing_kem_random)
+	base_info = CONCAT(version_info, device_id, client_id)
+	base_context = HKDF(base_kem_secret, base_info, hpke_base_label)
+	base_record0_key, base_record1_key, base_exporter_root = HKDF(
+		base_context,
+		hpke_schedule_label,
+		nil
+	)
+	client_psk = HKDF(base_exporter_root, psk_export_label, nil)
+	secret_ciphertext = AEAD_ENC(base_record0_key, client_secret, nil)
+	pairing_application_ciphertext = AEAD_ENC(
+		base_record1_key,
+		pairing_application,
+		nil
+	)
+	sas_info_client = CONCAT(
+		sas_label,
+		device_id,
+		client_id,
+		device_public_key
+	)
+	sas_client = HKDF(device_random, client_secret, sas_info_client)
+]
+
+Client -> Device: pairing_enc, secret_ciphertext, pairing_application_ciphertext
+
+principal Device[
+	base_kem_secret_device = KEM_DECAP(device_private_key, pairing_enc)?
+	base_info_device = CONCAT(version_info, device_id, client_id)
+	base_context_device = HKDF(
+		base_kem_secret_device,
+		base_info_device,
+		hpke_base_label
+	)
+	base_record0_key_device, base_record1_key_device, base_exporter_root_device = HKDF(
+		base_context_device,
+		hpke_schedule_label,
+		nil
+	)
+	device_client_psk = HKDF(
+		base_exporter_root_device,
+		psk_export_label,
+		nil
+	)
+	client_secret_device = AEAD_DEC(
+		base_record0_key_device,
+		secret_ciphertext,
+		nil
+	)?
+	pairing_application_device = AEAD_DEC(
+		base_record1_key_device,
+		pairing_application_ciphertext,
+		nil
+	)?
+	recovered_commitment = HKDF(
+		base_salt,
+		client_secret_device,
+		commitment_label
+	)
+	_ = ASSERT(commitment, recovered_commitment)?
+	sas_info_device = CONCAT(sas_label, device_id, client_id, device_public_key)
+	sas_device = HKDF(device_random, client_secret_device, sas_info_device)
+]
+
+// These two guarded transmissions stand for the user's bilateral OOB compare.
+Client -> Device: [sas_client]
+
+principal Device[
+	_ = ASSERT(sas_client, sas_device)?
+]
+
+Device -> Client: [sas_device]
+
+principal Client[
+	_ = ASSERT(sas_device, sas_client)?
+	generates activation_request_id, activation_kem_random
+	generates activation_request_plaintext, activation_completion_plaintext
+	activation_kem_secret, activation_enc = KEM_ENCAP(
+		device_public_key,
+		activation_kem_random
+	)
+	activation_info = CONCAT(version_info, device_id, activation_request_id)
+	activation_binding = CONCAT(
+		hpke_psk_label,
+		activation_info,
+		client_id
+	)
+	activation_request_key, activation_completion_key, activation_exporter_root = HKDF(
+		CONCAT(activation_kem_secret, client_psk),
+		activation_binding,
+		hpke_schedule_label
+	)
+	activation_exporter = HKDF(activation_exporter_root, response_label, nil)
+	activation_request_ciphertext = AEAD_ENC(
+		activation_request_key,
+		activation_request_plaintext,
+		nil
+	)
+]
+
+Client -> Device: activation_request_id, activation_enc, activation_request_ciphertext
+
+principal Device[
+	activation_kem_secret_device = KEM_DECAP(
+		device_private_key,
+		activation_enc
+	)?
+	activation_info_device = CONCAT(
+		version_info,
+		device_id,
+		activation_request_id
+	)
+	activation_binding_device = CONCAT(
+		hpke_psk_label,
+		activation_info_device,
+		client_id
+	)
+	activation_request_key_device, activation_completion_key_device, activation_exporter_root_device = HKDF(
+		CONCAT(activation_kem_secret_device, device_client_psk),
+		activation_binding_device,
+		hpke_schedule_label
+	)
+	activation_exporter_device = HKDF(
+		activation_exporter_root_device,
+		response_label,
+		nil
+	)
+	activation_request_plaintext_device = AEAD_DEC(
+		activation_request_key_device,
+		activation_request_ciphertext,
+		nil
+	)?
+	generates activation_response_plaintext, activation_response_random
+	activation_response_salt = CONCAT(activation_enc, activation_response_random)
+	activation_response_key = HKDF(
+		activation_response_salt,
+		activation_exporter_device,
+		response_key_label
+	)
+	activation_response_nonce = HKDF(
+		activation_response_salt,
+		activation_exporter_device,
+		response_nonce_label
+	)
+	activation_response_material = CONCAT(
+		activation_response_key,
+		activation_response_nonce
+	)
+	activation_response_ciphertext = AEAD_ENC(
+		activation_response_material,
+		activation_response_plaintext,
+		nil
+	)
+]
+
+Device -> Client: activation_response_random, activation_response_ciphertext
+
+principal Client[
+	activation_response_salt_client = CONCAT(
+		activation_enc,
+		activation_response_random
+	)
+	activation_response_key_client = HKDF(
+		activation_response_salt_client,
+		activation_exporter,
+		response_key_label
+	)
+	activation_response_nonce_client = HKDF(
+		activation_response_salt_client,
+		activation_exporter,
+		response_nonce_label
+	)
+	activation_response_material_client = CONCAT(
+		activation_response_key_client,
+		activation_response_nonce_client
+	)
+	activation_response_plaintext_client = AEAD_DEC(
+		activation_response_material_client,
+		activation_response_ciphertext,
+		nil
+	)?
+	activation_completion_ciphertext = AEAD_ENC(
+		activation_completion_key,
+		activation_completion_plaintext,
+		nil
+	)
+]
+
+Client -> Device: activation_completion_ciphertext
+
+principal Device[
+	activation_completion_plaintext_device = AEAD_DEC(
+		activation_completion_key_device,
+		activation_completion_ciphertext,
+		nil
+	)?
+]
+
+queries[
+	// P04/P05 expected attacks: base mode precedes SAS authentication.
+	confidentiality? client_secret
+	confidentiality? pairing_application
+	equivalence? device_public_key_view, received_device_public_key_view
+
+	// P06/P07 and the activation instance of X01-X05.
+	confidentiality? activation_request_plaintext
+	confidentiality? activation_response_plaintext
+	confidentiality? activation_completion_plaintext
+	authentication? Client -> Device: activation_request_ciphertext
+	authentication? Device -> Client: activation_response_ciphertext
+	authentication? Client -> Device: activation_completion_ciphertext
+	equivalence? activation_request_plaintext, activation_request_plaintext_device
+	equivalence? activation_response_plaintext, activation_response_plaintext_client
+	equivalence? activation_completion_plaintext, activation_completion_plaintext_device
+]

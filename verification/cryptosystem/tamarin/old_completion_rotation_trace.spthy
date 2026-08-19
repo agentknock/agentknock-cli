@@ -1,0 +1,110 @@
+/*
+ * Agentknock v1: a retained completion from the old request generation remains
+ * valid after the binding rotates (X08).
+ *
+ * This is a focused, phase-indexed executability model.  It keeps the exact
+ * request, rotation, and completion schedules while omitting unrelated replay
+ * branches already covered by the active-attacker core theories.
+ */
+
+theory Agentknock_Old_Completion_Rotation_Trace
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2
+
+rule AcceptOldOrdinaryRequest:
+  let info = hpke_info('agentknock-v1', ~device_id, ~old_request_id)
+      old_ctx = psk_context(~old_request_seed, ~old_psk,
+                            ~client_id, info)
+      enc = aenc(~old_request_seed, pk(~skD))
+      c0 = senc(~old_request_plaintext,
+                record_key(old_ctx, 'record_0'))
+  in
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~old_psk),
+    Fr(~old_request_id), Fr(~old_request_seed),
+    Fr(~old_request_plaintext) ]
+  --[ DeviceRequestAccepted(~client_id, ~device_id, ~old_request_id,
+                            ~old_psk, 'current', 'no_rotation',
+                            enc, c0, old_ctx, ~old_request_plaintext) ]->
+  [ DeviceBinding(~client_id, ~device_id, ~skD,
+                  ~old_psk, 'none', 'none'),
+    DeviceWaitCompletion(~client_id, ~device_id, ~old_request_id,
+                         ~old_psk, old_ctx),
+    OldRequestRetained(~client_id, ~device_id, ~old_request_id,
+                       ~old_psk, old_ctx) ]
+
+rule AdoptSuccessorAfterOldRequest:
+  let rinfo = hpke_info('agentknock-v1', device_id,
+                        'zero_request_id')
+      rctx = psk_context(~rotation_seed, old_psk,
+                         client_id, rinfo)
+      renc = aenc(~rotation_seed, pk(skD))
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+      info = hpke_info('agentknock-v1', device_id, ~new_request_id)
+      new_ctx = psk_context(~new_request_seed, new_psk,
+                            client_id, info)
+      new_enc = aenc(~new_request_seed, pk(skD))
+      new_c0 = senc(~new_request_plaintext,
+                    record_key(new_ctx, 'record_0'))
+  in
+  [ DeviceBinding(client_id, device_id, skD,
+                  old_psk, 'none', 'none'),
+    OldRequestRetained(client_id, device_id, old_request_id,
+                       old_psk, old_ctx),
+    Fr(~rotation_seed), Fr(~new_request_id), Fr(~new_request_seed),
+    Fr(~new_request_plaintext) ]
+  --[ DeviceCandidateAdopted(client_id, device_id, ~new_request_id,
+                             old_psk, new_psk, renc,
+                             rctx, new_ctx, <'none', 'none'>),
+      DeviceRequestAccepted(client_id, device_id, ~new_request_id,
+                            new_psk, 'candidate', renc,
+                            new_enc, new_c0, new_ctx,
+                            ~new_request_plaintext) ]->
+  [ DeviceBinding(client_id, device_id, skD,
+                  new_psk, 'previous', old_psk),
+    OldCompletionAfterRotation(client_id, device_id, old_request_id,
+                               old_psk, old_ctx) ]
+
+rule SendOldCompletionAfterRotation:
+  [ OldCompletionAfterRotation(client_id, device_id, old_request_id,
+                               old_psk, old_ctx),
+    Fr(~completion_plaintext) ]
+  -->
+  [ OldCompletionWire(client_id, device_id, old_request_id,
+                      senc(~completion_plaintext,
+                           record_key(old_ctx, 'record_1'))) ]
+
+rule AcceptOldCompletionAfterRotation:
+  [ DeviceWaitCompletion(client_id, device_id, old_request_id,
+                         old_psk, old_ctx),
+    OldCompletionWire(client_id, device_id, old_request_id,
+                      senc(completion_plaintext,
+                           record_key(old_ctx, 'record_1'))) ]
+  --[ DeviceRetainedCompletionAccepted(client_id, device_id,
+                                       old_request_id, old_psk,
+                                       old_ctx, completion_plaintext) ]->
+  [ ]
+
+lemma X08_old_request_completion_after_rotation_executable:
+  exists-trace
+  "Ex client_id device_id old_rid old_psk old_ctx
+      new_rid new_psk completion class rotation enc c0 request
+      renc rctx new_ctx prev #i #j #k.
+       DeviceRequestAccepted(client_id, device_id, old_rid,
+                             old_psk, class, rotation,
+                             enc, c0, old_ctx, request)@i
+     & DeviceCandidateAdopted(client_id, device_id, new_rid,
+                             old_psk, new_psk, renc,
+                             rctx, new_ctx, prev)@j
+     & DeviceRetainedCompletionAccepted(client_id, device_id,
+                                        old_rid, old_psk,
+                                        old_ctx, completion)@k
+     & #i < #j & #j < #k"
+
+end

@@ -1,0 +1,461 @@
+/*
+ * Agentknock v1: ordinary paired request / response / completion exchange.
+ *
+ * The active binding is an input state established by the pairing theory.
+ * HPKE's KEM is represented by ideal public-key encapsulation of a fresh seed:
+ * aenc(kem_seed,pkD), recoverable with skD.  The PSK context constructor then
+ * binds that seed, info, and psk_id; record numbers, exporter labels,
+ * encapsulation, and the public response random remain explicit.  Concrete
+ * HPKE/KEM security is assumption O01.  State facts implement the normative
+ * one-slot transition and exact redelivery behavior.
+ */
+
+theory Agentknock_Paired_Exchange
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  response_kdf/4
+
+rule EstablishActiveBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk) ]
+  --[ ActiveBindingEstablished(~client_id, ~device_id,
+                              pk(~skD), ~psk) ]->
+  [ !DeviceIdentity(~device_id, ~skD),
+    !PublicDevice(~device_id, pk(~skD)),
+    !ClientActive(~client_id, ~device_id, pk(~skD), ~psk),
+    !DeviceActive(~client_id, ~device_id, ~skD, ~psk),
+    Out(< 'active_binding_public', ~client_id,
+          ~device_id, pk(~skD) >) ]
+
+rule RevealDeviceKey:
+  [ !DeviceIdentity(device_id, skD) ]
+  --[ DeviceKeyRevealed(device_id) ]->
+  [ Out(skD) ]
+
+rule RevealClientPSK:
+  [ !ClientActive(client_id, device_id, pkD, psk) ]
+  --[ ClientPSKRevealed(client_id, device_id, psk) ]->
+  [ !CompromisedPSK(client_id, device_id, psk), Out(psk) ]
+
+/*
+ * One fresh nonzero symbolic request_id and one sender context.  Fresh names
+ * stand for ULIDs after the implementation-defined validity/freshness check.
+ */
+rule ClientSendsRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx  = psk_context(~kem_seed, psk, client_id, info)
+      enc  = aenc(~kem_seed, pkD)
+      c0   = senc(~request_plaintext, record_key(ctx, 'record_0'))
+  in
+  [ !ClientActive(client_id, device_id, pkD, psk),
+    Fr(~request_id), Fr(~kem_seed), Fr(~request_plaintext) ]
+  --[ ClientRequestSent(client_id, device_id, ~request_id,
+                       enc, c0, ctx, ~request_plaintext),
+      HonestRequestID(~request_id),
+      HonestRequestSecret(client_id, device_id,
+                          ~request_id, ctx, ~request_plaintext) ]->
+  [ !ClientExchangeContext(client_id, device_id, ~request_id,
+                           enc, ctx),
+    ClientWaitResponse(client_id, device_id, ~request_id, enc, ctx),
+    ClientCompletionReady(client_id, device_id, ~request_id, enc, ctx),
+    Out(< 'paired_request', client_id, ~request_id,
+          'agentknock-v1', enc, c0, 'no_rotation' >) ]
+
+/* Explicit live sender-context compromise. */
+rule RevealClientExchangeContext:
+  [ !ClientExchangeContext(client_id, device_id, request_id, enc, ctx) ]
+  --[ ClientExchangeContextRevealed(client_id, device_id,
+                                    request_id, ctx) ]->
+  [ Out(ctx) ]
+
+/*
+ * Successful record-0 authentication, application processing, terminal
+ * response creation, and cache installation are one atomic rewrite.
+ */
+rule DeviceAcceptsRequestAndFixesResponse:
+  let info = hpke_info('agentknock-v1', device_id, request_id)
+      ctx  = psk_context(kem_seed, psk, client_id, info)
+      enc  = aenc(kem_seed, pk(skD))
+      c0   = senc(request_plaintext, record_key(ctx, 'record_0'))
+      response_secret = exporter(ctx, 'agentknock-v1 response')
+      key   = response_kdf(response_secret, enc, ~response_random, 'key')
+      nonce = response_kdf(response_secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response_plaintext, <key, nonce>)
+      response_msg = <~response_random, response_ct>
+  in
+  [ !DeviceActive(client_id, device_id, skD, psk),
+    In(< 'paired_request', client_id, request_id,
+         'agentknock-v1', enc, c0, rotation_field >),
+    Fr(~response_random), Fr(~response_plaintext) ]
+  --[ DeviceRequestAccepted(client_id, device_id, request_id,
+                            enc, c0, ctx, request_plaintext),
+      ApplicationRequestProcessed(client_id, request_id,
+                                  request_plaintext),
+      DeviceResponseFixed(client_id, device_id, request_id,
+                          enc, ctx, response_msg, ~response_plaintext),
+      ResponseKeyNonceUsed(client_id, request_id, key, nonce,
+                           ~response_plaintext),
+      ResponseReleased(client_id, device_id, request_id, response_msg) ]->
+  [ !AcceptedRequest(client_id, device_id, request_id,
+                     enc, c0, ctx, request_plaintext),
+    DeviceWaitCompletion(client_id, device_id, request_id, ctx),
+    !ResponseCache(client_id, device_id, request_id, response_msg),
+    Out(< 'paired_response', client_id, request_id,
+          ~response_random, response_ct >) ]
+
+/* Slot lookup precedes decoding: every later envelope returns cached bytes. */
+rule RedeliverFixedResponse:
+  [ !ResponseCache(client_id, device_id, request_id,
+                   <response_random, response_ct>),
+    In(< 'routed_request_candidate', device_id, client_id,
+         request_id, candidate_envelope >) ]
+  --[ ResponseRedelivered(client_id, device_id, request_id,
+                          <response_random, response_ct>),
+      ResponseReleased(client_id, device_id, request_id,
+                       <response_random, response_ct>) ]->
+  [ Out(< 'paired_response', client_id, request_id,
+          response_random, response_ct >) ]
+
+rule ClientAcceptsResponse:
+  let response_secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(response_secret, enc, response_random, 'key')
+      nonce = response_kdf(response_secret, enc, response_random, 'nonce')
+  in
+  [ ClientWaitResponse(client_id, device_id, request_id, enc, ctx),
+    In(< 'paired_response', client_id, request_id, response_random,
+         senc(response_plaintext, <key, nonce>) >) ]
+  --[ ClientResponseAccepted(client_id, device_id, request_id,
+                             enc, ctx, response_plaintext) ]->
+  [ !ClientResponseDisposition(client_id, request_id, 'accepted') ]
+
+rule IgnoreLaterResponse:
+  [ !ClientResponseDisposition(client_id, request_id, disposition),
+    In(< 'routed_response_candidate', client_id,
+         request_id, candidate_envelope >) ]
+  --[ LaterResponseIgnored(client_id, request_id, disposition) ]->
+  [ ]
+
+/* Completion is record 1 in the already-created request context. */
+rule ClientSendsCompletion:
+  let c1 = senc(~completion_plaintext, record_key(ctx, 'record_1'))
+  in
+  [ ClientCompletionReady(client_id, device_id, request_id, enc, ctx),
+    Fr(~completion_plaintext) ]
+  --[ ClientCompletionSent(client_id, device_id, request_id,
+                          ctx, c1, ~completion_plaintext),
+      HonestCompletionSecret(client_id, device_id, request_id,
+                             ctx, ~completion_plaintext) ]->
+  [ !CompletionCache(client_id, request_id, c1),
+    Out(< 'paired_completion', client_id, request_id, c1 >) ]
+
+rule RedeliverCompletion:
+  [ !CompletionCache(client_id, request_id, c1),
+    In(< 'completion_redelivery', client_id, request_id >) ]
+  --[ CompletionRedelivered(client_id, request_id, c1) ]->
+  [ Out(< 'paired_completion', client_id, request_id, c1 >) ]
+
+rule DeviceAcceptsCompletion:
+  [ DeviceWaitCompletion(client_id, device_id, request_id, ctx),
+    In(< 'paired_completion', client_id, request_id,
+         senc(completion_plaintext, record_key(ctx, 'record_1')) >) ]
+  --[ DeviceCompletionAccepted(client_id, device_id, request_id,
+                               ctx, completion_plaintext),
+      ApplicationCompletionProcessed(client_id, request_id,
+                                     completion_plaintext) ]->
+  [ !DeviceCompletionDisposition(client_id, device_id,
+                                 request_id, 'accepted') ]
+
+rule IgnoreLaterCompletion:
+  [ !DeviceCompletionDisposition(client_id, device_id,
+                                 request_id, disposition),
+    In(< 'routed_completion_candidate', device_id, client_id,
+         request_id, candidate_envelope >) ]
+  --[ LaterCompletionIgnored(client_id, device_id,
+                             request_id, disposition) ]->
+  [ ]
+
+/*
+ * A holder of the request context can construct a valid response.  This
+ * negative-control rule records the advertised non-property: the response is
+ * not a signature proving that the device, rather than the client, made it.
+ */
+rule ClientContextHolderConstructsResponse:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, ~fake_random, 'key')
+      nonce = response_kdf(secret, enc, ~fake_random, 'nonce')
+      ct  = senc(~fake_plaintext, <key, nonce>)
+  in
+  [ !ClientExchangeContext(client_id, device_id, request_id, enc, ctx),
+    Fr(~fake_random), Fr(~fake_plaintext) ]
+  --[ ResponseConstructedByClientContext(client_id, device_id,
+                                         request_id, ctx,
+                                         ~fake_plaintext) ]->
+  [ Out(< 'paired_response', client_id, request_id,
+          ~fake_random, ct >) ]
+
+/* A disclosed current PSK permits fresh client impersonation. */
+rule CompromisedPSKHolderSendsRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx  = psk_context(~kem_seed, psk, client_id, info)
+      enc  = aenc(~kem_seed, pkD)
+      c0   = senc('attacker_request', record_key(ctx, 'record_0'))
+  in
+  [ !CompromisedPSK(client_id, device_id, psk),
+    !PublicDevice(device_id, pkD),
+    Fr(~request_id), Fr(~kem_seed) ]
+  --[ PSKHolderImpersonates(client_id, device_id,
+                           ~request_id, enc, ctx) ]->
+  [ Out(< 'paired_request', client_id, ~request_id,
+          'agentknock-v1', enc, c0, 'no_rotation' >) ]
+
+/* Freshness/idempotency checks for adversary-supplied routing identifiers. */
+restriction UniqueDeviceRequestSlot:
+  "All client_id device_id request_id enc1 c01 ctx1 p1
+       enc2 c02 ctx2 p2 #i #j.
+     DeviceRequestAccepted(client_id, device_id, request_id,
+                           enc1, c01, ctx1, p1)@i
+   & DeviceRequestAccepted(client_id, device_id, request_id,
+                           enc2, c02, ctx2, p2)@j
+   ==> #i = #j"
+
+/* --------------------------- Executability ------------------------------ */
+
+lemma X00_honest_full_exchange_executable:
+  exists-trace
+  "Ex client_id device_id request_id enc c0 ctx request response_msg response
+      completion #i #j #k.
+       DeviceRequestAccepted(client_id, device_id, request_id,
+                             enc, c0, ctx, request)@i
+     & DeviceResponseFixed(client_id, device_id, request_id,
+                           enc, ctx, response_msg, response)@i
+     & ClientResponseAccepted(client_id, device_id, request_id,
+                              enc, ctx, response)@j
+     & DeviceCompletionAccepted(client_id, device_id, request_id,
+                                ctx, completion)@k"
+
+/* ---------------- Confidentiality and context possession (X01-X03) ----- */
+
+lemma X01_request_confidentiality_even_after_psk_disclosure:
+  "All client_id device_id request_id ctx request #i #j.
+       HonestRequestSecret(client_id, device_id,
+                           request_id, ctx, request)@i
+     & K(request)@j
+     ==> (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r)
+       | (Ex psk #r #s.
+            DeviceKeyRevealed(device_id)@r
+          & ClientPSKRevealed(client_id, device_id, psk)@s)"
+
+lemma X01_request_authentication:
+  "All client_id device_id request_id enc c0 ctx request #i.
+       DeviceRequestAccepted(client_id, device_id, request_id,
+                             enc, c0, ctx, request)@i
+     ==> (Ex #j. ClientRequestSent(client_id, device_id, request_id,
+                                  enc, c0, ctx, request)@j & #j < #i)
+       | (Ex psk #r. ClientPSKRevealed(client_id, device_id, psk)@r
+                    & #r < #i)
+       | (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r
+                    & #r < #i)"
+
+lemma X02_honest_response_confidentiality:
+  "All client_id device_id request_id enc c0 ctx request
+       response_msg response #i #j #k.
+       ClientRequestSent(client_id, device_id, request_id,
+                         enc, c0, ctx, request)@i
+     & DeviceResponseFixed(client_id, device_id, request_id,
+                           enc, ctx, response_msg, response)@j
+     & K(response)@k
+     ==> (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r)
+       | (Ex psk #r #s.
+            DeviceKeyRevealed(device_id)@r
+          & ClientPSKRevealed(client_id, device_id, psk)@s)"
+
+lemma X02_response_authenticates_context_possession_not_device_origin:
+  "All client_id device_id request_id enc ctx response #i.
+       ClientResponseAccepted(client_id, device_id, request_id,
+                              enc, ctx, response)@i
+     ==> (Ex response_msg #j.
+            DeviceResponseFixed(client_id, device_id, request_id,
+                                enc, ctx, response_msg, response)@j
+          & #j < #i)
+       | (Ex #j.
+            ResponseConstructedByClientContext(client_id, device_id,
+                                               request_id, ctx, response)@j
+          & #j < #i)
+       | (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r
+                    & #r < #i)
+       | (Ex psk #r #s.
+            ClientPSKRevealed(client_id, device_id, psk)@r
+          & DeviceKeyRevealed(device_id)@s & #r < #i & #s < #i)"
+
+lemma X02_client_can_construct_valid_response_negative_control:
+  exists-trace
+  "Ex client_id device_id request_id enc ctx response #i #j.
+       ResponseConstructedByClientContext(client_id, device_id,
+                                          request_id, ctx, response)@i
+     & ClientResponseAccepted(client_id, device_id, request_id,
+                              enc, ctx, response)@j"
+
+lemma X03_completion_confidentiality:
+  "All client_id device_id request_id ctx completion #i #j.
+       HonestCompletionSecret(client_id, device_id,
+                              request_id, ctx, completion)@i
+     & K(completion)@j
+     ==> (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r)
+       | (Ex psk #r #s.
+            DeviceKeyRevealed(device_id)@r
+          & ClientPSKRevealed(client_id, device_id, psk)@s)"
+
+lemma X03_completion_authentication_and_record_order:
+  "All client_id device_id request_id ctx completion #i.
+       DeviceCompletionAccepted(client_id, device_id, request_id,
+                                ctx, completion)@i
+     ==> (Ex c1 #j.
+            ClientCompletionSent(client_id, device_id, request_id,
+                                 ctx, c1, completion)@j & #j < #i)
+       | (Ex psk #r. ClientPSKRevealed(client_id, device_id, psk)@r
+                    & #r < #i)
+       | (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r
+                    & #r < #i)"
+
+/* ---------------- Context and identity binding (X04/X05) --------------- */
+
+lemma X04_accepted_request_matches_all_context_identifiers:
+  "All client_id device_id request_id enc c0 ctx request #i.
+       DeviceRequestAccepted(client_id, device_id, request_id,
+                             enc, c0, ctx, request)@i
+     ==> (Ex #j. ClientRequestSent(client_id, device_id, request_id,
+                                  enc, c0, ctx, request)@j & #j < #i)
+       | (Ex psk #r. ClientPSKRevealed(client_id, device_id, psk)@r
+                    & #r < #i)
+       | (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                               request_id, ctx)@r
+                    & #r < #i)"
+
+lemma live_context_reveal_allows_first_request_replacement:
+  exists-trace
+  "Ex client_id device_id request_id enc original_c0 ctx original
+      attacker_c0 #i #r #j.
+       ClientRequestSent(client_id, device_id, request_id,
+                         enc, original_c0, ctx, original)@i
+     & ClientExchangeContextRevealed(client_id, device_id,
+                                     request_id, ctx)@r
+     & DeviceRequestAccepted(client_id, device_id, request_id,
+                             enc, attacker_c0, ctx,
+                             'attacker_request')@j
+     & #i < #r & #r < #j
+     & not (original = 'attacker_request')"
+
+lemma live_context_reveal_allows_completion_forgery:
+  exists-trace
+  "Ex client_id device_id request_id enc c0 ctx request #i #r #j.
+       ClientRequestSent(client_id, device_id, request_id,
+                         enc, c0, ctx, request)@i
+     & ClientExchangeContextRevealed(client_id, device_id,
+                                     request_id, ctx)@r
+     & DeviceCompletionAccepted(client_id, device_id, request_id,
+                                ctx, 'attacker_completion')@j
+     & #i < #r & #r < #j"
+
+lemma X05_one_ciphertext_cannot_cross_request_contexts:
+  "All c0 client1 device1 request1 enc1 ctx1 p1
+          client2 device2 request2 enc2 ctx2 p2 #i #j.
+       DeviceRequestAccepted(client1, device1, request1,
+                             enc1, c0, ctx1, p1)@i
+     & DeviceRequestAccepted(client2, device2, request2,
+                             enc2, c0, ctx2, p2)@j
+     ==> client1 = client2 & device1 = device2
+       & request1 = request2 & enc1 = enc2 & ctx1 = ctx2"
+
+lemma X05_request_record_cannot_be_completion_record:
+  "All client_id device_id request_id enc c0 ctx request completion #i #j.
+       DeviceRequestAccepted(client_id, device_id, request_id,
+                             enc, c0, ctx, request)@i
+     & DeviceCompletionAccepted(client_id, device_id, request_id,
+                                ctx, completion)@j
+     ==> not (c0 = senc(completion, record_key(ctx, 'record_1')))"
+
+/* ---------------- Slot state, replay, and response material (X06/X07) -- */
+
+lemma X06_request_application_effect_once:
+  "All client_id request_id p1 p2 #i #j.
+       ApplicationRequestProcessed(client_id, request_id, p1)@i
+     & ApplicationRequestProcessed(client_id, request_id, p2)@j
+     ==> #i = #j"
+
+lemma X06_fixed_response_redelivery:
+  "All client_id device_id request_id msg1 msg2 #i #j.
+       ResponseReleased(client_id, device_id, request_id, msg1)@i
+     & ResponseReleased(client_id, device_id, request_id, msg2)@j
+     ==> msg1 = msg2"
+
+lemma X06_completion_application_effect_once:
+  "All client_id request_id p1 p2 #i #j.
+       ApplicationCompletionProcessed(client_id, request_id, p1)@i
+     & ApplicationCompletionProcessed(client_id, request_id, p2)@j
+     ==> #i = #j"
+
+lemma X06_replay_redelivers_without_reprocessing:
+  exists-trace
+  "Ex client_id device_id request_id msg request #i #j #k.
+       ResponseReleased(client_id, device_id, request_id, msg)@i
+     & ResponseReleased(client_id, device_id, request_id, msg)@j
+     & ApplicationRequestProcessed(client_id, request_id, request)@k
+     & not (#i = #j)"
+
+lemma X07_one_plaintext_per_response_key_nonce:
+  "All client1 request1 key nonce p1 client2 request2 p2 #i #j.
+       ResponseKeyNonceUsed(client1, request1, key, nonce, p1)@i
+     & ResponseKeyNonceUsed(client2, request2, key, nonce, p2)@j
+     ==> #i = #j & p1 = p2"
+
+/* --------------------------- Compromise (C01/C02) ---------------------- */
+
+lemma C01_psk_disclosure_enables_impersonation:
+  exists-trace
+  "Ex client_id device_id psk request_id enc c0 ctx #i #j #k.
+       ClientPSKRevealed(client_id, device_id, psk)@i
+     & PSKHolderImpersonates(client_id, device_id,
+                            request_id, enc, ctx)@j
+     & DeviceRequestAccepted(client_id, device_id, request_id,
+                             enc, c0, ctx, 'attacker_request')@k"
+
+lemma C02_recorded_request_survives_psk_only_disclosure:
+  "All client_id device_id request_id ctx request psk #i #j.
+       HonestRequestSecret(client_id, device_id,
+                           request_id, ctx, request)@i
+     & ClientPSKRevealed(client_id, device_id, psk)@j
+     & not (Ex #r. DeviceKeyRevealed(device_id)@r)
+     & not (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                                 request_id, ctx)@r)
+     ==> not (Ex #k. K(request)@k)"
+
+lemma joint_device_key_and_psk_compromise_breaks_recorded_request:
+  exists-trace
+  "Ex client_id device_id request_id ctx request psk #i #j #k #l.
+       HonestRequestSecret(client_id, device_id,
+                           request_id, ctx, request)@i
+     & DeviceKeyRevealed(device_id)@j
+     & ClientPSKRevealed(client_id, device_id, psk)@k
+     & K(request)@l
+     & #i < #j & #i < #k & #j < #l & #k < #l
+     & not (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
+                                                 request_id, ctx)@r)"
+
+lemma honest_request_id_is_not_rotation_reserved_id:
+  "All request_id #i.
+       HonestRequestID(request_id)@i
+     ==> not (request_id = 'zero_request_id')"
+
+end

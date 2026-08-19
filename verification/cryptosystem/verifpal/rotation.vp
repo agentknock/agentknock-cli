@@ -1,0 +1,157 @@
+// Agentknock v1 current-PSK rotation fallback and response confirmation.
+// This models the cryptographic fallback path: candidate derivation, ordinary
+// request authentication under that candidate, adoption, and confirmation.
+// Mutable current/previous slots and ordered branching remain a Tamarin task.
+
+attacker[active]
+
+principal Client[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public psk_export_label, response_label, response_key_label
+	knows public response_nonce_label, rotation_request_id
+	knows public device_id, client_id
+	knows private current_psk
+]
+
+principal Device[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public psk_export_label, response_label, response_key_label
+	knows public response_nonce_label, rotation_request_id
+	knows public device_id, client_id
+	knows private current_psk, device_private_key
+	device_public_key = PUBKEY(device_private_key)
+]
+
+Device -> Client: [device_public_key]
+
+principal Client[
+	// Export-only rotation context, bound to the reserved zero request ID.
+	generates rotation_kem_random
+	rotation_kem_secret, rotation_enc = KEM_ENCAP(
+		device_public_key,
+		rotation_kem_random
+	)
+	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
+	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
+	rotation_context = HKDF(
+		CONCAT(rotation_kem_secret, current_psk),
+		rotation_binding,
+		hpke_schedule_label
+	)
+	successor_psk = HKDF(rotation_context, psk_export_label, nil)
+
+	// The first ordinary request after the atomic client transition uses the
+	// successor and repeatedly carries the fixed rotation_enc.
+	generates request_id, request_kem_random, request_plaintext
+	request_kem_secret, request_enc = KEM_ENCAP(
+		device_public_key,
+		request_kem_random
+	)
+	request_info = CONCAT(version_info, device_id, request_id)
+	request_binding = CONCAT(hpke_psk_label, request_info, client_id)
+	request_key, completion_key, response_exporter_root = HKDF(
+		CONCAT(request_kem_secret, successor_psk),
+		request_binding,
+		hpke_schedule_label
+	)
+	response_exporter = HKDF(response_exporter_root, response_label, nil)
+	request_ciphertext = AEAD_ENC(request_key, request_plaintext, nil)
+]
+
+Client -> Device: request_id, request_enc, request_ciphertext, rotation_enc
+
+principal Device[
+	// This block is reached only after current/previous ordinary opens fail in
+	// the specification's ordered state machine.
+	rotation_kem_secret_device = KEM_DECAP(
+		device_private_key,
+		rotation_enc
+	)?
+	rotation_info_device = CONCAT(version_info, device_id, rotation_request_id)
+	rotation_binding_device = CONCAT(
+		hpke_psk_label,
+		rotation_info_device,
+		client_id
+	)
+	rotation_context_device = HKDF(
+		CONCAT(rotation_kem_secret_device, current_psk),
+		rotation_binding_device,
+		hpke_schedule_label
+	)
+	candidate_psk = HKDF(rotation_context_device, psk_export_label, nil)
+
+	request_kem_secret_device = KEM_DECAP(device_private_key, request_enc)?
+	request_info_device = CONCAT(version_info, device_id, request_id)
+	request_binding_device = CONCAT(
+		hpke_psk_label,
+		request_info_device,
+		client_id
+	)
+	request_key_device, completion_key_device, response_exporter_root_device = HKDF(
+		CONCAT(request_kem_secret_device, candidate_psk),
+		request_binding_device,
+		hpke_schedule_label
+	)
+	response_exporter_device = HKDF(
+		response_exporter_root_device,
+		response_label,
+		nil
+	)
+	// This checked open is the cryptographic gate for candidate adoption.
+	request_plaintext_device = AEAD_DEC(
+		request_key_device,
+		request_ciphertext,
+		nil
+	)?
+	generates response_plaintext, response_random
+	response_salt = CONCAT(request_enc, response_random)
+	response_key = HKDF(
+		response_salt,
+		response_exporter_device,
+		response_key_label
+	)
+	response_nonce = HKDF(
+		response_salt,
+		response_exporter_device,
+		response_nonce_label
+	)
+	response_material = CONCAT(response_key, response_nonce)
+	response_ciphertext = AEAD_ENC(response_material, response_plaintext, nil)
+]
+
+Device -> Client: response_random, response_ciphertext
+
+principal Client[
+	response_salt_client = CONCAT(request_enc, response_random)
+	response_key_client = HKDF(
+		response_salt_client,
+		response_exporter,
+		response_key_label
+	)
+	response_nonce_client = HKDF(
+		response_salt_client,
+		response_exporter,
+		response_nonce_label
+	)
+	response_material_client = CONCAT(response_key_client, response_nonce_client)
+	// A checked open of this response is the rotation confirmation event.
+	response_plaintext_client = AEAD_DEC(
+		response_material_client,
+		response_ciphertext,
+		nil
+	)?
+]
+
+queries[
+	// R02/R03/R06 cryptographic core, plus X01/X02 on the carrying request.
+	// Agreement on an uncommitted candidate is intentionally not queried here:
+	// only the checked ordinary request and its decryptable response constitute
+	// adoption/confirmation.  See negative_rotation_candidate_pre_gate.vp.
+	confidentiality? successor_psk
+	confidentiality? request_plaintext
+	confidentiality? response_plaintext
+	authentication? Client -> Device: request_ciphertext
+	authentication? Device -> Client: response_ciphertext
+	equivalence? request_plaintext, request_plaintext_device
+	equivalence? response_plaintext, response_plaintext_client
+]

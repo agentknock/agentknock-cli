@@ -1,0 +1,76 @@
+// Deliberate negative control for X03/X05.
+// The request and completion intentionally reuse one record key.  The relay
+// can swap record 0 and record 1 even in a single session.
+
+attacker[active]
+
+principal Client[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public device_id, client_id
+	knows private client_psk
+]
+
+principal Device[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public device_id, client_id
+	knows private client_psk, device_private_key
+	device_public_key = PUBKEY(device_private_key)
+]
+
+Device -> Client: [device_public_key]
+
+principal Client[
+	generates request_id, request_kem_random
+	generates request_plaintext, completion_plaintext
+	request_kem_secret, request_enc = KEM_ENCAP(
+		device_public_key,
+		request_kem_random
+	)
+	request_info = CONCAT(version_info, device_id, request_id)
+	request_binding = CONCAT(hpke_psk_label, request_info, client_id)
+	// BUG: one output is reused for both record slots.
+	broken_record_key = HKDF(
+		CONCAT(request_kem_secret, client_psk),
+		request_binding,
+		hpke_schedule_label
+	)
+	request_ciphertext = AEAD_ENC(broken_record_key, request_plaintext, nil)
+	completion_ciphertext = AEAD_ENC(
+		broken_record_key,
+		completion_plaintext,
+		nil
+	)
+]
+
+Client -> Device: request_id, request_enc, request_ciphertext
+Client -> Device: completion_ciphertext
+
+principal Device[
+	request_kem_secret_device = KEM_DECAP(device_private_key, request_enc)?
+	request_info_device = CONCAT(version_info, device_id, request_id)
+	request_binding_device = CONCAT(
+		hpke_psk_label,
+		request_info_device,
+		client_id
+	)
+	broken_record_key_device = HKDF(
+		CONCAT(request_kem_secret_device, client_psk),
+		request_binding_device,
+		hpke_schedule_label
+	)
+	request_plaintext_device = AEAD_DEC(
+		broken_record_key_device,
+		request_ciphertext,
+		nil
+	)?
+	completion_plaintext_device = AEAD_DEC(
+		broken_record_key_device,
+		completion_ciphertext,
+		nil
+	)?
+]
+
+queries[
+	equivalence? request_plaintext, request_plaintext_device
+	equivalence? completion_plaintext, completion_plaintext_device
+]

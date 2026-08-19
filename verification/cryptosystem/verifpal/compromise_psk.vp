@@ -1,0 +1,63 @@
+// Compromise experiment for C01 and C02.
+// A recorded request is created before phase 1.  Only the binding PSK is then
+// disclosed: the old plaintext should remain confidential because the KEM
+// secret still needs the device private key.  psk_holder_authority.vp is the
+// separate constructive witness for the compromised holder's future power.
+
+attacker[active]
+
+principal Client[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public device_id, client_id
+	knows private client_psk
+]
+
+principal Device[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public device_id, client_id
+	knows private client_psk, device_private_key
+	device_public_key = PUBKEY(device_private_key)
+]
+
+Device -> Client: [device_public_key]
+
+principal Client[
+	generates old_request_id, old_kem_random, old_plaintext
+	old_kem_secret, old_enc = KEM_ENCAP(device_public_key, old_kem_random)
+	old_info = CONCAT(version_info, device_id, old_request_id)
+	old_binding = CONCAT(hpke_psk_label, old_info, client_id)
+	old_request_key = HKDF(
+		CONCAT(old_kem_secret, client_psk),
+		old_binding,
+		hpke_schedule_label
+	)
+	old_ciphertext = AEAD_ENC(old_request_key, old_plaintext, nil)
+]
+
+Client -> Device: old_request_id, old_enc, old_ciphertext
+
+principal Device[
+	old_kem_secret_device = KEM_DECAP(device_private_key, old_enc)?
+	old_info_device = CONCAT(version_info, device_id, old_request_id)
+	old_binding_device = CONCAT(hpke_psk_label, old_info_device, client_id)
+	old_request_key_device = HKDF(
+		CONCAT(old_kem_secret_device, client_psk),
+		old_binding_device,
+		hpke_schedule_label
+	)
+	old_plaintext_device = AEAD_DEC(
+		old_request_key_device,
+		old_ciphertext,
+		nil
+	)?
+]
+
+phase[1]
+
+principal Client[leaks client_psk]
+
+queries[
+	// C02 should hold under PSK-only post-recording disclosure.
+	confidentiality? old_plaintext
+	equivalence? old_plaintext, old_plaintext_device
+]

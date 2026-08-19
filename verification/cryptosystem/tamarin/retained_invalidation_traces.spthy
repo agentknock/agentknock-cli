@@ -1,0 +1,108 @@
+/*
+ * Agentknock v1: retained exchange state survives binding invalidation (R09).
+ *
+ * This focused phase model starts at a checked ordinary-request acceptance.
+ * The active-attacker paired/rotation models establish that checked boundary;
+ * this theory verifies the subsequent retained-slot lifecycle without unrelated
+ * HPKE interleavings.  Exact response and completion record schedules are kept.
+ */
+
+theory Agentknock_Retained_Invalidation_Traces
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  response_kdf/4
+
+rule AcceptOrdinaryRequestAndRetainExchange:
+  let info = hpke_info('agentknock-v1', ~device_id, ~request_id)
+      ctx = psk_context(~request_seed, ~psk, ~client_id, info)
+      enc = aenc(~request_seed, pk(~skD))
+      c0 = senc(~request_plaintext, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response_plaintext, <key, nonce>)
+      response_msg = <~response_random, response_ct>
+  in
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk),
+    Fr(~request_id), Fr(~request_seed), Fr(~request_plaintext),
+    Fr(~response_random), Fr(~response_plaintext) ]
+  --[ DeviceRequestAccepted(~client_id, ~device_id, ~request_id,
+                            ~psk, 'current', 'no_rotation',
+                            enc, c0, ctx, ~request_plaintext),
+      ResponseReleased(~client_id, ~device_id, ~request_id,
+                       response_msg) ]->
+  [ DeviceBinding(~client_id, ~device_id, ~skD,
+                  ~psk, 'none', 'none'),
+    DeviceWaitCompletion(~client_id, ~device_id, ~request_id,
+                         ~psk, ctx),
+    ClientCompletionReady(~client_id, ~device_id, ~request_id,
+                          ~psk, ctx),
+    !ResponseCache(~client_id, ~device_id, ~request_id, response_msg) ]
+
+rule InvalidateBinding:
+  [ DeviceBinding(client_id, device_id, skD,
+                  current_psk, previous_flag, previous_psk) ]
+  --[ BindingInvalidated(client_id, device_id, current_psk,
+                         <previous_flag, previous_psk>) ]->
+  [ !InvalidatedBinding(client_id, device_id) ]
+
+rule SendRetainedCompletionAfterInvalidation:
+  let c1 = senc(~completion_plaintext, record_key(ctx, 'record_1'))
+  in
+  [ !InvalidatedBinding(client_id, device_id),
+    ClientCompletionReady(client_id, device_id, request_id,
+                          used_psk, ctx),
+    Fr(~completion_plaintext) ]
+  -->
+  [ RetainedCompletionWire(client_id, device_id, request_id,
+                           c1) ]
+
+rule AcceptRetainedCompletionAfterInvalidation:
+  [ !InvalidatedBinding(client_id, device_id),
+    DeviceWaitCompletion(client_id, device_id, request_id,
+                         used_psk, ctx),
+    RetainedCompletionWire(client_id, device_id, request_id,
+                           senc(completion_plaintext,
+                                record_key(ctx, 'record_1'))) ]
+  --[ DeviceRetainedCompletionAccepted(client_id, device_id,
+                                       request_id, used_psk,
+                                       ctx, completion_plaintext) ]->
+  [ ]
+
+rule RedeliverCachedResponseAfterInvalidation:
+  [ !InvalidatedBinding(client_id, device_id),
+    !ResponseCache(client_id, device_id, request_id, response_msg) ]
+  --[ ResponseRedelivered(client_id, device_id, request_id,
+                          response_msg) ]->
+  [ ]
+
+lemma R09_retained_completion_survives_invalidation:
+  exists-trace
+  "Ex client_id device_id rid used_psk ctx completion
+      class rotation enc c0 request current previous_state #i #j #k.
+       DeviceRequestAccepted(client_id, device_id, rid,
+                             used_psk, class, rotation,
+                             enc, c0, ctx, request)@i
+     & BindingInvalidated(client_id, device_id,
+                          current, previous_state)@j
+     & DeviceRetainedCompletionAccepted(client_id, device_id, rid,
+                                        used_psk, ctx, completion)@k
+     & #i < #j & #j < #k"
+
+lemma R09_cached_response_survives_invalidation:
+  exists-trace
+  "Ex client_id device_id rid msg current previous_state #i #j #k.
+       ResponseReleased(client_id, device_id, rid, msg)@i
+     & BindingInvalidated(client_id, device_id,
+                          current, previous_state)@j
+     & ResponseRedelivered(client_id, device_id, rid, msg)@k
+     & #i < #j & #j < #k"
+
+end

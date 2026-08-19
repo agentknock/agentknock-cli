@@ -1,0 +1,294 @@
+(**
+  Agentknock v1: one rotation step from a fixed active PSK generation.
+
+  Claims covered: the cryptographic core of R02-R04 and R06.  This model has
+  unbounded independent attempts but intentionally does not claim the mutable
+  lineage/overlap properties R01, R05, R07-R09; those need Tamarin state.
+*)
+
+set preciseActions = true.
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free version_v1: bitstring.
+free request_tag: bitstring.
+free response_tag: bitstring.
+free zero_request_id: bitstring.
+free psk_exporter_label: bitstring.
+free response_exporter_label: bitstring.
+free response_key_label: bitstring.
+free response_nonce_label: bitstring.
+free sequence_zero: record_sequence.
+
+free current_request_plaintext: bitstring [private].
+free rotated_request_plaintext: bitstring [private].
+free rotated_response_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+fun hpke_export_psk(hpke_context, bitstring): psk.
+fun hpke_export(hpke_context, bitstring): bitstring.
+fun derive_response_value(bitstring, encapsulated_key, bitstring, bitstring): bitstring.
+fun response_seal(bitstring, bitstring, bitstring): bitstring.
+reduc forall message: bitstring, key: bitstring, nonce: bitstring;
+  response_open(response_seal(message, key, nonce), key, nonce) = message.
+
+event ClientSendCurrentRequest(bitstring, bitstring, bitstring, bitstring, psk).
+event DeviceAcceptCurrentRequest(bitstring, bitstring, bitstring, bitstring, psk).
+event ClientPrepareRotation(bitstring, bitstring, encapsulated_key, psk).
+event ClientSendRotatedRequest(
+  bitstring, bitstring, bitstring, bitstring, encapsulated_key, psk
+).
+event DeviceAdoptCandidate(
+  bitstring, bitstring, bitstring, bitstring, encapsulated_key, psk
+).
+event DeviceAdoptGeneration(
+  bitstring, bitstring, bitstring, encapsulated_key, psk
+).
+event DeviceSendRotatedResponse(
+  bitstring, bitstring, bitstring, bitstring, encapsulated_key, psk
+).
+event ClientConfirmRotation(
+  bitstring, bitstring, bitstring, bitstring, encapsulated_key, psk
+).
+
+(** Sanity witness: expected false means adoption and confirmation are reachable. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      response: bitstring, rotation_enc: encapsulated_key,
+      successor_psk: psk;
+  event(ClientConfirmRotation(
+    did, cid, rid, response, rotation_enc, successor_psk
+  )) ==> false.
+
+query attacker(current_request_plaintext) ==> false.
+query attacker(rotated_request_plaintext) ==> false.
+query attacker(rotated_response_plaintext) ==> false.
+
+(** R04: current-PSK success takes the first branch and ignores rotation_enc. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      request: bitstring, current_psk: psk;
+  event(DeviceAcceptCurrentRequest(did, cid, rid, request, current_psk)) ==>
+  event(ClientSendCurrentRequest(did, cid, rid, request, current_psk)).
+
+(** R02/R03: candidate adoption needs a matching prepared rotation and request. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      request: bitstring, rotation_enc: encapsulated_key,
+      successor_psk: psk;
+  event(DeviceAdoptCandidate(
+    did, cid, rid, request, rotation_enc, successor_psk
+  )) ==>
+  event(ClientSendRotatedRequest(
+    did, cid, rid, request, rotation_enc, successor_psk
+  )).
+
+query did: bitstring, cid: bitstring, rid: bitstring,
+      request: bitstring, rotation_enc: encapsulated_key,
+      successor_psk: psk;
+  event(DeviceAdoptCandidate(
+    did, cid, rid, request, rotation_enc, successor_psk
+  )) ==>
+  event(ClientPrepareRotation(
+    did, cid, rotation_enc, successor_psk
+  )).
+
+(** R06: only a response from the adopted candidate request confirms rotation. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      response: bitstring, rotation_enc: encapsulated_key,
+      successor_psk: psk;
+  inj-event(ClientConfirmRotation(
+    did, cid, rid, response, rotation_enc, successor_psk
+  )) ==>
+  inj-event(DeviceSendRotatedResponse(
+    did, cid, rid, response, rotation_enc, successor_psk
+  )).
+
+query did: bitstring, cid: bitstring, rid: bitstring,
+      response: bitstring, rotation_enc: encapsulated_key,
+      successor_psk: psk;
+  event(ClientConfirmRotation(
+    did, cid, rid, response, rotation_enc, successor_psk
+  )) ==>
+  event(DeviceAdoptGeneration(
+    did, cid, rid, rotation_enc, successor_psk
+  )).
+
+let CurrentClient(
+  public_key: device_public_key, device_id: bitstring,
+  client_id: bitstring, current_psk: psk
+) =
+  new request_id: bitstring;
+  new request_ephemeral: ephemeral_secret_key;
+  new ignored_rotation_ephemeral: ephemeral_secret_key;
+  let enc = encapsulate(request_ephemeral) in
+  let ignored_rotation_enc = encapsulate(ignored_rotation_ephemeral) in
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_sender(request_ephemeral, public_key),
+    current_psk, client_id, info
+  ) in
+  let ciphertext = hpke_seal(
+    current_request_plaintext, context, sequence_zero
+  ) in
+  event ClientSendCurrentRequest(
+    device_id, client_id, request_id,
+    current_request_plaintext, current_psk
+  );
+  out(network,
+    (request_tag, client_id, request_id, version_v1,
+     enc, ciphertext, ignored_rotation_enc)).
+
+let RotatingClient(
+  public_key: device_public_key, device_id: bitstring,
+  client_id: bitstring, current_psk: psk
+) =
+  new rotation_ephemeral: ephemeral_secret_key;
+  let rotation_enc = encapsulate(rotation_ephemeral) in
+  let rinfo = hpke_info(version_v1, device_id, zero_request_id) in
+  let rotation_context = hpke_psk_context(
+    kem_sender(rotation_ephemeral, public_key),
+    current_psk, client_id, rinfo
+  ) in
+  let successor_psk = hpke_export_psk(
+    rotation_context, psk_exporter_label
+  ) in
+  event ClientPrepareRotation(
+    device_id, client_id, rotation_enc, successor_psk
+  );
+
+  new request_id: bitstring;
+  new request_ephemeral: ephemeral_secret_key;
+  let request_enc = encapsulate(request_ephemeral) in
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let request_context = hpke_psk_context(
+    kem_sender(request_ephemeral, public_key),
+    successor_psk, client_id, info
+  ) in
+  let request_ciphertext = hpke_seal(
+    rotated_request_plaintext, request_context, sequence_zero
+  ) in
+  event ClientSendRotatedRequest(
+    device_id, client_id, request_id, rotated_request_plaintext,
+    rotation_enc, successor_psk
+  );
+  out(network,
+    (request_tag, client_id, request_id, version_v1,
+     request_enc, request_ciphertext, rotation_enc));
+
+  in(network,
+    (=response_tag, =client_id, =request_id,
+     response_random: bitstring, response_ciphertext: bitstring));
+  let exported = hpke_export(
+    request_context, response_exporter_label
+  ) in
+  let derived_key = derive_response_value(
+    exported, request_enc, response_random, response_key_label
+  ) in
+  let derived_nonce = derive_response_value(
+    exported, request_enc, response_random, response_nonce_label
+  ) in
+  let response = response_open(
+    response_ciphertext, derived_key, derived_nonce
+  ) in
+  event ClientConfirmRotation(
+    device_id, client_id, request_id, response,
+    rotation_enc, successor_psk
+  ).
+
+let SendRotatedResponse(
+  context: hpke_context, request_enc: encapsulated_key,
+  device_id: bitstring, client_id: bitstring, request_id: bitstring,
+  rotation_enc: encapsulated_key, successor_psk: psk
+) =
+  let exported = hpke_export(context, response_exporter_label) in
+  new response_random: bitstring;
+  let derived_key = derive_response_value(
+    exported, request_enc, response_random, response_key_label
+  ) in
+  let derived_nonce = derive_response_value(
+    exported, request_enc, response_random, response_nonce_label
+  ) in
+  let ciphertext = response_seal(
+    rotated_response_plaintext, derived_key, derived_nonce
+  ) in
+  event DeviceSendRotatedResponse(
+    device_id, client_id, request_id, rotated_response_plaintext,
+    rotation_enc, successor_psk
+  );
+  out(network,
+    (response_tag, client_id, request_id, response_random, ciphertext)).
+
+let Device(
+  secret_key: device_secret_key, device_id: bitstring,
+  current_psk: psk
+) =
+  in(network,
+    (=request_tag, client_id: bitstring, request_id: bitstring,
+     =version_v1, request_enc: encapsulated_key,
+     request_ciphertext: bitstring, rotation_enc: encapsulated_key));
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let current_context = hpke_psk_context(
+    kem_receiver(request_enc, secret_key),
+    current_psk, client_id, info
+  ) in
+  let current_request = hpke_open(
+    request_ciphertext, current_context, sequence_zero
+  ) in
+    (* Step 1 succeeds: rotation_enc is deliberately not evaluated. *)
+    event DeviceAcceptCurrentRequest(
+      device_id, client_id, request_id, current_request, current_psk
+    )
+  else
+    (* Candidate fallback is reached only after the current open fails. *)
+    let rinfo = hpke_info(version_v1, device_id, zero_request_id) in
+    let rotation_context = hpke_psk_context(
+      kem_receiver(rotation_enc, secret_key),
+      current_psk, client_id, rinfo
+    ) in
+    let successor_psk = hpke_export_psk(
+      rotation_context, psk_exporter_label
+    ) in
+    let candidate_context = hpke_psk_context(
+      kem_receiver(request_enc, secret_key),
+      successor_psk, client_id, info
+    ) in
+    let rotated_request = hpke_open(
+      request_ciphertext, candidate_context, sequence_zero
+    ) in
+    event DeviceAdoptCandidate(
+      device_id, client_id, request_id, rotated_request,
+      rotation_enc, successor_psk
+    );
+    event DeviceAdoptGeneration(
+      device_id, client_id, request_id, rotation_enc, successor_psk
+    );
+    SendRotatedResponse(
+      candidate_context, request_enc, device_id, client_id,
+      request_id, rotation_enc, successor_psk
+    ).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  new client_id: bitstring;
+  new current_psk: psk;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id, public_key));
+  ((!CurrentClient(public_key, device_id, client_id, current_psk)) |
+   (!RotatingClient(public_key, device_id, client_id, current_psk)) |
+   (!Device(secret_key, device_id, current_psk)))

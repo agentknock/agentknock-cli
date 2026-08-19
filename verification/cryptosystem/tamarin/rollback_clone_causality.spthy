@@ -1,0 +1,78 @@
+/*
+ * Agentknock v1: a clone-branch adoption comes from an authenticated rotation
+ * request made by that branch (C04).
+ *
+ * This focused active-network theory keeps the exact rotation and ordinary-
+ * request schedules.  It removes only the second branch and race state, which
+ * are independently covered by rollback_clone.spthy.
+ */
+
+theory Agentknock_Rollback_Clone_Causality
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2
+
+rule CreateOneCloneBranch:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk0) ]
+  -->
+  [ ClientCopy('copy', ~client_id, ~device_id, pk(~skD), ~psk0),
+    DeviceBinding(~client_id, ~device_id, ~skD, ~psk0),
+    Out(< 'device_public', ~device_id, pk(~skD) >) ]
+
+rule ClientCopyStartsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      candidate = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(~request_seed, candidate, client_id,
+                        hpke_info('agentknock-v1', device_id,
+                                  ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc('clone_rotation_request', record_key(ctx, 'record_0'))
+  in
+  [ ClientCopy(copy, client_id, device_id, pkD, old_psk),
+    Fr(~rotation_seed), Fr(~request_seed), Fr(~request_id) ]
+  --[ CloneBranchRotationStarted(copy, client_id, device_id,
+                                ~request_id, old_psk,
+                                candidate, renc, rctx, ctx) ]->
+  [ Out(< 'clone_rotation_request', client_id, ~request_id,
+          enc, c0, renc >) ]
+
+rule DeviceAdoptsCloneBranch:
+  let rctx = psk_context(rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(rotation_seed, pk(skD))
+      candidate = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(request_seed, candidate, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc('clone_rotation_request',
+                record_key(ctx, 'record_0'))
+  in
+  [ DeviceBinding(client_id, device_id, skD, old_psk),
+    In(< 'clone_rotation_request', client_id, request_id,
+         enc, c0, renc >) ]
+  --[ DeviceAdoptedCloneBranch(client_id, device_id, request_id,
+                              old_psk,
+                              candidate, renc, rctx, ctx) ]->
+  [ ]
+
+lemma C04_rotation_is_not_compromise_recovery:
+  "All client_id device_id rid old new renc rctx ctx #i.
+       DeviceAdoptedCloneBranch(client_id, device_id, rid, old, new,
+                                renc, rctx, ctx)@i
+     ==> (Ex copy #s.
+            CloneBranchRotationStarted(copy, client_id, device_id,
+                                       rid, old, new,
+                                       renc, rctx, ctx)@s
+          & #s < #i)"
+
+end

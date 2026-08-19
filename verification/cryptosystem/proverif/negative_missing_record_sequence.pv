@@ -1,0 +1,78 @@
+(**
+  Negative control for X03/X05.
+
+  This deliberately removes HPKE record sequence numbers.  The relay can
+  relabel the request ciphertext as a completion in the same request context.
+  The completion correspondence must fail.
+*)
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+
+free network: channel.
+free request_tag: bitstring.
+free completion_tag: bitstring.
+free version_v1: bitstring.
+free request_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun flawed_hpke_seal(bitstring, hpke_context): bitstring.
+reduc forall message: bitstring, context: hpke_context;
+  flawed_hpke_open(flawed_hpke_seal(message, context), context) = message.
+
+event ClientSendRequest(bitstring, bitstring, bitstring).
+event ClientSendCompletion(bitstring, bitstring, bitstring).
+event DeviceAcceptCompletion(bitstring, bitstring, bitstring).
+
+(** Expected attack: request record is accepted in the completion slot. *)
+query cid: bitstring, rid: bitstring, message: bitstring;
+  event(DeviceAcceptCompletion(cid, rid, message)) ==>
+  event(ClientSendCompletion(cid, rid, message)).
+
+let Client(public_key: device_public_key, device_id: bitstring, binding_psk: psk) =
+  new client_id: bitstring;
+  new request_id: bitstring;
+  new ephemeral_key: ephemeral_secret_key;
+  let enc = encapsulate(ephemeral_key) in
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_sender(ephemeral_key, public_key), binding_psk, client_id, info
+  ) in
+  let ciphertext = flawed_hpke_seal(request_plaintext, context) in
+  event ClientSendRequest(client_id, request_id, request_plaintext);
+  out(network,
+    (request_tag, client_id, request_id, enc, ciphertext)).
+
+let Device(secret_key: device_secret_key, device_id: bitstring, binding_psk: psk) =
+  in(network,
+    (=request_tag, client_id: bitstring, request_id: bitstring,
+     enc: encapsulated_key, request_ciphertext: bitstring));
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_receiver(enc, secret_key), binding_psk, client_id, info
+  ) in
+  let request = flawed_hpke_open(request_ciphertext, context) in
+  in(network,
+    (=completion_tag, =client_id, =request_id,
+     completion_ciphertext: bitstring));
+  let completion = flawed_hpke_open(completion_ciphertext, context) in
+  event DeviceAcceptCompletion(client_id, request_id, completion).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  new binding_psk: psk;
+  let public_key = device_public(secret_key) in
+  (Client(public_key, device_id, binding_psk) |
+   Device(secret_key, device_id, binding_psk))

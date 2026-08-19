@@ -1,0 +1,326 @@
+(**
+  Agentknock v1: initial pairing, idealized SAS comparison, and activation.
+
+  Claims covered: P02, P03, P05-P07 (cryptographic correspondence core).
+  P01 is witnessed by the reachable activation trace.  P04 is exercised in
+  negative_pairing_mitm.pv.  P08 is mutable idempotency state and is left to
+  Tamarin.
+
+  The private sas_offer/sas_confirm channels model an honest user comparing
+  the complete 12-digit displays out of band.  sas_value is collision-free in
+  this symbolic branch.  This cannot prove the real 10^-12 false-accept
+  probability, partial comparison behavior, or pending-attempt amplification.
+*)
+
+(* Retain action/session correlations across the multi-stage pairing. *)
+set preciseActions = true.
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+type sas_value.
+
+free network: channel.
+free sas_offer: channel [private].
+free sas_confirm: channel [private].
+
+free version_v1: bitstring.
+free pairing_request_tag: bitstring.
+free pairing_response_tag: bitstring.
+free pairing_completion_tag: bitstring.
+free activation_request_tag: bitstring.
+free activation_response_tag: bitstring.
+free commitment_label: bitstring.
+free psk_exporter_label: bitstring.
+free sas_label: bitstring.
+free response_exporter_label: bitstring.
+free response_key_label: bitstring.
+free response_nonce_label: bitstring.
+free sequence_zero: record_sequence.
+free sequence_one: record_sequence.
+
+free pairing_application_plaintext: bitstring [private].
+free activation_request_plaintext: bitstring [private].
+free activation_response_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun commitment(bitstring, bitstring): bitstring.
+fun hpke_base_context(kem_secret, bitstring): hpke_context.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+fun hpke_export_psk(hpke_context, bitstring): psk.
+fun hpke_export(hpke_context, bitstring): bitstring.
+
+fun sas(bitstring, bitstring, bitstring, bitstring, device_public_key, bitstring): sas_value.
+
+fun derive_response_value(bitstring, encapsulated_key, bitstring, bitstring): bitstring.
+fun response_seal(bitstring, bitstring, bitstring): bitstring.
+reduc forall message: bitstring, key: bitstring, nonce: bitstring;
+  response_open(response_seal(message, key, nonce), key, nonce) = message.
+
+event DeviceRetainPairingRequest(bitstring, bitstring, bitstring).
+event ClientSendPairingCompletion(
+  bitstring, bitstring, device_public_key, bitstring, bitstring, psk
+).
+event DeviceAcceptPairingCompletion(bitstring, bitstring, bitstring, bitstring, psk).
+event ClientOfferSAS(
+  bitstring, bitstring, device_public_key, bitstring, bitstring, sas_value, psk
+).
+event DeviceAcceptSAS(
+  bitstring, bitstring, device_public_key, bitstring, bitstring, sas_value, psk
+).
+event DeviceAuthorizeBinding(bitstring, bitstring, psk).
+event ClientAcceptSAS(
+  bitstring, bitstring, device_public_key, bitstring, bitstring, sas_value, psk
+).
+event ClientSendActivation(bitstring, bitstring, bitstring, bitstring, psk).
+event DeviceActivate(bitstring, bitstring, bitstring, bitstring, psk).
+event DeviceSendActivationResponse(bitstring, bitstring, bitstring, bitstring, psk).
+event ClientActivate(bitstring, bitstring, bitstring, bitstring, psk).
+
+(** P01 sanity witness: expected false means honest activation is reachable. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      response: bitstring, binding_psk: psk;
+  event(ClientActivate(did, cid, rid, response, binding_psk)) ==> false.
+
+(** Post-SAS activation traffic is secret from the relay. *)
+query attacker(activation_request_plaintext) ==> false.
+query attacker(activation_response_plaintext) ==> false.
+
+(** P02: completion acceptance implies the recovered secret matches the retained commitment. *)
+query did: bitstring, cid: bitstring, client_secret: bitstring,
+      application: bitstring, binding_psk: psk;
+  event(DeviceAcceptPairingCompletion(
+    did, cid, client_secret, application, binding_psk
+  )) ==>
+  event(DeviceRetainPairingRequest(
+    did, cid, commitment(commitment_label, client_secret)
+  )).
+
+(** P03: ideal equal-SAS acceptance gives full transcript and PSK agreement. *)
+query did: bitstring, cid: bitstring, public_key: device_public_key,
+      client_secret: bitstring, device_random: bitstring,
+      displayed_sas: sas_value, binding_psk: psk;
+  inj-event(ClientAcceptSAS(
+    did, cid, public_key, client_secret, device_random,
+    displayed_sas, binding_psk
+  )) ==>
+  inj-event(DeviceAcceptSAS(
+    did, cid, public_key, client_secret, device_random,
+    displayed_sas, binding_psk
+  )).
+
+query did: bitstring, cid: bitstring, public_key: device_public_key,
+      client_secret: bitstring, device_random: bitstring,
+      displayed_sas: sas_value, binding_psk: psk;
+  event(DeviceAcceptSAS(
+    did, cid, public_key, client_secret, device_random,
+    displayed_sas, binding_psk
+  )) ==>
+  event(ClientOfferSAS(
+    did, cid, public_key, client_secret, device_random,
+    displayed_sas, binding_psk
+  )).
+
+(** P05/P06: honest device activation is gated by SAS and matching PSK request. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      request: bitstring, binding_psk: psk;
+  event(DeviceActivate(did, cid, rid, request, binding_psk)) ==>
+  event(ClientSendActivation(did, cid, rid, request, binding_psk)).
+
+query did: bitstring, cid: bitstring, rid: bitstring,
+      request: bitstring, binding_psk: psk;
+  event(DeviceActivate(did, cid, rid, request, binding_psk)) ==>
+  event(DeviceAuthorizeBinding(did, cid, binding_psk)).
+
+(** P07: client activation needs the matching authenticated response. *)
+query did: bitstring, cid: bitstring, rid: bitstring,
+      response: bitstring, binding_psk: psk;
+  inj-event(ClientActivate(did, cid, rid, response, binding_psk)) ==>
+  inj-event(DeviceSendActivationResponse(
+    did, cid, rid, response, binding_psk
+  )).
+
+let Client() =
+  new client_id: bitstring;
+  new client_secret: bitstring;
+  let committed = commitment(commitment_label, client_secret) in
+  out(network, (pairing_request_tag, client_id, version_v1, committed));
+
+  in(network,
+    (=pairing_response_tag, =client_id, device_id: bitstring,
+     public_key: device_public_key, device_random: bitstring));
+  new pairing_ephemeral: ephemeral_secret_key;
+  let pairing_enc = encapsulate(pairing_ephemeral) in
+  let pinfo = hpke_info(version_v1, device_id, client_id) in
+  let pairing_context = hpke_base_context(
+    kem_sender(pairing_ephemeral, public_key), pinfo
+  ) in
+  let secret_ciphertext = hpke_seal(
+    client_secret, pairing_context, sequence_zero
+  ) in
+  let application_ciphertext = hpke_seal(
+    pairing_application_plaintext, pairing_context, sequence_one
+  ) in
+  let binding_psk = hpke_export_psk(pairing_context, psk_exporter_label) in
+  event ClientSendPairingCompletion(
+    device_id, client_id, public_key, client_secret,
+    pairing_application_plaintext, binding_psk
+  );
+  out(network,
+    (pairing_completion_tag, client_id, pairing_enc,
+     secret_ciphertext, application_ciphertext));
+
+  let displayed_sas = sas(
+    client_secret, device_random, device_id, client_id,
+    public_key, sas_label
+  ) in
+  event ClientOfferSAS(
+    device_id, client_id, public_key, client_secret,
+    device_random, displayed_sas, binding_psk
+  );
+  out(sas_offer, (client_id, displayed_sas));
+  in(sas_confirm, (=client_id, =displayed_sas));
+  event ClientAcceptSAS(
+    device_id, client_id, public_key, client_secret,
+    device_random, displayed_sas, binding_psk
+  );
+
+  new activation_request_id: bitstring;
+  new activation_ephemeral: ephemeral_secret_key;
+  let activation_enc = encapsulate(activation_ephemeral) in
+  let ainfo = hpke_info(version_v1, device_id, activation_request_id) in
+  let activation_context = hpke_psk_context(
+    kem_sender(activation_ephemeral, public_key),
+    binding_psk, client_id, ainfo
+  ) in
+  let activation_ciphertext = hpke_seal(
+    activation_request_plaintext, activation_context, sequence_zero
+  ) in
+  event ClientSendActivation(
+    device_id, client_id, activation_request_id,
+    activation_request_plaintext, binding_psk
+  );
+  out(network,
+    (activation_request_tag, client_id, activation_request_id,
+     version_v1, activation_enc, activation_ciphertext));
+
+  in(network,
+    (=activation_response_tag, =client_id, =activation_request_id,
+     response_random: bitstring, response_ciphertext: bitstring));
+  let exported = hpke_export(
+    activation_context, response_exporter_label
+  ) in
+  let derived_key = derive_response_value(
+    exported, activation_enc, response_random, response_key_label
+  ) in
+  let derived_nonce = derive_response_value(
+    exported, activation_enc, response_random, response_nonce_label
+  ) in
+  let response = response_open(
+    response_ciphertext, derived_key, derived_nonce
+  ) in
+  event ClientActivate(
+    device_id, client_id, activation_request_id, response, binding_psk
+  ).
+
+let Device(secret_key: device_secret_key, device_id: bitstring) =
+  in(network,
+    (=pairing_request_tag, client_id: bitstring,
+     =version_v1, retained_commitment: bitstring));
+  event DeviceRetainPairingRequest(
+    device_id, client_id, retained_commitment
+  );
+  new device_random: bitstring;
+  let public_key = device_public(secret_key) in
+  out(network,
+    (pairing_response_tag, client_id, device_id, public_key, device_random));
+
+  in(network,
+    (=pairing_completion_tag, =client_id, pairing_enc: encapsulated_key,
+     secret_ciphertext: bitstring, application_ciphertext: bitstring));
+  let pinfo = hpke_info(version_v1, device_id, client_id) in
+  let pairing_context = hpke_base_context(
+    kem_receiver(pairing_enc, secret_key), pinfo
+  ) in
+  let client_secret = hpke_open(
+    secret_ciphertext, pairing_context, sequence_zero
+  ) in
+  let application = hpke_open(
+    application_ciphertext, pairing_context, sequence_one
+  ) in
+  if retained_commitment = commitment(commitment_label, client_secret) then
+    let binding_psk = hpke_export_psk(
+      pairing_context, psk_exporter_label
+    ) in
+    event DeviceAcceptPairingCompletion(
+      device_id, client_id, client_secret, application, binding_psk
+    );
+    let displayed_sas = sas(
+      client_secret, device_random, device_id, client_id,
+      public_key, sas_label
+    ) in
+    in(sas_offer, (=client_id, =displayed_sas));
+    event DeviceAcceptSAS(
+      device_id, client_id, public_key, client_secret,
+      device_random, displayed_sas, binding_psk
+    );
+    event DeviceAuthorizeBinding(device_id, client_id, binding_psk);
+    out(sas_confirm, (client_id, displayed_sas));
+
+    in(network,
+      (=activation_request_tag, =client_id, activation_request_id: bitstring,
+       =version_v1, activation_enc: encapsulated_key,
+       activation_ciphertext: bitstring));
+    let ainfo = hpke_info(version_v1, device_id, activation_request_id) in
+    let activation_context = hpke_psk_context(
+      kem_receiver(activation_enc, secret_key),
+      binding_psk, client_id, ainfo
+    ) in
+    let request = hpke_open(
+      activation_ciphertext, activation_context, sequence_zero
+    ) in
+    event DeviceActivate(
+      device_id, client_id, activation_request_id, request, binding_psk
+    );
+
+    let exported = hpke_export(
+      activation_context, response_exporter_label
+    ) in
+    new response_random: bitstring;
+    let derived_key = derive_response_value(
+      exported, activation_enc, response_random, response_key_label
+    ) in
+    let derived_nonce = derive_response_value(
+      exported, activation_enc, response_random, response_nonce_label
+    ) in
+    let response_ciphertext = response_seal(
+      activation_response_plaintext, derived_key, derived_nonce
+    ) in
+    event DeviceSendActivationResponse(
+      device_id, client_id, activation_request_id,
+      activation_response_plaintext, binding_psk
+    );
+    out(network,
+      (activation_response_tag, client_id, activation_request_id,
+       response_random, response_ciphertext)).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id, public_key));
+  ((!Client()) | (!Device(secret_key, device_id)))

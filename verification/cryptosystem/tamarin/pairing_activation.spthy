@@ -1,0 +1,471 @@
+/*
+ * Agentknock v1: initial pairing, SAS comparison, and activation.
+ *
+ * This is a symbolic model of Sections 7 and 8 (as used for activation) of
+ * docs/CRYPTOSYSTEM.md.  HPKE's KEM is modeled as ideal public-key
+ * encapsulation of a fresh context seed, with domain-separated record keys
+ * and exporters explicit.  Concrete HPKE/KEM security is assumption O01.
+ * The user/OOB comparison is a
+ * synchronization on the full symbolic SAS; the quantitative 12-digit
+ * collision probability is deliberately outside this theory.
+ */
+
+theory Agentknock_Pairing_Activation
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption, hashing
+
+functions:
+  commitment/1,
+  hpke_info/3,
+  base_context/2,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  sas/5,
+  response_kdf/4
+
+/* One stable device identity.  The public key and identifiers are public. */
+rule RegisterDevice:
+  [ Fr(~skD), Fr(~device_id) ]
+  --[ DeviceRegistered(~device_id, pk(~skD)) ]->
+  [ !Device(~device_id, ~skD),
+    Out(< 'device_identity', ~device_id, pk(~skD) >) ]
+
+/* Compromise is explicit so secrecy/authentication lemmas can name it. */
+rule RevealDeviceKey:
+  [ !Device(device_id, skD) ]
+  --[ DeviceKeyRevealed(device_id) ]->
+  [ Out(skD) ]
+
+/*
+ * The honest client commits before accepting any clear response.  The fresh
+ * client_id also serves as the initial request_id.
+ */
+rule ClientStartsPairing:
+  let commit = commitment(~client_secret)
+  in
+  [ Fr(~client_id), Fr(~client_secret), Fr(~pairing_application) ]
+  --[ ClientPairingStarted(~client_id, ~client_secret,
+                           ~pairing_application, commit),
+      PairingApplicationSecret(~client_id, ~pairing_application) ]->
+  [ ClientWaitResponse(~client_id, ~client_secret,
+                       ~pairing_application, commit),
+    Out(< 'pairing_request', ~client_id, 'agentknock-v1', commit >) ]
+
+/*
+ * The device fixes its contribution and complete clear response on the first
+ * accepted slot transition.  UniquePairingRequest below models the retained
+ * slot/freshness check for adversary-chosen identifiers.
+ */
+rule DeviceAcceptsPairingRequest:
+  [ !Device(device_id, skD),
+    In(< 'pairing_request', client_id, 'agentknock-v1', commit >),
+    Fr(~device_random) ]
+  --[ DevicePairingRequestAccepted(client_id, device_id, commit),
+      DevicePairingResponseFixed(client_id, device_id,
+                                 pk(skD), ~device_random) ]->
+  [ DeviceWaitCompletion(client_id, device_id, skD,
+                         commit, ~device_random),
+    !PairingResponseCache(client_id, device_id,
+                          pk(skD), ~device_random),
+    Out(< 'pairing_response', client_id, device_id,
+          pk(skD), ~device_random >) ]
+
+/* Slot redelivery returns exactly the fixed tuple and has no state effect. */
+rule RedeliverPairingResponse:
+  [ !PairingResponseCache(client_id, device_id, pkD, device_random),
+    In(< 'routed_pairing_request_candidate',
+         device_id, client_id, candidate_envelope >) ]
+  --[ PairingResponseRedelivered(client_id, device_id,
+                                 pkD, device_random) ]->
+  [ Out(< 'pairing_response', client_id, device_id,
+          pkD, device_random >) ]
+
+/*
+ * A clear response is deliberately not authenticated.  The client accepts
+ * any group public key, derives the base-mode context, sends records 0 and 1,
+ * and retains the exported PSK plus its full SAS transcript.
+ */
+rule ClientAcceptsClearResponse:
+  let info = hpke_info('agentknock-v1', device_id, client_id)
+      ctx  = base_context(~kem_seed, info)
+      enc  = aenc(~kem_seed, pkD)
+      c0   = senc(client_secret, record_key(ctx, 'record_0'))
+      c1   = senc(pairing_application, record_key(ctx, 'record_1'))
+      psk  = exporter(ctx, 'agentknock-v1 psk')
+      code = sas(client_secret, device_random,
+                 device_id, client_id, pkD)
+  in
+  [ ClientWaitResponse(client_id, client_secret,
+                       pairing_application, commitment(client_secret)),
+    In(< 'pairing_response', client_id, device_id, pkD, device_random >),
+    Fr(~kem_seed) ]
+  --[ ClientPairingCompletionSent(client_id, device_id, pkD,
+                                  client_secret, pairing_application,
+                                  enc, c0, c1, psk),
+      ClientSASReady(client_id, device_id, pkD, device_random,
+                     client_secret, psk, code) ]->
+  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
+                  client_secret, pairing_application, psk, code),
+    !PairingCompletionCache(client_id, enc, c0, c1),
+    Out(< 'pairing_completion', client_id, enc, c0, c1 >) ]
+
+rule RedeliverPairingCompletion:
+  [ !PairingCompletionCache(client_id, enc, c0, c1),
+    In(< 'completion_redelivery', client_id >) ]
+  --[ PairingCompletionRedelivered(client_id, enc, c0, c1) ]->
+  [ Out(< 'pairing_completion', client_id, enc, c0, c1 >) ]
+
+/*
+ * Opening the two patterns enforces record order.  The retained commitment is
+ * unified with commitment(client_secret), so a mismatching reveal has no
+ * accepting transition.  The application value becomes only untrusted
+ * pending metadata here.
+ */
+rule DeviceAcceptsPairingCompletion:
+  let info = hpke_info('agentknock-v1', device_id, client_id)
+      ctx  = base_context(kem_seed, info)
+      enc  = aenc(kem_seed, pk(skD))
+      c0   = senc(client_secret, record_key(ctx, 'record_0'))
+      c1   = senc(pairing_application, record_key(ctx, 'record_1'))
+      psk  = exporter(ctx, 'agentknock-v1 psk')
+      code = sas(client_secret, device_random,
+                 device_id, client_id, pk(skD))
+  in
+  [ DeviceWaitCompletion(client_id, device_id, skD,
+                         commitment(client_secret), device_random),
+    In(< 'pairing_completion', client_id, enc, c0, c1 >) ]
+  --[ DevicePairingCompletionAccepted(client_id, device_id, pk(skD),
+                                      client_secret, pairing_application,
+                                      enc, c0, c1, psk),
+      DevicePendingMetadata(client_id, pairing_application),
+      DeviceSASReady(client_id, device_id, pk(skD), device_random,
+                     client_secret, psk, code) ]->
+  [ DeviceWaitSAS(client_id, device_id, skD, device_random,
+                  client_secret, pairing_application, psk, code),
+    !PairingCompletionDisposition(client_id, device_id, 'accepted') ]
+
+/* Later completion candidates are ignored from the retained disposition. */
+rule IgnoreLaterPairingCompletion:
+  [ !PairingCompletionDisposition(client_id, device_id, disposition),
+    In(< 'routed_pairing_completion_candidate',
+         device_id, client_id, candidate_envelope >) ]
+  --[ LaterPairingCompletionIgnored(client_id, device_id, disposition) ]->
+  [ ]
+
+/*
+ * This internal rule is the authenticated out-of-band comparison.  Requiring
+ * one syntactically equal full SAS models the no-collision branch.  Both
+ * endpoints move atomically to pending activation state.
+ */
+rule UserVerifiesEqualSAS:
+  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
+                  client_secret, pairing_application, psk, code),
+    DeviceWaitSAS(client_id, device_id, skD, device_random,
+                  client_secret, device_application, psk, code) ]
+  --[ SASVerified(client_id, device_id, pkD, device_random,
+                  client_secret, psk, code),
+      PendingBindingEstablished(client_id, device_id, psk) ]->
+  [ ClientPendingActivation(client_id, device_id, pkD, psk),
+    DevicePendingActivation(client_id, device_id, skD, psk),
+    !PendingPSKCompromiseCopy(client_id, device_id, psk) ]
+
+rule UserRejectsPairing:
+  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
+                  client_secret, pairing_application, psk, code),
+    DeviceWaitSAS(client_id, device_id, skD, other_random,
+                  other_secret, device_application, other_psk, other_code) ]
+  --[ SASRejected(client_id, device_id) ]->
+  [ !PairingRejected(client_id) ]
+
+/* The pending PSK is disclosed only by an explicit durable-state compromise. */
+rule RevealPendingPSK:
+  [ !PendingPSKCompromiseCopy(client_id, device_id, psk) ]
+  --[ ClientPSKRevealed(client_id, psk) ]->
+  [ Out(psk) ]
+
+/* Client activation request: PSK mode, request record sequence zero. */
+rule ClientSendsActivationRequest:
+  let info = hpke_info('agentknock-v1', device_id, ~request_id)
+      ctx  = psk_context(~kem_seed, psk, client_id, info)
+      enc  = aenc(~kem_seed, pkD)
+      c0   = senc(~activation_request, record_key(ctx, 'record_0'))
+  in
+  [ ClientPendingActivation(client_id, device_id, pkD, psk),
+    Fr(~request_id), Fr(~kem_seed), Fr(~activation_request) ]
+  --[ ClientActivationRequestSent(client_id, device_id, ~request_id,
+                                  enc, ~activation_request),
+      HonestRequestID(~request_id),
+      ActivationRequestSecret(client_id, device_id, ~request_id,
+                              ~activation_request) ]->
+  [ ClientWaitActivationResponse(client_id, device_id, pkD, psk,
+                                 ~request_id, enc, ctx),
+    ClientActivationCompletionReady(client_id, device_id, pkD, psk,
+                                    ~request_id, enc, ctx),
+    Out(< 'paired_request', client_id, ~request_id,
+          'agentknock-v1', enc, c0, 'no_rotation' >) ]
+
+/*
+ * A valid activation request atomically activates the device and fixes the
+ * terminal response before releasing it.  A rotation field is ignored.
+ */
+rule DeviceAcceptsActivationRequest:
+  let info = hpke_info('agentknock-v1', device_id, request_id)
+      ctx  = psk_context(kem_seed, psk, client_id, info)
+      enc  = aenc(kem_seed, pk(skD))
+      c0   = senc(activation_request, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key  = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~activation_response, <key, nonce>)
+      response_msg = <~response_random, response_ct>
+  in
+  [ DevicePendingActivation(client_id, device_id, skD, psk),
+    In(< 'paired_request', client_id, request_id,
+         'agentknock-v1', enc, c0, rotation_field >),
+    Fr(~response_random), Fr(~activation_response) ]
+  --[ DeviceActivationRequestAccepted(client_id, device_id, request_id,
+                                      enc, activation_request),
+      DeviceActivated(client_id, device_id, psk),
+      DeviceActivationResponseFixed(client_id, request_id,
+                                    response_msg, ~activation_response),
+      ActivationResponseSecret(client_id, device_id, request_id,
+                               ~activation_response),
+      ResponseReleased(client_id, device_id, request_id, response_msg) ]->
+  [ !DeviceActive(client_id, device_id, skD, psk),
+    DeviceWaitActivationCompletion(client_id, device_id, request_id,
+                                   ctx),
+    !ActivationResponseCache(client_id, device_id,
+                             request_id, response_msg),
+    Out(< 'paired_response', client_id, request_id,
+          ~response_random, response_ct >) ]
+
+rule RedeliverActivationResponse:
+  [ !ActivationResponseCache(client_id, device_id, request_id,
+                             <response_random, response_ct>),
+    In(< 'routed_request_candidate', device_id, client_id,
+         request_id, candidate_envelope >) ]
+  --[ ActivationResponseRedelivered(client_id, device_id, request_id,
+                                    <response_random, response_ct>),
+      ResponseReleased(client_id, device_id, request_id,
+                       <response_random, response_ct>) ]->
+  [ Out(< 'paired_response', client_id, request_id,
+          response_random, response_ct >) ]
+
+/* Client activation occurs only after opening the context-bound response. */
+rule ClientAcceptsActivationResponse:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientWaitActivationResponse(client_id, device_id, pkD, psk,
+                                 request_id, enc, ctx),
+    In(< 'paired_response', client_id, request_id, response_random,
+         senc(activation_response, <key, nonce>) >) ]
+  --[ ClientActivationResponseAccepted(client_id, device_id, request_id,
+                                       activation_response),
+      ClientActivated(client_id, device_id, psk) ]->
+  [ !ClientActive(client_id, device_id, pkD, psk) ]
+
+/* Completion is record sequence one and may be sent independently of reply. */
+rule ClientSendsActivationCompletion:
+  let c1 = senc(~completion, record_key(ctx, 'record_1'))
+  in
+  [ ClientActivationCompletionReady(client_id, device_id, pkD, psk,
+                                    request_id, enc, ctx),
+    Fr(~completion) ]
+  --[ ClientActivationCompletionSent(client_id, request_id, ~completion),
+      ActivationCompletionSecret(client_id, device_id,
+                                 request_id, ~completion) ]->
+  [ !ActivationCompletionCache(client_id, request_id, c1),
+    Out(< 'paired_completion', client_id, request_id, c1 >) ]
+
+rule DeviceAcceptsActivationCompletion:
+  [ DeviceWaitActivationCompletion(client_id, device_id, request_id, ctx),
+    In(< 'paired_completion', client_id, request_id,
+         senc(completion, record_key(ctx, 'record_1')) >) ]
+  --[ DeviceActivationCompletionAccepted(client_id, device_id,
+                                         request_id, completion) ]->
+  [ !ActivationCompletionDisposition(client_id, request_id, 'accepted') ]
+
+rule RedeliverActivationCompletion:
+  [ !ActivationCompletionCache(client_id, request_id, c1),
+    In(< 'completion_redelivery', client_id, request_id >) ]
+  --[ ActivationCompletionRedelivered(client_id, request_id, c1) ]->
+  [ Out(< 'paired_completion', client_id, request_id, c1 >) ]
+
+rule IgnoreLaterActivationCompletion:
+  [ !ActivationCompletionDisposition(client_id, request_id, disposition),
+    In(< 'routed_completion_candidate', client_id,
+         request_id, candidate_envelope >) ]
+  --[ LaterActivationCompletionIgnored(client_id, request_id, disposition) ]->
+  [ ]
+
+/*
+ * Explicit active-relay response substitution.  Revealing rogue_sk models an
+ * adversary-controlled key pair; it lets the intruder open both base records.
+ */
+rule RoguePairingResponse:
+  [ In(< 'pairing_request', client_id, version, commit >),
+    Fr(~rogue_sk), Fr(~rogue_random), Fr(~rogue_device_id) ]
+  --[ RogueResponseSubstituted(client_id, ~rogue_device_id,
+                               pk(~rogue_sk), ~rogue_random) ]->
+  [ Out(~rogue_sk),
+    Out(< 'pairing_response', client_id, ~rogue_device_id,
+          pk(~rogue_sk), ~rogue_random >) ]
+
+/* Retained-slot/freshness semantics for adversary-selected client IDs. */
+restriction UniquePairingRequest:
+  "All client_id device_id commit1 commit2 #i #j.
+     DevicePairingRequestAccepted(client_id, device_id, commit1)@i
+   & DevicePairingRequestAccepted(client_id, device_id, commit2)@j
+   ==> #i = #j"
+
+restriction UniqueActivationRequest:
+  "All client_id device_id request_id enc1 p1 enc2 p2 #i #j.
+     DeviceActivationRequestAccepted(client_id, device_id, request_id,
+                                     enc1, p1)@i
+   & DeviceActivationRequestAccepted(client_id, device_id, request_id,
+                                     enc2, p2)@j
+   ==> #i = #j"
+
+/* ---------------- Pairing agreement and record order (P02/P03) -------- */
+
+lemma P02_completion_matches_committed_secret:
+  "All client_id device_id pkD secret app enc c0 c1 psk #i.
+       DevicePairingCompletionAccepted(client_id, device_id, pkD,
+                                       secret, app, enc, c0, c1, psk)@i
+     ==> (Ex commit #j.
+            DevicePairingRequestAccepted(client_id, device_id, commit)@j
+          & commit = commitment(secret)
+          & #j < #i)"
+
+lemma P02_ordered_distinct_base_records:
+  "All client_id device_id pkD secret app enc c0 c1 psk #i.
+       DevicePairingCompletionAccepted(client_id, device_id, pkD,
+                                       secret, app, enc, c0, c1, psk)@i
+     ==> not (c0 = c1)"
+
+lemma P03_sas_full_transcript_agreement:
+  "All client_id device_id pkD device_random secret psk code #i.
+       SASVerified(client_id, device_id, pkD, device_random,
+                   secret, psk, code)@i
+     ==> (Ex #j #k.
+            ClientSASReady(client_id, device_id, pkD, device_random,
+                           secret, psk, code)@j
+          & DeviceSASReady(client_id, device_id, pkD, device_random,
+                           secret, psk, code)@k
+          & #j < #i & #k < #i)"
+
+lemma P03_sas_injective:
+  "All client_id device_id psk #i #j.
+       PendingBindingEstablished(client_id, device_id, psk)@i
+     & PendingBindingEstablished(client_id, device_id, psk)@j
+     ==> #i = #j"
+
+lemma P05_no_activation_before_sas:
+  "All client_id device_id psk #i.
+       DeviceActivated(client_id, device_id, psk)@i
+     ==> (Ex pkD device_random secret code #j.
+            SASVerified(client_id, device_id, pkD, device_random,
+                        secret, psk, code)@j & #j < #i)"
+
+lemma P05_rejected_attempt_cannot_activate:
+  "All client_id device_id psk #i #j.
+       SASRejected(client_id, device_id)@i
+     & DeviceActivated(client_id, device_id, psk)@j
+     ==> F"
+
+/* ------------------------- Activation (P06/P07) ------------------------ */
+
+lemma P06_device_activation_agreement:
+  "All client_id device_id psk #i.
+       DeviceActivated(client_id, device_id, psk)@i
+     ==> (Ex request_id enc request #j.
+            ClientActivationRequestSent(client_id, device_id, request_id,
+                                        enc, request)@j
+          & #j < #i)
+       | (Ex #r. ClientPSKRevealed(client_id, psk)@r & #r < #i)
+       | (Ex #r. DeviceKeyRevealed(device_id)@r & #r < #i)"
+
+lemma P07_client_activation_authenticates_response:
+  "All client_id device_id psk #i.
+       ClientActivated(client_id, device_id, psk)@i
+     ==> (Ex request_id request_msg response_plain #j #k.
+            DeviceActivated(client_id, device_id, psk)@j
+          & DeviceActivationResponseFixed(client_id, request_id,
+                                          request_msg, response_plain)@k
+          & #j < #i & #k < #i)
+       | (Ex #r. DeviceKeyRevealed(device_id)@r & #r < #i)"
+
+/* ----------------------- Idempotency / uniqueness (P08) ---------------- */
+
+lemma P08_one_pairing_response_tuple:
+  "All client_id device_id pk1 random1 pk2 random2 #i #j.
+       DevicePairingResponseFixed(client_id, device_id, pk1, random1)@i
+     & DevicePairingResponseFixed(client_id, device_id, pk2, random2)@j
+     ==> pk1 = pk2 & random1 = random2"
+
+lemma P08_pairing_completion_processed_once:
+  "All client_id device_id pk1 secret1 app1 enc1 c01 c11 psk1
+       pk2 secret2 app2 enc2 c02 c12 psk2 #i #j.
+       DevicePairingCompletionAccepted(client_id, device_id, pk1,
+                                       secret1, app1, enc1, c01, c11, psk1)@i
+     & DevicePairingCompletionAccepted(client_id, device_id, pk2,
+                                       secret2, app2, enc2, c02, c12, psk2)@j
+     ==> #i = #j"
+
+lemma P08_pairing_response_redelivery_executable:
+  exists-trace
+  "Ex client_id device_id pkD random #i #j.
+       DevicePairingResponseFixed(client_id, device_id, pkD, random)@i
+     & PairingResponseRedelivered(client_id, device_id, pkD, random)@j
+     & #i < #j"
+
+lemma P08_pairing_completion_redelivery_executable:
+  exists-trace
+  "Ex client_id device_id pkD secret app enc c0 c1 psk #i #j.
+       ClientPairingCompletionSent(client_id, device_id, pkD,
+                                   secret, app, enc, c0, c1, psk)@i
+     & PairingCompletionRedelivered(client_id, enc, c0, c1)@j
+     & #i < #j"
+
+lemma P08_activation_processed_once:
+  "All client_id device_id request_id enc1 p1 enc2 p2 #i #j.
+       DeviceActivationRequestAccepted(client_id, device_id, request_id,
+                                       enc1, p1)@i
+     & DeviceActivationRequestAccepted(client_id, device_id, request_id,
+                                       enc2, p2)@j
+     ==> #i = #j"
+
+lemma P08_activation_response_redelivery_is_exact:
+  "All client_id device_id request_id msg1 msg2 #i #j.
+       ResponseReleased(client_id, device_id, request_id, msg1)@i
+     & ResponseReleased(client_id, device_id, request_id, msg2)@j
+     ==> msg1 = msg2"
+
+lemma P08_activation_completion_accepted_once:
+  "All client_id device_id request_id completion1 completion2 #i #j.
+       DeviceActivationCompletionAccepted(client_id, device_id,
+                                          request_id, completion1)@i
+     & DeviceActivationCompletionAccepted(client_id, device_id,
+                                          request_id, completion2)@j
+     ==> #i = #j"
+
+/* -------------------------- Confidentiality ----------------------------- */
+
+lemma pairing_application_secret_after_verified_sas:
+  "All client_id device_id pkD random secret psk code app #i #j #k.
+       SASVerified(client_id, device_id, pkD, random,
+                   secret, psk, code)@i
+     & PairingApplicationSecret(client_id, app)@j
+     & K(app)@k
+     ==> (Ex #r. DeviceKeyRevealed(device_id)@r)"
+
+lemma honest_request_id_is_not_rotation_reserved_id:
+  "All request_id #i.
+       HonestRequestID(request_id)@i
+     ==> not (request_id = 'zero_request_id')"
+
+end

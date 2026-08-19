@@ -1,0 +1,148 @@
+/*
+ * Agentknock v1: recorded-transcript lineage and delayed device-key compromise.
+ *
+ * One rule records an exact, honest base-mode export, an initial paired request,
+ * one PSK rotation, and a request under the successor.  The adversary receives
+ * only the public transcript until RevealStableDeviceKey.  This focused
+ * experiment checks the C03 reconstruction chain without the unrelated protocol
+ * interleavings covered by the active-attacker pairing and rotation theories.
+ * It mechanically covers one successor; arbitrary later successors are the
+ * repeated application of the same one-step derivation, not a separate theorem.
+ */
+
+theory Agentknock_End_To_End_Lineage
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  base_context/2,
+  psk_context/4,
+  record_key/2,
+  exporter/2
+
+rule RecordOneSuccessorLineage:
+  let base_info = hpke_info('agentknock-v1', ~device_id, ~client_id)
+      base_ctx = base_context(~pair_seed, base_info)
+      pair_enc = aenc(~pair_seed, pk(~skD))
+      pair_c0 = senc(~client_secret, record_key(base_ctx, 'record_0'))
+      pair_c1 = senc(~pair_app, record_key(base_ctx, 'record_1'))
+      psk0 = exporter(base_ctx, 'agentknock-v1 psk')
+
+      initial_info = hpke_info('agentknock-v1', ~device_id,
+                               ~initial_request_id)
+      initial_ctx = psk_context(~initial_seed, psk0,
+                                ~client_id, initial_info)
+      initial_enc = aenc(~initial_seed, pk(~skD))
+      initial_c0 = senc(~initial_secret,
+                        record_key(initial_ctx, 'record_0'))
+
+      rotation_info = hpke_info('agentknock-v1', ~device_id,
+                                'zero_request_id')
+      rotation_ctx = psk_context(~rotation_seed, psk0,
+                                 ~client_id, rotation_info)
+      rotation_enc = aenc(~rotation_seed, pk(~skD))
+      psk1 = exporter(rotation_ctx, 'agentknock-v1 psk')
+      rotation_request_info = hpke_info('agentknock-v1', ~device_id,
+                                        ~rotation_request_id)
+      rotation_request_ctx = psk_context(~rotation_request_seed, psk1,
+                                         ~client_id,
+                                         rotation_request_info)
+      rotation_request_enc = aenc(~rotation_request_seed, pk(~skD))
+      rotation_request_c0 = senc(~rotation_request_secret,
+                                 record_key(rotation_request_ctx,
+                                            'record_0'))
+
+      post_info = hpke_info('agentknock-v1', ~device_id,
+                            ~post_request_id)
+      post_ctx = psk_context(~post_seed, psk1, ~client_id, post_info)
+      post_enc = aenc(~post_seed, pk(~skD))
+      post_c0 = senc(~post_secret, record_key(post_ctx, 'record_0'))
+  in
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id),
+    Fr(~pair_seed), Fr(~client_secret), Fr(~pair_app),
+    Fr(~initial_request_id), Fr(~initial_seed), Fr(~initial_secret),
+    Fr(~rotation_seed), Fr(~rotation_request_id),
+    Fr(~rotation_request_seed), Fr(~rotation_request_secret),
+    Fr(~post_request_id), Fr(~post_seed), Fr(~post_secret) ]
+  --[ E2EBaseCompletionAccepted(~client_id, ~device_id,
+                               pair_enc, base_ctx, psk0),
+      E2ESASVerified(~client_id, ~device_id, psk0),
+      E2EInitialRequestSecret(~client_id, ~device_id,
+                              ~initial_request_id, psk0,
+                              ~initial_secret),
+      E2ERotationStarted(~client_id, ~device_id,
+                         psk0, psk1, rotation_enc, rotation_ctx),
+      E2ESuccessorRequestSecret(~client_id, ~device_id,
+                                ~rotation_request_id, psk1,
+                                ~rotation_request_secret),
+      E2EPostRotationRequestSecret(~client_id, ~device_id,
+                                   ~post_request_id, psk1,
+                                   ~post_secret),
+      HonestRequestID(~initial_request_id),
+      HonestRequestID(~rotation_request_id),
+      HonestRequestID(~post_request_id) ]->
+  [ !StableDeviceKey(~device_id, ~skD),
+    Out(< 'device_public', ~device_id, pk(~skD) >),
+    Out(< 'pairing_completion', ~client_id,
+          pair_enc, pair_c0, pair_c1 >),
+    Out(< 'ordinary_request', ~client_id, ~initial_request_id,
+          initial_enc, initial_c0, 'initial' >),
+    Out(< 'rotation_request', ~client_id, ~rotation_request_id,
+          rotation_request_enc, rotation_request_c0, rotation_enc >),
+    Out(< 'ordinary_request', ~client_id, ~post_request_id,
+          post_enc, post_c0, 'successor' >) ]
+
+rule RevealStableDeviceKey:
+  [ !StableDeviceKey(device_id, skD) ]
+  --[ E2EDeviceKeyRevealed(device_id) ]->
+  [ Out(skD) ]
+
+lemma C03_late_device_key_recovers_initial_psk:
+  exists-trace
+  "Ex client_id device_id psk0 #i #r #k.
+       E2ESASVerified(client_id, device_id, psk0)@i
+     & E2EDeviceKeyRevealed(device_id)@r
+     & K(psk0)@k & #i < #r & #r < #k"
+
+lemma C03_late_device_key_recovers_successor_lineage:
+  exists-trace
+  "Ex client_id device_id psk0 psk1 renc rctx #i #r #k.
+       E2ERotationStarted(client_id, device_id,
+                         psk0, psk1, renc, rctx)@i
+     & E2EDeviceKeyRevealed(device_id)@r
+     & K(psk1)@k & #i < #r & #r < #k"
+
+lemma C03_late_device_key_decrypts_pre_and_post_rotation_traffic:
+  exists-trace
+  "Ex client_id device_id rid0 rid1 psk0 psk1 secret0 secret1
+      #a #b #r #k #l.
+       E2EInitialRequestSecret(client_id, device_id,
+                              rid0, psk0, secret0)@a
+     & E2EPostRotationRequestSecret(client_id, device_id,
+                                   rid1, psk1, secret1)@b
+     & E2EDeviceKeyRevealed(device_id)@r
+     & K(secret0)@k & K(secret1)@l
+     & #a < #r & #b < #r & #r < #k & #r < #l"
+
+lemma no_initial_psk_disclosure_without_device_key:
+  "All client_id device_id psk0 #i #k.
+       E2ESASVerified(client_id, device_id, psk0)@i
+     & K(psk0)@k
+     ==> (Ex #r. E2EDeviceKeyRevealed(device_id)@r)"
+
+lemma domain_and_mode_contexts_are_distinct:
+  "All client_id device_id enc base_ctx psk0 psk1 renc rctx #i #j.
+       E2EBaseCompletionAccepted(client_id, device_id,
+                                enc, base_ctx, psk0)@i
+     & E2ERotationStarted(client_id, device_id,
+                         psk0, psk1, renc, rctx)@j
+     ==> not (base_ctx = rctx)"
+
+lemma honest_request_id_is_not_rotation_reserved_id:
+  "All request_id #i.
+       HonestRequestID(request_id)@i
+     ==> not (request_id = 'zero_request_id')"
+
+end

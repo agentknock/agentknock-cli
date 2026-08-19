@@ -1,0 +1,20 @@
+(**
+  Agentknock v1 pairing-address experiment for C05.
+
+  The relay-visible address_id is a deterministic public HKDF image of a weak
+  pairing address.  ProVerif's weak-secret equivalence query must report an
+  offline guessing attack.  This is qualitative; it does not model a concrete
+  dictionary, entropy, or HKDF cost.
+*)
+
+free network: channel.
+free base_salt: bitstring.
+free address_label: bitstring.
+free pairing_address: bitstring [private].
+
+fun address_hkdf(bitstring, bitstring, bitstring): bitstring.
+
+weaksecret pairing_address.
+
+process
+  out(network, address_hkdf(base_salt, pairing_address, address_label))

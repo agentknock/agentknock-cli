@@ -1,0 +1,90 @@
+(**
+  Agentknock v1 compromise experiment for C01/C02.
+
+  An honest paired ciphertext is recorded, then the current client PSK is
+  disclosed.  Historical plaintext secrecy must still hold without skD or the
+  sender ephemeral (C02), while authentication of future client requests must
+  fail because the attacker can create a new PSK-mode context (C01).
+*)
+
+set preciseActions = true.
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free request_tag: bitstring.
+free version_v1: bitstring.
+free sequence_zero: record_sequence.
+free historical_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+
+event HonestClientSend(bitstring, bitstring, bitstring).
+event DeviceAccept(bitstring, bitstring, bitstring).
+
+(** C02: a PSK alone cannot reconstruct the recorded DH/KEM context. *)
+query attacker(historical_plaintext) ==> false.
+
+(** C01 expected attack: after disclosure, the attacker impersonates client. *)
+query cid: bitstring, rid: bitstring, message: bitstring;
+  event(DeviceAccept(cid, rid, message)) ==>
+  event(HonestClientSend(cid, rid, message)).
+
+let HonestClient(
+  public_key: device_public_key, device_id: bitstring,
+  client_id: bitstring, binding_psk: psk
+) =
+  new request_id: bitstring;
+  new ephemeral_key: ephemeral_secret_key;
+  let enc = encapsulate(ephemeral_key) in
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_sender(ephemeral_key, public_key), binding_psk, client_id, info
+  ) in
+  let ciphertext = hpke_seal(
+    historical_plaintext, context, sequence_zero
+  ) in
+  event HonestClientSend(client_id, request_id, historical_plaintext);
+  out(network,
+    (request_tag, client_id, request_id, version_v1, enc, ciphertext));
+  (* Durable-state disclosure after the historical ciphertext is recorded. *)
+  out(network, binding_psk).
+
+let Device(
+  secret_key: device_secret_key, device_id: bitstring, binding_psk: psk
+) =
+  in(network,
+    (=request_tag, client_id: bitstring, request_id: bitstring,
+     =version_v1, enc: encapsulated_key, ciphertext: bitstring));
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_receiver(enc, secret_key), binding_psk, client_id, info
+  ) in
+  let message = hpke_open(ciphertext, context, sequence_zero) in
+  event DeviceAccept(client_id, request_id, message).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  new client_id: bitstring;
+  new binding_psk: psk;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id, public_key, client_id));
+  (HonestClient(public_key, device_id, client_id, binding_psk) |
+   (!Device(secret_key, device_id, binding_psk)))

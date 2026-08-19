@@ -1,0 +1,116 @@
+/*
+ * Agentknock v1: focused pre-SAS active-attacker witnesses.
+ *
+ * This theory contains only the base-mode pairing steps needed for P04 and
+ * the unauthenticated-metadata half of P05.  Removing later activation and
+ * replay rules does not weaken either existential attack: both traces end at
+ * pairing completion, before SAS approval.  The full positive model is
+ * pairing_activation.spthy.
+ */
+
+theory Agentknock_Pairing_Pre_SAS_Attacks
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption, hashing
+
+functions:
+  commitment/1,
+  hpke_info/3,
+  base_context/2,
+  record_key/2,
+  exporter/2,
+  sas/5
+
+rule RegisterDevice:
+  [ Fr(~skD), Fr(~device_id) ]
+  -->
+  [ !Device(~device_id, ~skD),
+    Out(< 'device_identity', ~device_id, pk(~skD) >) ]
+
+rule RevealDeviceKey:
+  [ !Device(device_id, skD) ]
+  --[ DeviceKeyRevealed(device_id) ]->
+  [ Out(skD) ]
+
+rule ClientStartsPairing:
+  let commit = commitment(~client_secret)
+  in
+  [ Fr(~client_id), Fr(~client_secret), Fr(~pairing_application) ]
+  --[ ClientPairingStarted(~client_id, ~client_secret,
+                           ~pairing_application, commit) ]->
+  [ ClientWaitResponse(~client_id, ~client_secret,
+                       ~pairing_application, commit),
+    Out(< 'pairing_request', ~client_id, 'agentknock-v1', commit >) ]
+
+rule DeviceAcceptsPairingRequest:
+  [ !Device(device_id, skD),
+    In(< 'pairing_request', client_id, 'agentknock-v1', commit >),
+    Fr(~device_random) ]
+  --[ DevicePairingRequestAccepted(client_id, device_id, commit) ]->
+  [ DeviceWaitCompletion(client_id, device_id, skD,
+                         commit, ~device_random),
+    Out(< 'pairing_response', client_id, device_id,
+          pk(skD), ~device_random >) ]
+
+rule ClientAcceptsClearResponse:
+  let info = hpke_info('agentknock-v1', device_id, client_id)
+      ctx = base_context(~kem_seed, info)
+      enc = aenc(~kem_seed, pkD)
+      c0 = senc(client_secret, record_key(ctx, 'record_0'))
+      c1 = senc(pairing_application, record_key(ctx, 'record_1'))
+  in
+  [ ClientWaitResponse(client_id, client_secret,
+                       pairing_application, commitment(client_secret)),
+    In(< 'pairing_response', client_id, device_id, pkD, device_random >),
+    Fr(~kem_seed) ]
+  -->
+  [ Out(< 'pairing_completion', client_id, enc, c0, c1 >) ]
+
+rule DeviceAcceptsPairingCompletion:
+  let info = hpke_info('agentknock-v1', device_id, client_id)
+      ctx = base_context(kem_seed, info)
+      enc = aenc(kem_seed, pk(skD))
+      c0 = senc(client_secret, record_key(ctx, 'record_0'))
+      c1 = senc(pairing_application, record_key(ctx, 'record_1'))
+  in
+  [ DeviceWaitCompletion(client_id, device_id, skD,
+                         commitment(client_secret), device_random),
+    In(< 'pairing_completion', client_id, enc, c0, c1 >) ]
+  --[ DevicePendingMetadata(client_id, pairing_application) ]->
+  [ ]
+
+rule RoguePairingResponse:
+  [ In(< 'pairing_request', client_id, version, commit >),
+    Fr(~rogue_sk), Fr(~rogue_random), Fr(~rogue_device_id) ]
+  --[ RogueResponseSubstituted(client_id, ~rogue_device_id,
+                               pk(~rogue_sk), ~rogue_random) ]->
+  [ Out(~rogue_sk),
+    Out(< 'pairing_response', client_id, ~rogue_device_id,
+          pk(~rogue_sk), ~rogue_random >) ]
+
+restriction UniquePairingRequest:
+  "All client_id device_id commit1 commit2 #i #j.
+       DevicePairingRequestAccepted(client_id, device_id, commit1)@i
+     & DevicePairingRequestAccepted(client_id, device_id, commit2)@j
+     ==> #i = #j"
+
+lemma P04_active_relay_learns_pre_sas_application:
+  exists-trace
+  "Ex client_id app secret commit rogue_device rogue_pk rogue_random #i #j #k.
+       ClientPairingStarted(client_id, secret, app, commit)@i
+     & RogueResponseSubstituted(client_id, rogue_device,
+                               rogue_pk, rogue_random)@j
+     & K(app)@k
+     & #i < #j & #j < #k
+     & not (Ex revealed_device #r.
+              DeviceKeyRevealed(revealed_device)@r)"
+
+lemma P05_device_pending_metadata_can_be_attacker_chosen:
+  exists-trace
+  "Ex client_id app #i #j.
+       DevicePendingMetadata(client_id, app)@i
+     & K(app)@j & #j < #i
+     & not (Ex revealed_device #r.
+              DeviceKeyRevealed(revealed_device)@r)"
+
+end

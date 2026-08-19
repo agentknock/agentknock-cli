@@ -1,0 +1,58 @@
+/*
+ * Agentknock v1: per-binding state isolation.
+ *
+ * Candidate authentication is proved in psk_rotation.spthy.  This focused
+ * state theory checks the orthogonal map-indexing claim: a transition for one
+ * client binding does not mutate a different client entry on the same device.
+ * The linear DeviceBinding fact is the specification's atomic per-binding
+ * record (implementation persistence remains O05).
+ */
+
+theory Agentknock_Binding_Isolation
+begin
+
+rule RegisterDevice:
+  [ Fr(~device_id) ]
+  -->
+  [ !Device(~device_id) ]
+
+rule EstablishActiveBinding:
+  [ !Device(device_id), Fr(~client_id), Fr(~psk) ]
+  --[ ActiveBindingEstablished(~client_id, device_id, ~psk) ]->
+  [ DeviceBinding(~client_id, device_id, ~psk, 'none', 'none') ]
+
+rule RotateSelectedBindingWithOtherPresent:
+  [ DeviceBinding(client1, device_id, old_psk,
+                  selected_previous_flag, selected_previous_psk),
+    DeviceBinding(client2, device_id, other_current_psk,
+                  other_previous_flag, other_previous_psk),
+    Fr(~new_psk) ]
+  --[ DeviceBindingChanged(client1, device_id, old_psk, ~new_psk),
+      DeviceBindingMutation(client1, device_id),
+      OtherBindingPreserved(client1, client2, device_id,
+                            <other_current_psk,
+                             <other_previous_flag, other_previous_psk>>,
+                            <other_current_psk,
+                             <other_previous_flag, other_previous_psk>>) ]->
+  [ DeviceBinding(client1, device_id, ~new_psk,
+                  'previous', old_psk),
+    DeviceBinding(client2, device_id, other_current_psk,
+                  other_previous_flag, other_previous_psk) ]
+
+lemma R09_two_bindings_rotation_isolation_executable:
+  exists-trace
+  "Ex client1 client2 device_id psk2 old new state #a #b #d.
+       ActiveBindingEstablished(client1, device_id, old)@a
+     & ActiveBindingEstablished(client2, device_id, psk2)@b
+     & DeviceBindingChanged(client1, device_id, old, new)@d
+     & OtherBindingPreserved(client1, client2, device_id,
+                             state, state)@d
+     & not (client1 = client2)"
+
+lemma R09_other_binding_stable_without_its_own_mutation:
+  "All client1 client2 device_id before after #i.
+       OtherBindingPreserved(client1, client2, device_id,
+                             before, after)@i
+     ==> before = after"
+
+end

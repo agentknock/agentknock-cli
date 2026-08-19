@@ -1,0 +1,57 @@
+// Deliberate negative control for X04/X05.
+// request_id is intentionally absent from the PSK key schedule.  One session
+// is insufficient to expose the error; with two sessions the relay can move
+// a protected record into another routing request slot.  The KEM layer is
+// deliberately elided in this focused control because it is orthogonal to the
+// missing context field and makes Verifpal's bounded search less complete.
+
+attacker[active]
+
+principal Client[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public device_id, client_id
+	knows private client_psk
+]
+
+principal Device[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public device_id, client_id
+	knows private client_psk
+]
+
+principal Client[
+	generates request_id, request_plaintext
+	// BUG: request_id is absent from this context.
+	broken_binding = CONCAT(hpke_psk_label, version_info, device_id, client_id)
+	request_key = HKDF(
+		client_psk,
+		broken_binding,
+		hpke_schedule_label
+	)
+	request_ciphertext = AEAD_ENC(request_key, request_plaintext, nil)
+]
+
+Client -> Device: request_id, request_ciphertext
+
+principal Device[
+	broken_binding_device = CONCAT(
+		hpke_psk_label,
+		version_info,
+		device_id,
+		client_id
+	)
+	request_key_device = HKDF(
+		client_psk,
+		broken_binding_device,
+		hpke_schedule_label
+	)
+	request_plaintext_device = AEAD_DEC(
+		request_key_device,
+		request_ciphertext,
+		nil
+	)?
+]
+
+queries[
+	equivalence? request_plaintext, request_plaintext_device
+]

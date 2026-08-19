@@ -1,0 +1,78 @@
+/* Agentknock v1: a compromised previous PSK cannot rotate (R05). */
+
+theory Agentknock_Previous_PSK_Compromise
+begin
+
+builtins: asymmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  exporter/2
+
+rule EstablishOverlap:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id),
+    Fr(~current_psk), Fr(~old_psk) ]
+  -->
+  [ !PublicDevice(~device_id, pk(~skD)),
+    !PreviousPSKCopy(~client_id, ~device_id, ~old_psk),
+    DeviceOverlap(~client_id, ~device_id, ~skD,
+                  ~current_psk, ~old_psk) ]
+
+rule RevealPreviousPSK:
+  [ !PreviousPSKCopy(client_id, device_id, old_psk) ]
+  --[ PreviousPSKRevealed(client_id, device_id, old_psk) ]->
+  [ !CompromisedPreviousPSK(client_id, device_id, old_psk),
+    Out(old_psk) ]
+
+rule CompromisedPreviousAttemptsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      attempted_psk = exporter(rctx, 'agentknock-v1 psk')
+  in
+  [ !CompromisedPreviousPSK(client_id, device_id, old_psk),
+    !PublicDevice(device_id, pkD),
+    Fr(~rotation_seed), Fr(~request_id) ]
+  --[ PreviousPSKRotationAttempt(client_id, device_id, old_psk,
+                                attempted_psk, renc, ~request_id) ]->
+  [ PreviousRotationAuthWire(client_id, device_id, ~request_id,
+                             renc, attempted_psk) ]
+
+/*
+ * PreviousRotationAuthWire is the assume/guarantee boundary for the checked
+ * ordinary-request gate: its final argument is exactly the PSK under which the
+ * request authenticated.  The core rotation model and ProVerif model establish
+ * that checked gate from the full HPKE/record terms.  Keeping that deconstruction
+ * out of this local compromise theory avoids duplicating an expensive proof.
+ * This rule can therefore adopt only when that authenticated PSK is the candidate
+ * derived from the device's actual current PSK.
+ */
+rule DeviceWouldAdoptCurrentDerivedCandidate:
+  let rctx = psk_context(rotation_seed, current_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(rotation_seed, pk(skD))
+      candidate_psk = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context('checked_request_seed', candidate_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+  in
+  [ DeviceOverlap(client_id, device_id, skD, current_psk, old_psk),
+    PreviousRotationAuthWire(client_id, device_id, request_id,
+                             renc, candidate_psk) ]
+  --[ DeviceCandidateAdopted(client_id, device_id, request_id,
+                            current_psk, candidate_psk,
+                            renc, rctx, ctx, <'previous', old_psk>) ]->
+  [ ]
+
+lemma R05_compromised_previous_psk_cannot_rotate:
+  "All client_id device_id old attempted renc rid #i.
+       PreviousPSKRotationAttempt(client_id, device_id, old,
+                                 attempted, renc, rid)@i
+     ==> not (Ex current rctx ctx prev #j.
+                 DeviceCandidateAdopted(client_id, device_id, rid,
+                                        current, attempted, renc,
+                                        rctx, ctx, prev)@j)"
+
+end

@@ -1,0 +1,41 @@
+/*
+ * Agentknock v1: fixed previous-PSK expiry (R05).
+ *
+ * This is the local overlap transition for an arbitrary current/previous
+ * pair.  Other operations that preserve this pair are stuttering steps for
+ * the property.  A later candidate adoption replaces the pair and cannot
+ * reintroduce the fresh old generation; replacement is checked separately in
+ * previous_psk_replacement.spthy.
+ */
+
+theory Agentknock_Previous_PSK_Expiry
+begin
+
+rule EstablishOverlap:
+  [ Fr(~client_id), Fr(~device_id), Fr(~current_psk), Fr(~old_psk) ]
+  -->
+  [ Overlap(~client_id, ~device_id, ~current_psk, ~old_psk) ]
+
+rule AcceptUnderPreviousPSK:
+  [ Overlap(client_id, device_id, current_psk, old_psk),
+    Fr(~request_id) ]
+  --[ DevicePreviousRequestAccepted(client_id, device_id, ~request_id,
+                                    current_psk, old_psk,
+                                    'no_rotation', 'state_ctx') ]->
+  [ Overlap(client_id, device_id, current_psk, old_psk) ]
+
+rule ExpirePreviousPSK:
+  [ Overlap(client_id, device_id, current_psk, old_psk) ]
+  --[ PreviousPSKExpired(client_id, device_id,
+                        current_psk, old_psk) ]->
+  [ ]
+
+lemma R05_expired_previous_never_authenticates_later [use_induction]:
+  "All client_id device_id current old rid later_current rotation ctx #i #j.
+       PreviousPSKExpired(client_id, device_id, current, old)@i
+     & DevicePreviousRequestAccepted(client_id, device_id, rid,
+                                     later_current, old,
+                                     rotation, ctx)@j
+     ==> #j < #i"
+
+end

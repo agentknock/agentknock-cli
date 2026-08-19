@@ -1,0 +1,96 @@
+(**
+  Negative control for P04/P05.
+
+  This is the initial clear response plus HPKE base-mode completion, with the
+  SAS comparison deliberately absent.  Both queries must fail: an active relay
+  substitutes its own public key, learns the pre-SAS application plaintext,
+  and makes the client complete a base exchange that has no matching honest
+  device response.
+*)
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free version_v1: bitstring.
+free pairing_request_tag: bitstring.
+free pairing_response_tag: bitstring.
+free pairing_completion_tag: bitstring.
+free commitment_label: bitstring.
+free sequence_zero: record_sequence.
+free sequence_one: record_sequence.
+
+free pairing_application_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun commitment(bitstring, bitstring): bitstring.
+fun hpke_base_context(kem_secret, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+
+event HonestDeviceResponse(bitstring, bitstring, device_public_key, bitstring).
+event ClientCompleteBaseExchange(bitstring, bitstring, device_public_key, bitstring).
+
+(** Expected attack: P04 says this plaintext is not confidential pre-SAS. *)
+query attacker(pairing_application_plaintext) ==> false.
+
+(** Expected attack: base mode does not authenticate the intended device. *)
+query did: bitstring, cid: bitstring, public_key: device_public_key,
+      device_random: bitstring;
+  event(ClientCompleteBaseExchange(did, cid, public_key, device_random)) ==>
+  event(HonestDeviceResponse(did, cid, public_key, device_random)).
+
+let Client() =
+  new client_id: bitstring;
+  new client_secret: bitstring;
+  let committed = commitment(commitment_label, client_secret) in
+  out(network, (pairing_request_tag, client_id, version_v1, committed));
+  in(network,
+    (=pairing_response_tag, =client_id, device_id: bitstring,
+     public_key: device_public_key, device_random: bitstring));
+  new pairing_ephemeral: ephemeral_secret_key;
+  let enc = encapsulate(pairing_ephemeral) in
+  let info = hpke_info(version_v1, device_id, client_id) in
+  let context = hpke_base_context(
+    kem_sender(pairing_ephemeral, public_key), info
+  ) in
+  let secret_ciphertext = hpke_seal(
+    client_secret, context, sequence_zero
+  ) in
+  let application_ciphertext = hpke_seal(
+    pairing_application_plaintext, context, sequence_one
+  ) in
+  event ClientCompleteBaseExchange(
+    device_id, client_id, public_key, device_random
+  );
+  out(network,
+    (pairing_completion_tag, client_id, enc,
+     secret_ciphertext, application_ciphertext)).
+
+let Device(secret_key: device_secret_key, device_id: bitstring) =
+  in(network,
+    (=pairing_request_tag, client_id: bitstring,
+     =version_v1, committed: bitstring));
+  new device_random: bitstring;
+  let public_key = device_public(secret_key) in
+  event HonestDeviceResponse(
+    device_id, client_id, public_key, device_random
+  );
+  out(network,
+    (pairing_response_tag, client_id, device_id, public_key, device_random)).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  ((!Client()) | (!Device(secret_key, device_id)))

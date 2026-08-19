@@ -1,0 +1,67 @@
+// Deliberate pre-gate diagnostic for R02/R03.
+// A relay can replace a well-formed rotation encapsulation, so the raw
+// candidate derived before the ordinary request is checked need not equal the
+// client's successor.  This is denial of service, not adoption: rotation.vp
+// shows that the later checked request/response path still agrees.  Verifpal
+// cannot condition an equivalence query on successful checked-open adoption.
+
+attacker[active]
+
+principal Client[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public psk_export_label, rotation_request_id
+	knows public device_id, client_id
+	knows private current_psk
+]
+
+principal Device[
+	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public psk_export_label, rotation_request_id
+	knows public device_id, client_id
+	knows private current_psk, device_private_key
+	device_public_key = PUBKEY(device_private_key)
+]
+
+Device -> Client: [device_public_key]
+
+principal Client[
+	generates rotation_kem_random
+	rotation_kem_secret, rotation_enc = KEM_ENCAP(
+		device_public_key,
+		rotation_kem_random
+	)
+	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
+	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
+	rotation_context = HKDF(
+		CONCAT(rotation_kem_secret, current_psk),
+		rotation_binding,
+		hpke_schedule_label
+	)
+	successor_psk = HKDF(rotation_context, psk_export_label, nil)
+]
+
+Client -> Device: rotation_enc
+
+principal Device[
+	rotation_kem_secret_device = KEM_DECAP(
+		device_private_key,
+		rotation_enc
+	)?
+	rotation_info_device = CONCAT(version_info, device_id, rotation_request_id)
+	rotation_binding_device = CONCAT(
+		hpke_psk_label,
+		rotation_info_device,
+		client_id
+	)
+	rotation_context_device = HKDF(
+		CONCAT(rotation_kem_secret_device, current_psk),
+		rotation_binding_device,
+		hpke_schedule_label
+	)
+	candidate_psk = HKDF(rotation_context_device, psk_export_label, nil)
+]
+
+queries[
+	// Expected failure: candidate_psk is not an adopted state value.
+	equivalence? successor_psk, candidate_psk
+]

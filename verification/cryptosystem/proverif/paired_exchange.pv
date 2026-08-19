@@ -1,0 +1,175 @@
+(**
+  Agentknock v1: ordinary paired request/response/completion.
+
+  Claims covered: X01-X05 (symbolic cryptographic core), and the
+  cryptographic part of X07.  X06-X08 require mutable retained state and are
+  intentionally left to the Tamarin model.
+
+  HPKE is modeled as a perfect symbolic KEM-derived context.  The context
+  explicitly contains mode, PSK, psk_id, info, exporter label, and record
+  sequence.  This proves properties of that abstraction, not RFC 9180 itself.
+*)
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+
+free version_v1: bitstring.
+free request_tag: bitstring.
+free response_tag: bitstring.
+free completion_tag: bitstring.
+free response_exporter_label: bitstring.
+free response_key_label: bitstring.
+free response_nonce_label: bitstring.
+free sequence_zero: record_sequence.
+free sequence_one: record_sequence.
+
+free request_plaintext: bitstring [private].
+free response_plaintext: bitstring [private].
+free completion_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+
+fun hpke_export(hpke_context, bitstring): bitstring.
+fun derive_response_value(bitstring, encapsulated_key, bitstring, bitstring): bitstring.
+fun response_seal(bitstring, bitstring, bitstring): bitstring.
+reduc forall message: bitstring, key: bitstring, nonce: bitstring;
+  response_open(response_seal(message, key, nonce), key, nonce) = message.
+
+event ClientSendRequest(bitstring, bitstring, bitstring, bitstring).
+event DeviceAcceptRequest(bitstring, bitstring, bitstring, bitstring).
+event DeviceSendResponse(bitstring, bitstring, bitstring, bitstring).
+event ClientAcceptResponse(bitstring, bitstring, bitstring, bitstring).
+event ClientSendCompletion(bitstring, bitstring, bitstring, bitstring).
+event DeviceAcceptCompletion(bitstring, bitstring, bitstring, bitstring).
+
+(** Sanity witness: expected false means a full honest exchange is reachable. *)
+query did: bitstring, cid: bitstring, rid: bitstring, message: bitstring;
+  event(ClientAcceptResponse(did, cid, rid, message)) ==> false.
+
+(** X01: relay secrecy of the ordinary request. *)
+query attacker(request_plaintext) ==> false.
+(** X02: relay secrecy of the response. *)
+query attacker(response_plaintext) ==> false.
+(** X03: relay secrecy of the sequence-1 completion. *)
+query attacker(completion_plaintext) ==> false.
+
+(** X01/X04/X05: acceptance agrees on device/client/request context and text. *)
+query did: bitstring, cid: bitstring, rid: bitstring, message: bitstring;
+  event(DeviceAcceptRequest(did, cid, rid, message)) ==>
+  event(ClientSendRequest(did, cid, rid, message)).
+
+(** X02/X04/X05: an accepted response comes from the matching request context. *)
+query did: bitstring, cid: bitstring, rid: bitstring, message: bitstring;
+  inj-event(ClientAcceptResponse(did, cid, rid, message)) ==>
+  inj-event(DeviceSendResponse(did, cid, rid, message)).
+
+(** X03-X05: the sequence-1 completion agrees on the entire request context. *)
+query did: bitstring, cid: bitstring, rid: bitstring, message: bitstring;
+  event(DeviceAcceptCompletion(did, cid, rid, message)) ==>
+  event(ClientSendCompletion(did, cid, rid, message)).
+
+let Client(public_key: device_public_key, device_id: bitstring, binding_psk: psk) =
+  new client_id: bitstring;
+  new request_id: bitstring;
+  new ephemeral_key: ephemeral_secret_key;
+  let enc = encapsulate(ephemeral_key) in
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_sender(ephemeral_key, public_key), binding_psk, client_id, info
+  ) in
+  let request_ciphertext = hpke_seal(request_plaintext, context, sequence_zero) in
+  event ClientSendRequest(device_id, client_id, request_id, request_plaintext);
+  out(network, (request_tag, client_id, request_id, version_v1, enc, request_ciphertext));
+
+  (* A completion may be sent without first receiving a response. *)
+  let completion_ciphertext = hpke_seal(completion_plaintext, context, sequence_one) in
+  event ClientSendCompletion(device_id, client_id, request_id, completion_plaintext);
+  out(network, (completion_tag, client_id, request_id, completion_ciphertext));
+
+  in(network,
+    (=response_tag, =client_id, =request_id,
+     response_random: bitstring, response_ciphertext: bitstring));
+  let exported = hpke_export(context, response_exporter_label) in
+  let key = derive_response_value(
+    exported, enc, response_random, response_key_label
+  ) in
+  let nonce = derive_response_value(
+    exported, enc, response_random, response_nonce_label
+  ) in
+  let received_response = response_open(response_ciphertext, key, nonce) in
+  event ClientAcceptResponse(
+    device_id, client_id, request_id, received_response
+  ).
+
+let Device(secret_key: device_secret_key, device_id: bitstring, binding_psk: psk) =
+  in(network,
+    (=request_tag, client_id: bitstring, request_id: bitstring,
+     =version_v1, enc: encapsulated_key, request_ciphertext: bitstring));
+  let info = hpke_info(version_v1, device_id, request_id) in
+  let context = hpke_psk_context(
+    kem_receiver(enc, secret_key), binding_psk, client_id, info
+  ) in
+  let received_request = hpke_open(
+    request_ciphertext, context, sequence_zero
+  ) in
+  event DeviceAcceptRequest(
+    device_id, client_id, request_id, received_request
+  );
+
+  let exported = hpke_export(context, response_exporter_label) in
+  new response_random: bitstring;
+  let key = derive_response_value(
+    exported, enc, response_random, response_key_label
+  ) in
+  let nonce = derive_response_value(
+    exported, enc, response_random, response_nonce_label
+  ) in
+  let response_ciphertext = response_seal(response_plaintext, key, nonce) in
+  event DeviceSendResponse(
+    device_id, client_id, request_id, response_plaintext
+  );
+  out(network,
+    (response_tag, client_id, request_id, response_random, response_ciphertext));
+
+  in(network,
+    (=completion_tag, =client_id, =request_id, completion_ciphertext: bitstring));
+  let received_completion = hpke_open(
+    completion_ciphertext, context, sequence_one
+  ) in
+  event DeviceAcceptCompletion(
+    device_id, client_id, request_id, received_completion
+  ).
+
+process
+  new secret_key: device_secret_key;
+  (* Two aliases deliberately share one key and PSK.  This stronger test makes
+     device_id, psk_id/client_id, and request_id context separation observable
+     instead of relying on different secret keys. *)
+  new device_id_a: bitstring;
+  new device_id_b: bitstring;
+  new binding_psk: psk;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id_a, public_key));
+  out(network, (device_id_b, public_key));
+  ((!Client(public_key, device_id_a, binding_psk)) |
+   (!Client(public_key, device_id_b, binding_psk)) |
+   (!Device(secret_key, device_id_a, binding_psk)) |
+   (!Device(secret_key, device_id_b, binding_psk)))

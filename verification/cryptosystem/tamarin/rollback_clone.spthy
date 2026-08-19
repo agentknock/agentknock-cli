@@ -1,0 +1,127 @@
+/*
+ * Agentknock v1 advertised non-property: cloned/rolled-back client state.
+ *
+ * A valid active client binding is duplicated without disclosing its PSK to
+ * the network adversary.  Both copies derive distinct successors from the
+ * same generation and race authenticated rotation requests.  Exactly one can
+ * become the device successor; the other copy is stranded on a fork.
+ */
+
+theory Agentknock_Rollback_Clone
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2
+
+rule CreateActiveBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk0) ]
+  --[ CloneTestBindingEstablished(~client_id, ~device_id, ~psk0) ]->
+  [ !PublicDevice(~device_id, pk(~skD)),
+    ClientBinding(~client_id, ~device_id, pk(~skD), ~psk0),
+    DeviceBinding(~client_id, ~device_id, ~skD, ~psk0) ]
+
+/* This is the storage rollback/copy event, not an intruder key disclosure. */
+rule CloneValidClientState:
+  [ ClientBinding(client_id, device_id, pkD, psk0) ]
+  --[ ValidClientStateCloned(client_id, device_id, psk0) ]->
+  [ ClientCopy('copy_A', client_id, device_id, pkD, psk0),
+    ClientCopy('copy_B', client_id, device_id, pkD, psk0) ]
+
+rule ClientCopyStartsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk,
+                         client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      candidate = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(~request_seed, candidate,
+                        client_id,
+                        hpke_info('agentknock-v1', device_id,
+                                  ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc('fork_request', record_key(ctx, 'record_0'))
+  in
+  [ ClientCopy(copy, client_id, device_id, pkD, old_psk),
+    Fr(~rotation_seed), Fr(~request_seed), Fr(~request_id) ]
+  --[ CloneBranchRotationStarted(copy, client_id, device_id,
+                                ~request_id, old_psk,
+                                candidate, renc, rctx, ctx),
+      HonestRequestID(~request_id) ]->
+  [ ForkedClientCopy(copy, client_id, device_id, pkD, candidate, renc),
+    Out(< 'clone_rotation_request', client_id, ~request_id,
+          enc, c0, renc >) ]
+
+/* Candidate derivation is authorized only from the device's current state. */
+rule DeviceAdoptsOneCloneBranch:
+  let rctx = psk_context(rotation_seed, current_psk,
+                         client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(rotation_seed, pk(skD))
+      candidate = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(request_seed, candidate,
+                        client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc('fork_request', record_key(ctx, 'record_0'))
+  in
+  [ DeviceBinding(client_id, device_id, skD, current_psk),
+    In(< 'clone_rotation_request', client_id, request_id,
+         enc, c0, renc >) ]
+  --[ DeviceAdoptedCloneBranch(client_id, device_id, request_id,
+                              current_psk,
+                              candidate, renc, rctx, ctx) ]->
+  [ DeviceBinding(client_id, device_id, skD, candidate),
+    DevicePreviousGeneration(client_id, device_id, current_psk) ]
+
+lemma C04_two_clones_fork_distinct_successors:
+  exists-trace
+  "Ex client_id device_id old pskA pskB ridA ridB
+      encA rctxA ctxA encB rctxB ctxB #c #a #b.
+       ValidClientStateCloned(client_id, device_id, old)@c
+     & CloneBranchRotationStarted('copy_A', client_id, device_id,
+                                  ridA, old, pskA,
+                                  encA, rctxA, ctxA)@a
+     & CloneBranchRotationStarted('copy_B', client_id, device_id,
+                                  ridB, old, pskB,
+                                  encB, rctxB, ctxB)@b
+     & not (pskA = pskB)"
+
+lemma C04_forked_rotations_race_one_device_lineage:
+  exists-trace
+  "Ex client_id device_id old pskA pskB ridA ridB
+      encA rctxA ctxA encB rctxB ctxB #c #a #b #w.
+       ValidClientStateCloned(client_id, device_id, old)@c
+     & CloneBranchRotationStarted('copy_A', client_id, device_id,
+                                  ridA, old, pskA,
+                                  encA, rctxA, ctxA)@a
+     & CloneBranchRotationStarted('copy_B', client_id, device_id,
+                                  ridB, old, pskB,
+                                  encB, rctxB, ctxB)@b
+     & DeviceAdoptedCloneBranch(client_id, device_id, ridA,
+                                old, pskA,
+                                encA, rctxA, ctxA)@w
+     & #a < #w & #b < #w & not (pskA = pskB)"
+
+lemma C04_at_most_one_distinct_fork_candidate_is_adopted:
+  "All client_id device_id old psk1 psk2
+       rid1 rid2 enc1 enc2 rctx1 rctx2 ctx1 ctx2 #i #j.
+       DeviceAdoptedCloneBranch(client_id, device_id, rid1,
+                                old, psk1,
+                                enc1, rctx1, ctx1)@i
+     & DeviceAdoptedCloneBranch(client_id, device_id, rid2,
+                                old, psk2,
+                                enc2, rctx2, ctx2)@j
+     ==> #i = #j & psk1 = psk2"
+
+lemma honest_request_id_is_not_rotation_reserved_id:
+  "All request_id #i.
+       HonestRequestID(request_id)@i
+     ==> not (request_id = 'zero_request_id')"
+
+end

@@ -1,0 +1,141 @@
+(**
+  Negative compromise experiment for C03.
+
+  The client emits a recorded base pairing transcript, traffic under the
+  exported initial PSK, a rotation encapsulation, and traffic under the
+  successor PSK.  Only then is skD disclosed.  All three secrecy queries must
+  fail, demonstrating the specified absence of forward secrecy through one
+  recorded rotation successor.  Longer recorded lineages follow by repeating
+  the same symbolic reconstruction step; they are not directly unrolled here.
+*)
+
+set preciseActions = true.
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free release_device_key: channel [private].
+free release_token: bitstring.
+free transcript_tag: bitstring.
+free request_tag: bitstring.
+free rotation_tag: bitstring.
+free version_v1: bitstring.
+free zero_request_id: bitstring.
+free psk_exporter_label: bitstring.
+free sequence_zero: record_sequence.
+free sequence_one: record_sequence.
+
+free pairing_application_plaintext: bitstring [private].
+free initial_psk_request_plaintext: bitstring [private].
+free successor_psk_request_plaintext: bitstring [private].
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun hpke_base_context(kem_secret, bitstring): hpke_context.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
+  hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+fun hpke_export_psk(hpke_context, bitstring): psk.
+
+(** All are expected attacks after the ordered skD disclosure. *)
+query attacker(pairing_application_plaintext) ==> false.
+query attacker(initial_psk_request_plaintext) ==> false.
+query attacker(successor_psk_request_plaintext) ==> false.
+
+let RecordedHistory(public_key: device_public_key, device_id: bitstring) =
+  new client_id: bitstring;
+  new client_secret: bitstring;
+
+  (* Recorded initial base-mode transcript and initial PSK export. *)
+  new pairing_ephemeral: ephemeral_secret_key;
+  let pairing_enc = encapsulate(pairing_ephemeral) in
+  let pinfo = hpke_info(version_v1, device_id, client_id) in
+  let pairing_context = hpke_base_context(
+    kem_sender(pairing_ephemeral, public_key), pinfo
+  ) in
+  let secret_ciphertext = hpke_seal(
+    client_secret, pairing_context, sequence_zero
+  ) in
+  let application_ciphertext = hpke_seal(
+    pairing_application_plaintext, pairing_context, sequence_one
+  ) in
+  let initial_psk = hpke_export_psk(
+    pairing_context, psk_exporter_label
+  ) in
+  out(network,
+    (transcript_tag, client_id, pairing_enc,
+     secret_ciphertext, application_ciphertext));
+
+  (* Recorded ordinary request under the initial generation. *)
+  new initial_request_id: bitstring;
+  new initial_request_ephemeral: ephemeral_secret_key;
+  let initial_request_enc = encapsulate(initial_request_ephemeral) in
+  let initial_info = hpke_info(version_v1, device_id, initial_request_id) in
+  let initial_request_context = hpke_psk_context(
+    kem_sender(initial_request_ephemeral, public_key),
+    initial_psk, client_id, initial_info
+  ) in
+  let initial_request_ciphertext = hpke_seal(
+    initial_psk_request_plaintext,
+    initial_request_context, sequence_zero
+  ) in
+  out(network,
+    (request_tag, client_id, initial_request_id,
+     initial_request_enc, initial_request_ciphertext));
+
+  (* Recorded rotation encapsulation and successor export. *)
+  new rotation_ephemeral: ephemeral_secret_key;
+  let rotation_enc = encapsulate(rotation_ephemeral) in
+  let rinfo = hpke_info(version_v1, device_id, zero_request_id) in
+  let rotation_context = hpke_psk_context(
+    kem_sender(rotation_ephemeral, public_key),
+    initial_psk, client_id, rinfo
+  ) in
+  let successor_psk = hpke_export_psk(
+    rotation_context, psk_exporter_label
+  ) in
+  out(network, (rotation_tag, client_id, rotation_enc));
+
+  (* Recorded request under the successor generation. *)
+  new successor_request_id: bitstring;
+  new successor_request_ephemeral: ephemeral_secret_key;
+  let successor_request_enc = encapsulate(successor_request_ephemeral) in
+  let successor_info = hpke_info(version_v1, device_id, successor_request_id) in
+  let successor_request_context = hpke_psk_context(
+    kem_sender(successor_request_ephemeral, public_key),
+    successor_psk, client_id, successor_info
+  ) in
+  let successor_request_ciphertext = hpke_seal(
+    successor_psk_request_plaintext,
+    successor_request_context, sequence_zero
+  ) in
+  out(network,
+    (request_tag, client_id, successor_request_id,
+     successor_request_enc, successor_request_ciphertext));
+
+  (* Force long-term-key compromise to occur after every transcript output. *)
+  out(release_device_key, release_token).
+
+let DelayedDeviceCompromise(secret_key: device_secret_key) =
+  in(release_device_key, =release_token);
+  out(network, secret_key).
+
+process
+  new secret_key: device_secret_key;
+  new device_id: bitstring;
+  let public_key = device_public(secret_key) in
+  out(network, (device_id, public_key));
+  (RecordedHistory(public_key, device_id) |
+   DelayedDeviceCompromise(secret_key))

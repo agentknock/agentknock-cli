@@ -1,0 +1,130 @@
+/* Agentknock v1: phase-indexed lost-confirmation recovery trace (R07). */
+
+theory Agentknock_Rotation_Recovery_Trace
+begin
+
+builtins: asymmetric-encryption, symmetric-encryption
+
+functions:
+  hpke_info/3,
+  psk_context/4,
+  record_key/2,
+  exporter/2,
+  response_kdf/4
+
+rule EstablishBinding:
+  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~old_psk) ]
+  -->
+  [ ClientReady(~client_id, ~device_id, pk(~skD), ~old_psk),
+    DeviceOld(~client_id, ~device_id, ~skD, ~old_psk) ]
+
+rule ClientStartsRotation:
+  let rctx = psk_context(~rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(~rotation_seed, pkD)
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+  in
+  [ ClientReady(client_id, device_id, pkD, old_psk),
+    Fr(~rotation_seed) ]
+  --[ ClientRotationStarted(client_id, device_id, old_psk,
+                            new_psk, renc, rctx) ]->
+  [ ClientPendingFirst(client_id, device_id, pkD,
+                       old_psk, new_psk, renc, rctx) ]
+
+rule ClientSendsFirstRequest:
+  let ctx = psk_context(~request_seed, new_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc(~request, record_key(ctx, 'record_0'))
+  in
+  [ ClientPendingFirst(client_id, device_id, pkD,
+                       old_psk, new_psk, renc, rctx),
+    Fr(~request_id), Fr(~request_seed), Fr(~request) ]
+  -->
+  [ ClientPendingAfterDrop(client_id, device_id, pkD,
+                           old_psk, new_psk, renc, rctx),
+    FirstRequestWire(client_id, device_id, ~request_id,
+                     enc, c0, renc) ]
+
+rule DeviceAdoptsAndResponseIsDropped:
+  let rctx = psk_context(rotation_seed, old_psk, client_id,
+                         hpke_info('agentknock-v1', device_id,
+                                   'zero_request_id'))
+      renc = aenc(rotation_seed, pk(skD))
+      new_psk = exporter(rctx, 'agentknock-v1 psk')
+      ctx = psk_context(request_seed, new_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc(request, record_key(ctx, 'record_0'))
+  in
+  [ DeviceOld(client_id, device_id, skD, old_psk),
+    FirstRequestWire(client_id, device_id, request_id, enc, c0, renc) ]
+  --[ DeviceCandidateAdopted(client_id, device_id, request_id,
+                            old_psk, new_psk, renc, rctx, ctx,
+                            <'none', 'none'>) ]->
+  [ DeviceNew(client_id, device_id, skD, new_psk) ]
+
+rule ClientSendsSecondRequest:
+  let ctx = psk_context(~request_seed, new_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, ~request_id))
+      enc = aenc(~request_seed, pkD)
+      c0 = senc(~request, record_key(ctx, 'record_0'))
+  in
+  [ ClientPendingAfterDrop(client_id, device_id, pkD,
+                           old_psk, new_psk, renc, rctx),
+    Fr(~request_id), Fr(~request_seed), Fr(~request) ]
+  -->
+  [ ClientWaitSecondResponse(client_id, device_id, ~request_id,
+                             new_psk, renc, enc, ctx),
+    SecondRequestWire(client_id, device_id, ~request_id,
+                      enc, c0, renc) ]
+
+rule DeviceAcceptsSecondUnderCurrent:
+  let ctx = psk_context(request_seed, new_psk, client_id,
+                        hpke_info('agentknock-v1', device_id, request_id))
+      enc = aenc(request_seed, pk(skD))
+      c0 = senc(request, record_key(ctx, 'record_0'))
+      secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, ~response_random, 'key')
+      nonce = response_kdf(secret, enc, ~response_random, 'nonce')
+      response_ct = senc(~response, <key, nonce>)
+  in
+  [ DeviceNew(client_id, device_id, skD, new_psk),
+    SecondRequestWire(client_id, device_id, request_id, enc, c0, renc),
+    Fr(~response_random), Fr(~response) ]
+  --[ DeviceCurrentRequestAccepted(client_id, device_id, request_id,
+                                  new_psk, renc, ctx) ]->
+  [ SecondResponseWire(client_id, device_id, request_id,
+                       new_psk, renc, ctx,
+                       ~response_random, response_ct) ]
+
+rule ClientConfirmsOnSecondResponse:
+  let secret = exporter(ctx, 'agentknock-v1 response')
+      key = response_kdf(secret, enc, response_random, 'key')
+      nonce = response_kdf(secret, enc, response_random, 'nonce')
+  in
+  [ ClientWaitSecondResponse(client_id, device_id, request_id,
+                             new_psk, renc, enc, ctx),
+    SecondResponseWire(client_id, device_id, request_id,
+                       new_psk, renc, ctx, response_random,
+                       senc(response, <key, nonce>)) ]
+  --[ ClientRotationConfirmed(client_id, device_id,
+                              request_id, new_psk, renc) ]->
+  [ ]
+
+lemma R07_lost_confirmation_recovery_executable:
+  exists-trace
+  "Ex client_id device_id old new renc rid1 rid2
+      rctx ctx1 prev ctx2 #i #j #k #l.
+       ClientRotationStarted(client_id, device_id,
+                             old, new, renc, rctx)@i
+     & DeviceCandidateAdopted(client_id, device_id, rid1,
+                             old, new, renc, rctx, ctx1, prev)@j
+     & DeviceCurrentRequestAccepted(client_id, device_id, rid2,
+                                    new, renc, ctx2)@k
+     & ClientRotationConfirmed(client_id, device_id, rid2,
+                               new, renc)@l
+     & not (rid1 = rid2)"
+
+end
