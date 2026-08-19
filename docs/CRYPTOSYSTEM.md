@@ -1,8 +1,8 @@
-# The AgentKnock v1 cryptosystem
+# The Agentknock v1 cryptosystem
 
 ## Abstract
 
-AgentKnock lets a client and a device exchange protected application messages
+Agentknock lets a client and a device exchange protected application messages
 through an untrusted relay. This document specifies the cryptography for
 pairing the endpoints, protecting request-response-completion exchanges, and
 rotating the pairing pre-shared key (PSK).
@@ -156,7 +156,7 @@ HPKE record sequence numbers start at zero as specified by RFC 9180.
 
 ## 4. Cryptographic suite
 
-AgentKnock v1 uses the following fixed HPKE suite:
+Agentknock v1 uses the following fixed HPKE suite:
 
 | Component | RFC 9180 identifier | Selection | Relevant sizes |
 | --- | ---: | --- | --- |
@@ -447,7 +447,7 @@ commitment = HKDF-SHA256(
 This commit-before-peer-contribution pattern parallels the ZRTP HVI commitment
 in RFC 6189, §4.4.1.1. Both prevent an active attacker from seeing both honest
 contributions before choosing its own contribution to grind for a matching
-short authentication string. AgentKnock commits only to `client_secret` and
+short authentication string. Agentknock commits only to `client_secret` and
 reveals it in the first HPKE record; it does not use the ZRTP message format or
 HVI calculation.
 
@@ -794,8 +794,8 @@ the corresponding PSK.
 
 The exporter-plus-random-value construction in this section follows the
 bidirectional response construction described in HPKE-bis, Section 9.8,
-specialized to the fixed AgentKnock v1 suite and labels. The complete algorithm
-below defines the AgentKnock construction.
+specialized to the fixed Agentknock v1 suite and labels. The complete algorithm
+below defines the Agentknock construction.
 
 The response is not an HPKE record in the reverse direction. After the device
 successfully opens request sequence number 0, the device invokes the HPKE
@@ -1230,11 +1230,11 @@ Compromise of `skD` has a wider retrospective effect. If an attacker recorded
 the initial base-mode pairing exchange, `skD` lets it reconstruct that context
 and its exported `client_psk`. Recorded rotation encapsulations then reveal the
 successor PSKs in sequence, allowing recorded paired traffic to be opened.
-AgentKnock v1 therefore does not provide forward secrecy against later
+Agentknock v1 therefore does not provide forward secrecy against later
 compromise of the long-term device private key when the pairing transcript was
 recorded.
 
-AgentKnock v1 is not post-quantum secure because its fixed HPKE suite uses
+Agentknock v1 is not post-quantum secure because its fixed HPKE suite uses
 X25519. The construction can also be instantiated with a post-quantum or hybrid
 HPKE suite by substituting that suite and adjusting every algorithm-dependent
 length. Such an instantiation is a separate protocol version, not an extension

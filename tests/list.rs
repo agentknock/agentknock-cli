@@ -130,7 +130,7 @@ fn reports_when_no_pairing_exists() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("AgentKnock is not paired")
+            .contains("Agentknock is not paired")
     );
 }
 

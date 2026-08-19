@@ -42,7 +42,7 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
 #[command(
     name = "agentknock",
     version,
-    about = "AgentKnock requests profile access and runs commands.",
+    about = "Agentknock requests profile access and runs commands.",
     arg_required_else_help = true,
     subcommand_required = true,
     disable_help_subcommand = true,
@@ -59,7 +59,7 @@ enum Command {
     #[command(visible_alias = "x")]
     Exec(ExecCommand),
 
-    /// Manage the pairing with an AgentKnock device.
+    /// Manage the pairing with an Agentknock device.
     #[command(
         arg_required_else_help = true,
         subcommand_required = true,
@@ -103,7 +103,7 @@ struct ExecCommand {
     )]
     reason: Option<String>,
 
-    /// Do not show AgentKnock runtime output.
+    /// Do not show Agentknock runtime output.
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
 
@@ -118,7 +118,7 @@ struct ExecCommand {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum PairingCommand {
-    /// Start pairing with an AgentKnock device.
+    /// Start pairing with an Agentknock device.
     Start {
         /// Pairing address shown by the device.
         #[arg(value_name = "PAIRING_ADDRESS", value_parser = parse_pairing_address)]
@@ -494,7 +494,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             }
             if output == OutputMode::Verbose {
                 print_received_environment(&credentials);
-                print_message(format_args!("AgentKnock executes the command: {program}."));
+                print_message(format_args!("Agentknock executes the command: {program}."));
             }
             let program = program.clone();
             selected
@@ -517,23 +517,23 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             finish_pairing_for_cli()
                 .await
                 .map_err(CommandError::FinishPairing)?;
-            println!("AgentKnock finished pairing. AgentKnock is ready for use.");
+            println!("Agentknock finished pairing. Agentknock is ready for use.");
         }
         Operation::AbortPairing => {
             abort_pairing().map_err(CommandError::AbortPairing)?;
-            println!("AgentKnock aborted the pending pairing. AgentKnock is not paired.");
+            println!("Agentknock aborted the pending pairing. Agentknock is not paired.");
         }
         Operation::RemovePairing { force } => {
             if force {
                 force_remove_pairing().map_err(CommandError::ForceRemovePairing)?;
                 println!(
-                    "AgentKnock removed the local pairing. The device-side pairing was not changed."
+                    "Agentknock removed the local pairing. The device-side pairing was not changed."
                 );
             } else {
                 remove_pairing_for_cli()
                     .await
                     .map_err(CommandError::RemovePairing)?;
-                println!("AgentKnock removed this pairing.");
+                println!("Agentknock removed this pairing.");
             }
         }
         Operation::ListProfiles => {
@@ -548,7 +548,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 .await
                 .map_err(CommandError::UploadProfile)?;
             println!(
-                "AgentKnock delivered profile proposal {:?} to the device.",
+                "Agentknock delivered profile proposal {:?} to the device.",
                 profile.name
             );
             println!("The profile proposal has not been accepted on the device.");
@@ -772,34 +772,34 @@ where
 
 fn profile_list_progress_message(progress: ProfileListProgress) -> &'static str {
     match progress {
-        ProfileListProgress::Preparing => "AgentKnock prepares the profile list request.",
+        ProfileListProgress::Preparing => "Agentknock prepares the profile list request.",
         ProfileListProgress::WaitingForDelivery => {
-            "AgentKnock waits for the device to receive the profile list request."
+            "Agentknock waits for the device to receive the profile list request."
         }
         ProfileListProgress::WaitingForResponse => {
-            "The device received the profile list request. AgentKnock waits for a response from the device."
+            "The device received the profile list request. Agentknock waits for a response from the device."
         }
         ProfileListProgress::Completing => {
-            "AgentKnock received the profile list. AgentKnock confirms receipt."
+            "Agentknock received the profile list. Agentknock confirms receipt."
         }
-        ProfileListProgress::Completed => "AgentKnock completed the profile list request.",
+        ProfileListProgress::Completed => "Agentknock completed the profile list request.",
     }
 }
 
 fn profile_upload_progress_message(progress: ProfileUploadProgress) -> &'static str {
     match progress {
-        ProfileUploadProgress::Preparing => "AgentKnock prepares the profile proposal.",
+        ProfileUploadProgress::Preparing => "Agentknock prepares the profile proposal.",
         ProfileUploadProgress::WaitingForDelivery => {
-            "AgentKnock waits for the device to receive the profile proposal."
+            "Agentknock waits for the device to receive the profile proposal."
         }
         ProfileUploadProgress::WaitingForResponse => {
-            "The device received the profile proposal. AgentKnock waits for durable receipt confirmation."
+            "The device received the profile proposal. Agentknock waits for durable receipt confirmation."
         }
         ProfileUploadProgress::Completing => {
-            "The device stored the profile proposal. AgentKnock confirms receipt."
+            "The device stored the profile proposal. Agentknock confirms receipt."
         }
         ProfileUploadProgress::Completed => {
-            "AgentKnock completed delivery of the profile proposal."
+            "Agentknock completed delivery of the profile proposal."
         }
     }
 }
@@ -810,49 +810,49 @@ fn pairing_progress_message(
 ) -> &'static str {
     match (operation, progress) {
         (PairingOperation::Start, PairingProgress::Preparing) => {
-            "AgentKnock prepares the pairing request."
+            "Agentknock prepares the pairing request."
         }
         (PairingOperation::Start, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the device to receive the pairing request."
+            "Agentknock waits for the device to receive the pairing request."
         }
         (PairingOperation::Start, PairingProgress::WaitingForResponse) => {
-            "The device received the pairing request. AgentKnock waits for a response from the device."
+            "The device received the pairing request. Agentknock waits for a response from the device."
         }
         (PairingOperation::Start, PairingProgress::Completing) => {
-            "AgentKnock received the pairing response. AgentKnock saves the pending pairing."
+            "Agentknock received the pairing response. Agentknock saves the pending pairing."
         }
         (PairingOperation::Start, PairingProgress::Completed) => {
-            "AgentKnock completed the pairing request."
+            "Agentknock completed the pairing request."
         }
         (PairingOperation::Finish, PairingProgress::Preparing) => {
-            "AgentKnock prepares the pairing confirmation."
+            "Agentknock prepares the pairing confirmation."
         }
         (PairingOperation::Finish, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the device to receive the pairing confirmation."
+            "Agentknock waits for the device to receive the pairing confirmation."
         }
         (PairingOperation::Finish, PairingProgress::WaitingForResponse) => {
-            "The device received the pairing confirmation. AgentKnock waits for a response from the device."
+            "The device received the pairing confirmation. Agentknock waits for a response from the device."
         }
         (PairingOperation::Finish, PairingProgress::Completing) => {
-            "The device accepted the pairing. AgentKnock saves the active pairing."
+            "The device accepted the pairing. Agentknock saves the active pairing."
         }
         (PairingOperation::Finish, PairingProgress::Completed) => {
-            "AgentKnock completed the pairing confirmation."
+            "Agentknock completed the pairing confirmation."
         }
         (PairingOperation::Remove, PairingProgress::Preparing) => {
-            "AgentKnock prepares the pairing removal request."
+            "Agentknock prepares the pairing removal request."
         }
         (PairingOperation::Remove, PairingProgress::WaitingForDelivery) => {
-            "AgentKnock waits for the device to receive the pairing removal request."
+            "Agentknock waits for the device to receive the pairing removal request."
         }
         (PairingOperation::Remove, PairingProgress::WaitingForResponse) => {
-            "The device received the pairing removal request. AgentKnock waits for a response from the device."
+            "The device received the pairing removal request. Agentknock waits for a response from the device."
         }
         (PairingOperation::Remove, PairingProgress::Completing) => {
-            "The device accepted the pairing removal request. AgentKnock removes the local pairing."
+            "The device accepted the pairing removal request. Agentknock removes the local pairing."
         }
         (PairingOperation::Remove, PairingProgress::Completed) => {
-            "AgentKnock completed the pairing removal request."
+            "Agentknock completed the pairing removal request."
         }
     }
 }
@@ -923,7 +923,7 @@ async fn request_exec_credentials(
 }
 
 fn print_start_pairing_success(sas: &PairingSas) {
-    println!("AgentKnock started the pairing process.");
+    println!("Agentknock started the pairing process.");
     println!("Verification code:");
     println!("{sas}");
     println!("Suggested action: Compare the verification code with the code on the device.");
@@ -939,7 +939,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecSelection { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "AgentKnock could not select the command {program:?}: {source}."
+                "Agentknock could not select the command {program:?}: {source}."
             ));
             print_message("The profile access request did not start.");
             match source.kind() {
@@ -961,11 +961,11 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             print_message("The command did not start.");
         }
         CommandError::ExecInterrupted if output != OutputMode::Quiet => {
-            print_message("A signal interrupted AgentKnock. The command did not start.");
+            print_message("A signal interrupted Agentknock. The command did not start.");
         }
         CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "The device approved the profile access request. AgentKnock did not execute the command {program:?}: {source}."
+                "The device approved the profile access request. Agentknock did not execute the command {program:?}: {source}."
             ));
             match source.kind() {
                 io::ErrorKind::NotFound => {
@@ -994,7 +994,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::ListProfiles(error) => print_list_error(error),
         CommandError::ProfileInput(error) => {
             print_plain_error(format_args!(
-                "AgentKnock could not read the profile proposal: {error}."
+                "Agentknock could not read the profile proposal: {error}."
             ));
         }
         CommandError::UploadProfile(error) => print_upload_error(error),
@@ -1007,12 +1007,12 @@ fn print_upload_error(error: &ProfileUploadError) {
             print_plain_error(format_args!(
                 "The device rejected the profile proposal: {message}"
             ));
-            print_plain_error("AgentKnock did not deliver the profile proposal.");
+            print_plain_error("Agentknock did not deliver the profile proposal.");
         }
         ProfileUploadError::Request(RequestError::Configuration(
             ConfigurationError::NoPairing { .. },
         )) => {
-            print_plain_error("AgentKnock is not paired. It cannot upload a profile.");
+            print_plain_error("Agentknock is not paired. It cannot upload a profile.");
             print_plain_error("Suggested action: Get a pairing address.");
             print_plain_error("Suggested action: Run this command:");
             print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
@@ -1020,17 +1020,17 @@ fn print_upload_error(error: &ProfileUploadError) {
         ProfileUploadError::Request(RequestError::Configuration(
             ConfigurationError::PairingPending { .. },
         )) => {
-            print_plain_error("Pairing is in progress. AgentKnock cannot upload a profile yet.");
+            print_plain_error("Pairing is in progress. Agentknock cannot upload a profile yet.");
         }
         ProfileUploadError::Request(RequestError::Configuration(error)) => {
             print_plain_error(format_args!(
-                "AgentKnock did not deliver the profile proposal: {error}."
+                "Agentknock did not deliver the profile proposal: {error}."
             ));
             print_plain_configuration_action(error);
         }
         ProfileUploadError::Request(RequestError::RelayUnavailable { .. }) => {
             print_plain_error(format_args!(
-                "AgentKnock did not deliver the profile proposal: {error}."
+                "Agentknock did not deliver the profile proposal: {error}."
             ));
             print_plain_error(
                 "Suggested action: After relay connectivity is restored, run the original command again.",
@@ -1038,14 +1038,14 @@ fn print_upload_error(error: &ProfileUploadError) {
         }
         ProfileUploadError::Request(RequestError::Unauthenticated { code, message }) => {
             print_plain_unauthenticated_report(code, message);
-            print_plain_error("AgentKnock did not deliver the profile proposal.");
+            print_plain_error("Agentknock did not deliver the profile proposal.");
             print_plain_unauthenticated_action(code);
         }
         ProfileUploadError::Request(RequestError::ClientInactive { message }) => {
             print_plain_error(format_args!(
                 "The relay reports that this paired client is not active: {message}"
             ));
-            print_plain_error("AgentKnock did not deliver the profile proposal.");
+            print_plain_error("Agentknock did not deliver the profile proposal.");
         }
         ProfileUploadError::Request(RequestError::InvalidTestRelayUrl) => {
             print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
@@ -1053,7 +1053,7 @@ fn print_upload_error(error: &ProfileUploadError) {
         }
         ProfileUploadError::Request(error) => {
             print_plain_error(format_args!(
-                "AgentKnock did not deliver the profile proposal: {error}."
+                "Agentknock did not deliver the profile proposal: {error}."
             ));
         }
     }
@@ -1062,31 +1062,31 @@ fn print_upload_error(error: &ProfileUploadError) {
 fn print_list_error(error: &RequestError) {
     match error {
         RequestError::Configuration(ConfigurationError::NoPairing { .. }) => {
-            print_plain_error("AgentKnock is not paired. It cannot list profiles.");
+            print_plain_error("Agentknock is not paired. It cannot list profiles.");
             print_plain_error("Suggested action: Get a pairing address.");
             print_plain_error("Suggested action: Run this command:");
             print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
-            print_plain_error("Pairing is in progress. AgentKnock cannot list profiles yet.");
+            print_plain_error("Pairing is in progress. Agentknock cannot list profiles yet.");
         }
         RequestError::Configuration(error) => {
-            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock did not list profiles: {error}."));
             print_plain_configuration_action(error);
         }
         RequestError::RelayUnavailable { .. } => {
-            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock did not list profiles: {error}."));
             print_plain_error("Suggested action: After relay connectivity is restored, run:");
             print_plain_error("agentknock profile list");
         }
         RequestError::Relay(_) => {
-            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock did not list profiles: {error}."));
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
-            print_plain_error("AgentKnock did not list profiles.");
+            print_plain_error("Agentknock did not list profiles.");
             print_plain_error(
-                "AgentKnock did not change the local pairing because of this report.",
+                "Agentknock did not change the local pairing because of this report.",
             );
             print_plain_unauthenticated_action(code);
         }
@@ -1094,14 +1094,14 @@ fn print_list_error(error: &RequestError) {
             print_plain_error(format_args!(
                 "The relay reports that this paired client is not active: {message}"
             ));
-            print_plain_error("AgentKnock did not list profiles.");
+            print_plain_error("Agentknock did not list profiles.");
         }
         RequestError::InvalidTestRelayUrl => {
             print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
             print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
         }
         _ => {
-            print_plain_error(format_args!("AgentKnock did not list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock did not list profiles: {error}."));
         }
     }
 }
@@ -1152,7 +1152,7 @@ fn print_exec_request_error(error: &RequestError) {
         }
         RequestError::RelayUnavailable { failures } => {
             print_message(format_args!(
-                "AgentKnock did not receive a relay response after {failures} consecutive errors."
+                "Agentknock did not receive a relay response after {failures} consecutive errors."
             ));
             print_message("The command did not start.");
             print_message(
@@ -1166,7 +1166,7 @@ fn print_exec_request_error(error: &RequestError) {
         RequestError::Unauthenticated { code, message } => {
             print_unauthenticated_report(code, message);
             print_message("The command did not start.");
-            print_message("AgentKnock did not change the local pairing because of this report.");
+            print_message("Agentknock did not change the local pairing because of this report.");
             print_unauthenticated_action(code);
         }
         RequestError::ClientInactive { message } => {
@@ -1183,7 +1183,7 @@ fn print_exec_request_error(error: &RequestError) {
         }
         RequestError::UnexpectedRelayStatus(status) => {
             print_message(format_args!(
-                "The relay returned HTTP status {status}. AgentKnock did not expect this status."
+                "The relay returned HTTP status {status}. Agentknock did not expect this status."
             ));
             print_message("The command did not start.");
         }
@@ -1202,7 +1202,7 @@ fn print_exec_request_error(error: &RequestError) {
 fn print_exec_configuration_error(error: &ConfigurationError) {
     match error {
         ConfigurationError::NoPairing { .. } => {
-            print_message("AgentKnock is not paired. The command did not start.");
+            print_message("Agentknock is not paired. The command did not start.");
             print_message("Suggested action: Get a pairing address.");
             print_message("Suggested action: Run this command:");
             print_message("agentknock pairing start <PAIRING_ADDRESS>");
@@ -1221,7 +1221,7 @@ fn print_exec_configuration_error(error: &ConfigurationError) {
             print_message(format_args!("chmod 600 {path:?}"));
         }
         ConfigurationError::HomeNotSet => {
-            print_message("HOME is not set. AgentKnock cannot find the pairing configuration.");
+            print_message("HOME is not set. Agentknock cannot find the pairing configuration.");
             print_message("The command did not start.");
             print_message("Suggested action: Set HOME to the correct home directory.");
         }
@@ -1250,26 +1250,26 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error("Pairing is already in progress.");
         }
         RequestError::Configuration(ConfigurationError::PairingExists { .. }) => {
-            print_plain_error("AgentKnock is already paired and ready for use.");
-            print_plain_error("AgentKnock did not change the existing pairing.");
+            print_plain_error("Agentknock is already paired and ready for use.");
+            print_plain_error("Agentknock did not change the existing pairing.");
         }
         RequestError::Configuration(error) => {
-            print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
+            print_plain_error(format_args!("Agentknock did not start pairing: {error}."));
             print_plain_configuration_action(error);
         }
         RequestError::RelayUnavailable { .. } => {
-            print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
+            print_plain_error(format_args!("Agentknock did not start pairing: {error}."));
             print_plain_error(
                 "Suggested action: After relay connectivity is restored, run the original command again.",
             );
         }
         RequestError::Relay(_) => {
-            print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
+            print_plain_error(format_args!("Agentknock did not start pairing: {error}."));
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
             print_plain_error(
-                "AgentKnock did not change the pairing state because of this report.",
+                "Agentknock did not change the pairing state because of this report.",
             );
             print_plain_unauthenticated_action(code);
         }
@@ -1278,7 +1278,7 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
         }
         _ => {
-            print_plain_error(format_args!("AgentKnock did not start pairing: {error}."));
+            print_plain_error(format_args!("Agentknock did not start pairing: {error}."));
         }
     }
 }
@@ -1292,21 +1292,21 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
         RequestError::Configuration(ConfigurationError::PairingNotPending { .. }) => {
-            print_plain_error("Pairing is complete. AgentKnock is ready for use.");
+            print_plain_error("Pairing is complete. Agentknock is ready for use.");
         }
         RequestError::Configuration(error) => {
-            print_plain_error(format_args!("AgentKnock did not finish pairing: {error}."));
+            print_plain_error(format_args!("Agentknock did not finish pairing: {error}."));
             print_plain_configuration_action(error);
         }
         RequestError::PairingRejected => {
             print_plain_error(
-                "The device rejected the pairing. AgentKnock kept the pending pairing.",
+                "The device rejected the pairing. Agentknock kept the pending pairing.",
             );
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
             print_plain_error(
-                "AgentKnock did not change the pairing state because of this report.",
+                "Agentknock did not change the pairing state because of this report.",
             );
             print_plain_unauthenticated_action(code);
         }
@@ -1314,14 +1314,14 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error(format_args!(
                 "The relay reports that the pending client is not active: {message}"
             ));
-            print_plain_error("AgentKnock kept the pending pairing.");
+            print_plain_error("Agentknock kept the pending pairing.");
         }
         RequestError::InvalidTestRelayUrl => {
             print_plain_error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8.");
             print_plain_error("Suggested action: Correct or unset AGENTKNOCK_TEST_RELAY_URL.");
         }
         _ => {
-            print_plain_error(format_args!("AgentKnock did not finish pairing: {error}."));
+            print_plain_error(format_args!("Agentknock did not finish pairing: {error}."));
         }
     }
 }
@@ -1329,15 +1329,15 @@ fn print_finish_pairing_error(error: &RequestError) {
 fn print_abort_pairing_error(error: &ConfigurationError) {
     match error {
         ConfigurationError::NoPairing { .. } => {
-            print_plain_error("AgentKnock has no pairing to abort.");
+            print_plain_error("Agentknock has no pairing to abort.");
         }
         ConfigurationError::PairingNotPending { .. } => {
-            print_plain_error("Pairing is active. AgentKnock can abort only a pending pairing.");
-            print_plain_error("AgentKnock did not change the active pairing.");
+            print_plain_error("Pairing is active. Agentknock can abort only a pending pairing.");
+            print_plain_error("Agentknock did not change the active pairing.");
         }
         _ => {
             print_plain_error(format_args!(
-                "AgentKnock did not abort the pending pairing: {error}."
+                "Agentknock did not abort the pending pairing: {error}."
             ));
             print_plain_configuration_action(error);
         }
@@ -1347,18 +1347,18 @@ fn print_abort_pairing_error(error: &ConfigurationError) {
 fn print_remove_pairing_error(error: &PairingRemoveError) {
     match error {
         PairingRemoveError::Configuration(ConfigurationError::NoPairing { .. }) => {
-            print_plain_error("AgentKnock is not paired. There is no active pairing to remove.");
+            print_plain_error("Agentknock is not paired. There is no active pairing to remove.");
         }
         PairingRemoveError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error(
-                "Pairing is in progress. AgentKnock did not remove the pending pairing.",
+                "Pairing is in progress. Agentknock did not remove the pending pairing.",
             );
             print_plain_error("Suggested action: To abort the pending pairing, run this command:");
             print_plain_error("agentknock pairing abort");
         }
         PairingRemoveError::Configuration(error) => {
             print_plain_error(format_args!(
-                "AgentKnock did not start pairing removal: {error}."
+                "Agentknock did not start pairing removal: {error}."
             ));
             print_plain_configuration_action(error);
         }
@@ -1375,7 +1375,7 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
                 }
                 _ => {
                     print_plain_error(format_args!(
-                        "AgentKnock did not receive a valid pairing removal response: {error}."
+                        "Agentknock did not receive a valid pairing removal response: {error}."
                     ));
                 }
             }
@@ -1385,11 +1385,11 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
             print_plain_error(
                 "The device accepted the pairing removal request, but the local pairing changed.",
             );
-            print_plain_error("AgentKnock did not remove the current local pairing.");
+            print_plain_error("Agentknock did not remove the current local pairing.");
         }
         PairingRemoveError::LocalState(error) => {
             print_plain_error(format_args!(
-                "The device accepted the pairing removal request, but AgentKnock did not remove the local pairing: {error}."
+                "The device accepted the pairing removal request, but Agentknock did not remove the local pairing: {error}."
             ));
             print_plain_configuration_action(error);
         }
@@ -1398,26 +1398,26 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
 
 fn print_unauthenticated_report(code: &str, message: &str) {
     print_message(format_args!(
-        "AgentKnock received this error report: {code:?}: {message:?}."
+        "Agentknock received this error report: {code:?}: {message:?}."
     ));
     print_message(
-        "AgentKnock could not authenticate the report. The device or relay could have sent it.",
+        "Agentknock could not authenticate the report. The device or relay could have sent it.",
     );
 }
 
 fn print_plain_unauthenticated_report(code: &str, message: &str) {
     print_plain_error(format_args!(
-        "AgentKnock received this error report: {code:?}: {message:?}."
+        "Agentknock received this error report: {code:?}: {message:?}."
     ));
     print_plain_error(
-        "AgentKnock could not authenticate the report. The device or relay could have sent it.",
+        "Agentknock could not authenticate the report. The device or relay could have sent it.",
     );
 }
 
 fn print_unauthenticated_action(code: &str) {
     if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_message(
-            "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
+            "Suggested action: Make sure that Agentknock and the device support the same protocol version.",
         );
     }
 }
@@ -1425,7 +1425,7 @@ fn print_unauthenticated_action(code: &str) {
 fn print_plain_unauthenticated_action(code: &str) {
     if code == "UNSUPPORTED_PROTOCOL_VERSION" {
         print_plain_error(
-            "Suggested action: Make sure that AgentKnock and the device support the same protocol version.",
+            "Suggested action: Make sure that Agentknock and the device support the same protocol version.",
         );
     }
 }
@@ -1433,11 +1433,11 @@ fn print_plain_unauthenticated_action(code: &str) {
 fn print_force_remove_pairing_error(error: &ConfigurationError) {
     match error {
         ConfigurationError::NoPairing { .. } => {
-            print_plain_error("AgentKnock is not paired. There is no local pairing to remove.");
+            print_plain_error("Agentknock is not paired. There is no local pairing to remove.");
         }
         _ => {
             print_plain_error(format_args!(
-                "AgentKnock did not remove the local pairing: {error}."
+                "Agentknock did not remove the local pairing: {error}."
             ));
             print_plain_configuration_action(error);
         }
@@ -1473,11 +1473,11 @@ fn print_progress(progress: CredentialRequestProgress) {
 fn print_received_environment(credentials: &Credentials) {
     let mut names = credentials.environment_variable_names().peekable();
     if names.peek().is_none() {
-        print_message("AgentKnock received no environment variables.");
+        print_message("Agentknock received no environment variables.");
         return;
     }
 
-    print_message("AgentKnock received these environment variables:");
+    print_message("Agentknock received these environment variables:");
     for name in names {
         print_message(format_args!("- {name}"));
     }
@@ -1574,17 +1574,17 @@ fn parent_id(status: &str) -> Option<u32> {
 
 fn progress_message(progress: CredentialRequestProgress) -> &'static str {
     match progress {
-        CredentialRequestProgress::Preparing => "AgentKnock prepares the profile access request.",
+        CredentialRequestProgress::Preparing => "Agentknock prepares the profile access request.",
         CredentialRequestProgress::WaitingForDelivery => {
-            "AgentKnock waits for the device to receive the profile access request."
+            "Agentknock waits for the device to receive the profile access request."
         }
         CredentialRequestProgress::WaitingForResponse => {
-            "The device received the profile access request. AgentKnock waits for a response from the device."
+            "The device received the profile access request. Agentknock waits for a response from the device."
         }
         CredentialRequestProgress::Completing => {
-            "AgentKnock received a response to the profile access request. AgentKnock completes the request."
+            "Agentknock received a response to the profile access request. Agentknock completes the request."
         }
-        CredentialRequestProgress::Completed => "AgentKnock completed the profile access request.",
+        CredentialRequestProgress::Completed => "Agentknock completed the profile access request.",
     }
 }
 
@@ -1716,15 +1716,15 @@ mod tests {
 
         assert_eq!(
             progress_message(WaitingForDelivery),
-            "AgentKnock waits for the device to receive the profile access request."
+            "Agentknock waits for the device to receive the profile access request."
         );
         assert_eq!(
             progress_message(WaitingForResponse),
-            "The device received the profile access request. AgentKnock waits for a response from the device."
+            "The device received the profile access request. Agentknock waits for a response from the device."
         );
         assert_eq!(
             progress_message(Completing),
-            "AgentKnock received a response to the profile access request. AgentKnock completes the request."
+            "Agentknock received a response to the profile access request. Agentknock completes the request."
         );
     }
 

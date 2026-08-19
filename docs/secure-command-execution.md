@@ -1,4 +1,4 @@
-# Secure command execution in AgentKnock
+# Secure command execution in Agentknock
 
 Status: implemented for Linux in the current worktree; design rationale and limits
 
@@ -6,14 +6,14 @@ Last reviewed: 2026-08-16
 
 ## Decision
 
-On Linux, AgentKnock should resolve and open the requested executable before it
+On Linux, Agentknock should resolve and open the requested executable before it
 sends the credential request. It should keep that file descriptor through the
 approval wait and, for a native executable, replace itself with that descriptor
 using `execveat(AT_EMPTY_PATH)`.
 
-This gives AgentKnock one precise and useful guarantee:
+This gives Agentknock one precise and useful guarantee:
 
-> For a native executable, AgentKnock executes the same opened filesystem object
+> For a native executable, Agentknock executes the same opened filesystem object
 > from which it derived the resolved path in the approval request.
 
 The guarantee prevents a routine `PATH` change, symlink change, rename,
@@ -22,7 +22,7 @@ top-level native executable during an approval that can last minutes or hours.
 It is especially useful for a system executable that the invoking user cannot
 modify in place, such as a normally installed `/usr/bin/ssh`.
 
-AgentKnock must not describe this as a sudo-like security boundary. It does not
+Agentknock must not describe this as a sudo-like security boundary. It does not
 change user ID, capabilities, namespaces, or operating-system authority. It
 delivers credentials to a process controlled by the same user that invoked it.
 The executable's interpreter, dynamic loader, shared libraries, configuration,
@@ -31,20 +31,20 @@ guarantee. An executable that the same user can modify in place is not made
 immutable by holding it open.
 
 Known `#!` scripts should use a deliberately weaker, path-based execution mode.
-AgentKnock should capture the candidate pathname that selected the script before
+Agentknock should capture the candidate pathname that selected the script before
 approval and call `execve` once on that same pathname after approval, without a
 second `PATH` search and without an implicit shell. It should not leak an
 executable descriptor into the interpreter or change the script's apparent path
 merely to pin the script. Interpreter-chain pinning is out of scope.
 
-AgentKnock should also send a SHA-256 hash of the selected executable when the
+Agentknock should also send a SHA-256 hash of the selected executable when the
 file is readable. The hash is not useful standalone evidence for a person or an
-LLM, and AgentKnock should not build a history of executable hashes. Its narrow
+LLM, and Agentknock should not build a history of executable hashes. Its narrow
 purpose is to give the device an exact equality condition for a reusable grant,
 such as "allow this executable to use these profiles for four hours." The grant
 stores the hash from the approved request and later requests must match it.
 
-AgentKnock should otherwise remain a transparent, same-user launcher. It should
+Agentknock should otherwise remain a transparent, same-user launcher. It should
 preserve the caller's environment, current directory, standard streams, process
 group, terminal, umask, resource limits, credentials, and deliberately inherited
 file descriptors. It should overlay the approved environment variables and then
@@ -56,7 +56,7 @@ creating a meaningful secret boundary here.
 
 The research followed six steps:
 
-1. Audit AgentKnock's current resolution, request construction, credential
+1. Audit Agentknock's current resolution, request construction, credential
    overlay, signal handling, and process replacement code.
 2. Establish the exact Linux and POSIX behavior of `open`, `execve`, `execvp`,
    `execveat`, effective-access checks, scripts, descriptors, signals, dynamic
@@ -68,7 +68,7 @@ The research followed six steps:
    CyberArk Summon, and systemd credentials.
 5. Separate techniques that defend a real OS privilege boundary from techniques
    that improve fidelity or convenience for a same-user launcher.
-6. Select the smallest design that closes AgentKnock's actual executable race,
+6. Select the smallest design that closes Agentknock's actual executable race,
    state its limits precisely, and derive adversarial tests from every claimed
    property.
 
@@ -92,7 +92,7 @@ The relevant assets are:
 
 The desired execution properties are:
 
-1. AgentKnock never introduces an implicit shell.
+1. Agentknock never introduces an implicit shell.
 2. Credential response data cannot change which top-level native executable was
    selected before approval.
 3. Ordinary pathname replacement during the approval wait cannot substitute a
@@ -100,17 +100,17 @@ The desired execution properties are:
 4. A native executable receives the original argument vector, including the
    originally typed `argv[0]`. A script receives the kernel's normal shebang
    argument transformation.
-5. AgentKnock disappears after protocol completion, so no unnecessary
+5. Agentknock disappears after protocol completion, so no unnecessary
    supervisor retains decrypted credentials or changes signal and process
    behavior.
-6. Failures are explicit. AgentKnock must not silently downgrade from pinned
+6. Failures are explicit. Agentknock must not silently downgrade from pinned
    native execution to a new pathname lookup.
 
 ### Assumptions
 
 The useful guarantee assumes that:
 
-- the installed AgentKnock process and its memory are not modified while it is
+- the installed Agentknock process and its memory are not modified while it is
   running;
 - the kernel and the invoking user's operating-system account are not fully
   compromised; and
@@ -119,28 +119,28 @@ The useful guarantee assumes that:
 
 These assumptions are narrower than assuming that all user-controlled files or
 environment values are trustworthy. A user-local tool may still be replaced by
-another process before AgentKnock opens it. Once opened, however, pathname
+another process before Agentknock opens it. Once opened, however, pathname
 replacement does not change the filesystem object referenced by the descriptor.
 
 ### What a same-user attacker can already do
 
-AgentKnock is not set-user-ID and does not cross a kernel privilege boundary. A
+Agentknock is not set-user-ID and does not cross a kernel privilege boundary. A
 hostile process with the invoking user's authority can commonly do one or more
 of the following, subject to host policy:
 
-- read or replace user-owned AgentKnock configuration and executables;
+- read or replace user-owned Agentknock configuration and executables;
 - inspect another process through `ptrace`-governed interfaces;
 - read a process's initial environment through `/proc/<pid>/environ`;
 - arrange core dumps or inspect process memory;
 - modify a user-writable executable in place; or
-- influence a dynamically linked AgentKnock process before `main` by setting
+- influence a dynamically linked Agentknock process before `main` by setting
   loader-control environment variables.
 
 Linux only enables the dynamic loader's restricted secure-execution mode for
 conditions such as set-user-ID, set-group-ID, file capabilities, or an LSM
-decision. A normal same-user AgentKnock invocation does not receive that
+decision. A normal same-user Agentknock invocation does not receive that
 protection. Clearing `LD_PRELOAD` immediately before the final `exec` would be
-too late to protect AgentKnock itself.
+too late to protect Agentknock itself.
 
 Environment delivery is therefore an inheritance mechanism, not containment.
 This is consistent with the product threat model: once a credential is released,
@@ -148,7 +148,7 @@ the approved process tree can use and disclose it. Executable pinning improves
 the fidelity of what was approved; it does not make credential delivery safe
 from a malicious invoking account.
 
-## Current AgentKnock behavior
+## Current Agentknock behavior
 
 The current Linux/Unix execution path has four important weaknesses:
 
@@ -163,7 +163,7 @@ The current Linux/Unix execution path has four important weaknesses:
    result can differ from the result of the later `execvp` search.
 4. `Command::exec` uses the `execvp` family for a command without a slash. POSIX
    and the Linux implementation require an `ENOEXEC` candidate to be passed to
-   a shell. This violates AgentKnock's requirement that a shell is used only
+   a shell. This violates Agentknock's requirement that a shell is used only
    when the caller explicitly requests one.
 
 Canonicalizing a path does not solve these problems. Canonicalization provides
@@ -173,11 +173,11 @@ filesystem object.
 The current use of `Command::exec` also performs one subtle service that a direct
 `execveat` implementation must preserve: Rust restores `SIGPIPE` to its default
 disposition in the child execution path. Rust ignores `SIGPIPE` in its own
-runtime so that socket and pipe writes return errors. AgentKnock must restore the
+runtime so that socket and pipe writes return errors. Agentknock must restore the
 disposition explicitly before a direct system call.
 
 Rust's Unix runtime also opens `/dev/null` on standard descriptors that were
-closed when the Rust process started. AgentKnock should preserve the descriptor
+closed when the Rust process started. Agentknock should preserve the descriptor
 state visible after that runtime initialization. It must still ensure that none
 of its own later opens accidentally occupies descriptor 0, 1, or 2.
 
@@ -194,9 +194,9 @@ copied without accounting for that boundary.
 | --- | --- | --- | --- |
 | classic `sudo` | Resolves before authentication. Optional `fdexec=always` opens during policy matching and later uses `fexecve`; the default only does this for digest-matched commands. | Reconstructs or filters environment, can use `secure_path`, closes descriptors, changes credentials and limits, and commonly uses a PTY monitor. | Descriptor execution is a direct precedent for closing the approval-to-execution pathname race. Most other controls exist because sudo crosses a privilege boundary. |
 | `sudo-rs` | Canonicalizes a selected path but currently executes the path with Rust `Command::exec`; digest rules are unsupported. | Always builds a filtered environment, marks extra descriptors close-on-exec, restores signals, and normally uses a PTY. | Memory safety and a smaller implementation do not themselves close executable TOCTOU. Canonicalization is not pinning. |
-| OpenBSD `doas` | Matches exact commands and optional exact arguments, uses a restricted path policy, then executes by path. | Rebuilds a small target environment, closes descriptors, and uses OpenBSD `pledge`/`unveil`. | A deliberately small privilege launcher still changes semantics that AgentKnock should preserve and still does not pin the opened file. |
+| OpenBSD `doas` | Matches exact commands and optional exact arguments, uses a restricted path policy, then executes by path. | Rebuilds a small target environment, closes descriptors, and uses OpenBSD `pledge`/`unveil`. | A deliberately small privilege launcher still changes semantics that Agentknock should preserve and still does not pin the opened file. |
 | `pkexec` | Resolves and canonicalizes a program before authorization, but later executes the path. It warns that a joined command-line string is not suitable for security decisions. | Clears the environment, restores a small validated set, closes descriptors, uses PAM, and changes credentials. | Authorization data must remain structured. A canonical path alone leaves a long authorization race. |
-| systemd service execution and `run0` | The service manager opens the selected executable with `O_PATH|O_CLOEXEC`, validates it, and calls `execveat(AT_EMPTY_PATH)`. | A fresh service receives controlled credentials, environment, limits, and usually a new PTY. | This is the strongest Linux precedent for native executable pinning. Its path fallback is less suitable for AgentKnock because AgentKnock can wait far longer before execution. |
+| systemd service execution and `run0` | The service manager opens the selected executable with `O_PATH|O_CLOEXEC`, validates it, and calls `execveat(AT_EMPTY_PATH)`. | A fresh service receives controlled credentials, environment, limits, and usually a new PTY. | This is the strongest Linux precedent for native executable pinning. Its path fallback is less suitable for Agentknock because Agentknock can wait far longer before execution. |
 | Bubblewrap | Executes after constructing namespaces, mounts, capability rules, seccomp filters, and `no_new_privs`. | Intentionally creates a sandbox and changes the target's view of the system. | Sandboxing is a separate product contract, not free launcher hardening. |
 
 Two cautions from these implementations matter directly:
@@ -205,13 +205,13 @@ Two cautions from these implementations matter directly:
   a writable inode. A digest does not fix that without a trusted expected digest
   and an immutable execution object.
 - Systemd falls back to pathname execution when descriptor execution returns
-  `ENOENT`, partly to support `O_CLOEXEC` scripts. For AgentKnock, `ENOENT` is
+  `ENOENT`, partly to support `O_CLOEXEC` scripts. For Agentknock, `ENOENT` is
   ambiguous: it can also mean that a native ELF interpreter is missing. A blind
   fallback after a long approval creates a new substitution opportunity.
 
 `run0` obtains polkit authorization before PID 1 opens the service executable.
 Systemd therefore pins its final setup-to-execution interval, not the file that
-was present throughout the user's authorization wait. AgentKnock must open
+was present throughout the user's authorization wait. Agentknock must open
 earlier because executable identity is part of its approval request.
 
 ### Secret-injection launchers
@@ -222,22 +222,22 @@ earlier because executable identity is part of its approval request.
 | Doppler `run` | Direct child argv, with a separate explicit shell-string mode. | Inherits and overlays secrets, blocks a few names, and warns about a longer non-exhaustive execution-control list. | Doppler explicitly warns that environment-variable names such as loader and runtime controls can cause code execution. Its warning list also demonstrates why a complete blacklist is unrealistic. |
 | Infisical `run` | Direct child argv, or an explicit shell-string mode. | Inherits and overlays while rejecting a reserved-name list. | Direct argv should be the default. Name filtering varies widely and remains incomplete. |
 | `aws-vault exec` | Normally resolves with `LookPath` and replaces itself with `exec`; an optional local credential server stays resident. | Removes conflicting AWS names and injects a fixed, program-owned schema. | Fixed credential names make collision policy tractable. A local credential protocol is useful for future renewable credentials, but not necessary for static environment delivery. |
-| SOPS `exec-env` | Always invokes `/bin/sh -c`; optional same-process mode replaces SOPS with the shell. | Inherits by default; optional pristine mode. | An implicit shell makes lookup, quoting, expansion, startup files, and signals part of the interface. AgentKnock should avoid it. |
+| SOPS `exec-env` | Always invokes `/bin/sh -c`; optional same-process mode replaces SOPS with the shell. | Inherits by default; optional pristine mode. | An implicit shell makes lookup, quoting, expansion, startup files, and signals part of the interface. Agentknock should avoid it. |
 | Chamber | Direct replacement on Unix. | Supports inherited or pristine environment. Its strict mode injects only variables declared by sentinel values in advance. | Explicitly declared destination names are stronger than a denylist when the workflow can support them. |
-| Vault Agent and Envconsul | Remain as supervisors for refresh and restart behavior. | Inherit and append by default, with varying allow/deny/pristine controls. | A resident parent is justified for renewal or restart, not for AgentKnock's one-time `exec` flow. |
+| Vault Agent and Envconsul | Remain as supervisors for refresh and restart behavior. | Inherit and append by default, with varying allow/deny/pristine controls. | A resident parent is justified for renewal or restart, not for Agentknock's one-time `exec` flow. |
 | `vaultenv` | Replaces itself directly. | Offers no-inherit, blacklist, and explicit collision policies. | Collision behavior should be deterministic and documented. |
 | `vals exec` | Runs a direct child. | Uses a pristine environment by default; inheritance is opt-in. | Pristine behavior is viable for a purpose-built workflow but would be a substantial compatibility change for an `env`-like wrapper. |
 | CyberArk Summon | Runs a child and remains for signal forwarding and temporary-file cleanup. | Maps declared environment names to secrets. | Declarative destination names are reviewable. Plaintext file delivery needs a lifecycle owner and careful storage semantics. |
 | systemd credentials | Gives a service immutable credential files rather than environment values. | Uses a per-service credential directory, preferably memory-backed. | File or protocol delivery is a better future shape for large, binary, scoped, or renewable credentials. It does not help arbitrary tools that require environment variables. |
 
 None of the inspected open-source secret launchers pins the executable across an
-interactive authorization delay. AgentKnock can provide a stronger binding than
+interactive authorization delay. Agentknock can provide a stronger binding than
 the current same-user secret-launcher norm without adopting privilege-launcher
 semantics.
 
 ### Technique decisions
 
-| Technique | Decision for AgentKnock | Reason |
+| Technique | Decision for Agentknock | Reason |
 | --- | --- | --- |
 | Direct structured argv | Adopt | Avoids shell parsing and preserves the request's exact argument boundaries. |
 | Resolve and open before approval | Adopt on Linux | Binds displayed native identity to later execution. |
@@ -250,11 +250,11 @@ semantics.
 | Sealed executable copy | Reject | Changes executable identity and breaks capabilities, labels, self-location, and other filesystem semantics. |
 | Preserve inherited environment | Adopt | Required for transparent general-purpose command behavior. |
 | Overlay approved variables | Adopt | Matches the credential-delivery contract; collisions must be deterministic. |
-| Environment denylist | Reject as a security boundary | Incomplete, too late for AgentKnock itself, and incompatible with some real tools. |
+| Environment denylist | Reject as a security boundary | Incomplete, too late for Agentknock itself, and incompatible with some real tools. |
 | Clean environment | Defer to an explicit future mode | Potentially useful for a separate workflow, but too disruptive as the default. |
-| Close AgentKnock-owned descriptors | Adopt | Prevents accidental relay, config, lock, and runtime descriptor leakage. |
+| Close Agentknock-owned descriptors | Adopt | Prevents accidental relay, config, lock, and runtime descriptor leakage. |
 | Close all descriptors above stderr | Reject | Caller-owned descriptors can be intentional command inputs or control channels. |
-| Restore signals changed by AgentKnock/Rust | Adopt | Preserves ordinary native program behavior, notably for `SIGPIPE`. |
+| Restore signals changed by Agentknock/Rust | Adopt | Preserves ordinary native program behavior, notably for `SIGPIPE`. |
 | Preserve cwd, stdio, tty, PID, process group, umask, and limits | Adopt | These are part of transparent invocation semantics. |
 | PTY or resident monitor | Reject for environment `exec` | Changes I/O and process behavior without adding a same-user boundary. |
 | `no_new_privs`, namespaces, seccomp, or chroot | Reject | This is sandbox policy, can break legitimate commands, and does not protect released values from the target. |
@@ -274,7 +274,7 @@ Add a Linux-only CLI type, conceptually named `SelectedExecutable`, that owns:
 - the executable mode: binary or script; and
 - for a known script only, the exact candidate pathname used to select it.
 
-This type belongs in the CLI implementation. The AgentKnock library receives
+This type belongs in the CLI implementation. The Agentknock library receives
 only the request metadata and remains unaware of file descriptors, process
 replacement, or command-line parsing.
 
@@ -329,7 +329,7 @@ For the reference Linux/glibc behavior, a `PATH` search should remember
 `EACCES` when at least one candidate produced it; otherwise report the final
 lookup error. A directory or a regular file that fails effective execute access
 counts as `EACCES`. This mirrors glibc's treatment of lookup and access errors,
-not its complete execute-at-each-candidate behavior. AgentKnock selects before
+not its complete execute-at-each-candidate behavior. Agentknock selects before
 the kernel checks file format and interpreter dependencies; a later format or
 interpreter failure is terminal rather than a reason to select another path or
 invoke a shell. A command containing `/` has no search and returns its own error
@@ -341,7 +341,7 @@ setup to execution but would not bind the executable shown during approval.
 The resolver should return a real error rather than `None`. A missing,
 non-executable, non-regular, inaccessible, or non-UTF-8 target should stop before
 any request is sent. This avoids asking for credentials for a command that
-AgentKnock already knows it cannot launch.
+Agentknock already knows it cannot launch.
 
 ### 3. Classify scripts before approval
 
@@ -452,7 +452,7 @@ time-bounded grant from matching.
 
 After a valid approved response and completion exchange:
 
-1. Start with the environment inherited by AgentKnock, using `vars_os` or an
+1. Start with the environment inherited by Agentknock, using `vars_os` or an
    equivalent byte-preserving API so unrelated non-UTF-8 entries survive.
 2. Overlay the returned profile variables, with returned values winning on a
    name collision. This preserves the current intended credential-injection
@@ -467,7 +467,7 @@ After a valid approved response and completion exchange:
 
 Do not maintain a blacklist of `LD_*`, `PATH`, `BASH_ENV`, `NODE_OPTIONS`,
 `PYTHONPATH`, `GIT_*`, and similar names as a claimed security boundary. The set
-is open-ended, inherited values may have affected AgentKnock already, and many
+is open-ended, inherited values may have affected Agentknock already, and many
 tools legitimately depend on environment-controlled configuration. Descriptor
 execution ensures that even an overlaid `PATH` does not change the selected
 top-level native executable, but such values can still affect loaders,
@@ -486,10 +486,10 @@ Immediately before execution:
    completion. Only after completion is finished and the CLI has decided to
    execute, set SIGINT, SIGTERM, and SIGPIPE to `SIG_DFL` immediately before the
    exec call. This preserves Rust's current `SIGPIPE` child behavior and ensures
-   that a termination signal in the final narrow window stops AgentKnock instead
+   that a termination signal in the final narrow window stops Agentknock instead
    of being swallowed by a now-unused Tokio handler. Do not alter the inherited
-   signal mask unless AgentKnock itself changed it.
-2. Verify that every AgentKnock-owned descriptor other than the selected
+   signal mask unless Agentknock itself changed it.
+2. Verify that every Agentknock-owned descriptor other than the selected
    executable descriptor is close-on-exec or already closed. This includes
    WebSocket, configuration, lock, random-source, timer, and runtime descriptors.
 3. Preserve caller-owned inherited descriptors. Do not run `closefrom` or
@@ -542,7 +542,7 @@ Do not change the following as part of this work:
 - namespaces, cgroups, LSM context, or seccomp state; or
 - the caller's existing `no_new_privs` state.
 
-In particular, AgentKnock must not set `no_new_privs`. That flag is inherited and
+In particular, Agentknock must not set `no_new_privs`. That flag is inherited and
 irreversible, and it prevents set-user-ID, set-group-ID, and file-capability
 transitions while also affecting LSM behavior. It would unexpectedly break
 commands such as `sudo` and would not stop a same-user target from reading the
@@ -550,19 +550,19 @@ credentials it was given.
 
 Do not allocate a PTY or keep a monitoring parent. Those mechanisms are useful
 for sudo I/O policy, output masking, renewal, or process supervision, but they
-conflict with AgentKnock's direct-replacement contract.
+conflict with Agentknock's direct-replacement contract.
 
 ## Exact guarantee and non-guarantees
 
 After implementation, documentation and UI may accurately say:
 
-- AgentKnock resolves the top-level command before requesting credentials.
-- On Linux, AgentKnock pins a native top-level executable and executes that same
+- Agentknock resolves the top-level command before requesting credentials.
+- On Linux, Agentknock pins a native top-level executable and executes that same
   opened filesystem object after approval.
-- AgentKnock passes the approved argument vector without an implicit shell.
-- AgentKnock resolves the top-level executable before applying returned
+- Agentknock passes the approved argument vector without an implicit shell.
+- Agentknock resolves the top-level executable before applying returned
   environment variables.
-- AgentKnock replaces itself with the command after protocol completion.
+- Agentknock replaces itself with the command after protocol completion.
 
 They must not say:
 
@@ -576,7 +576,7 @@ They must not say:
 - that the process is unaffected by its environment;
 - that credentials are hidden from the approved process tree or other actors
   with sufficient same-user inspection authority; or
-- that AgentKnock provides sudo, sandbox, or privilege-separation guarantees.
+- that Agentknock provides sudo, sandbox, or privilege-separation guarantees.
 
 The strongest ordinary case is a non-user-writable native system executable:
 path replacement is ineffective after selection, and the invoking user normally
@@ -617,14 +617,14 @@ correct identity handle.
 
 Flags that prohibit symlinks, mount crossings, or paths outside a chosen root
 are useful when resolving an untrusted path beneath a trusted directory.
-AgentKnock has no such trusted root and must support symlinks, bind mounts, Nix
+Agentknock has no such trusted root and must support symlinks, bind mounts, Nix
 profiles, and user toolchains. These restrictions would reject normal commands
 without strengthening the same-user boundary.
 
 ### Environment sanitization
 
 Sudo, doas, and pkexec reconstruct environments because an untrusted caller is
-crossing into a more privileged security domain. AgentKnock stays in the same
+crossing into a more privileged security domain. Agentknock stays in the same
 domain and intentionally runs general developer tools. A clean environment
 would break common authentication, configuration, toolchain, locale, terminal,
 and home-directory behavior. An incomplete denylist would create a misleading
@@ -633,15 +633,15 @@ security claim. Preserve-and-overlay is the honest default.
 ### Closing all extra descriptors
 
 Privilege launchers close unexpected descriptors so a privileged child cannot
-inherit attacker-selected communication channels. AgentKnock receives no new OS
+inherit attacker-selected communication channels. Agentknock receives no new OS
 privilege, and inherited descriptors may be deliberate inputs, outputs, sockets,
-or control channels. Only AgentKnock-owned descriptors should be close-on-exec.
+or control channels. Only Agentknock-owned descriptors should be close-on-exec.
 
 ### PTY, monitor, sandbox, or system service
 
 These are appropriate when enforcing I/O policy, changing privilege, refreshing
 credentials, restarting a target, or containing it. They alter process
-identity, signals, terminal behavior, namespaces, and output. AgentKnock's
+identity, signals, terminal behavior, namespaces, and output. Agentknock's
 environment mode needs none of those functions. Future renewable-token,
 credential-helper, SSH-agent, or file-credential modes may justify a separate
 resident broker design.
@@ -680,7 +680,7 @@ and their expected hashes belong on the approving device.
 - A command containing `/` does not search `PATH`.
 - An absent `PATH` uses `_CS_PATH`.
 - A selected non-UTF-8 display path fails before any credential request.
-- AgentKnock's own descriptors never replace the standard-descriptor state
+- Agentknock's own descriptors never replace the standard-descriptor state
   established by the Rust runtime.
 - Relative qualified commands and relative or empty `PATH` entries resolve from
   the captured current-directory descriptor even if its pathname is renamed.
@@ -702,7 +702,7 @@ Use a test relay that pauses between request and approval:
 - Modify the bytes of a user-writable selected inode in place and document the
   observed limitation rather than treating it as protected.
 - Make a pinned native executable's ELF interpreter unavailable and verify that
-  AgentKnock fails without path fallback.
+  Agentknock fails without path fallback.
 
 ### Reusable-grant hash tests
 
@@ -742,7 +742,7 @@ Use a test relay that pauses between request and approval:
 - Variable names can appear in verbose diagnostics, but values never do.
 - PID, cwd, stdio, process group, session, umask, resource limits, and
   deliberately inherited descriptors have the expected direct-exec behavior.
-- AgentKnock-owned descriptors do not survive into the target.
+- Agentknock-owned descriptors do not survive into the target.
 - `SIGPIPE` has its default disposition in the executed process.
 - SIGINT or SIGTERM received after completion but before the exec system call
   prevents the command from starting.
