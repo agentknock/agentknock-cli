@@ -279,13 +279,13 @@ pub(crate) struct PairingCompletion {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
-    #[error("cannot {operation} while cryptographic session is {state}")]
+    #[error("can't {operation} while the cryptographic session is {state}")]
     MessageOrder {
         operation: &'static str,
         state: &'static str,
     },
 
-    #[error("invalid base64 in cryptographic message: {0}")]
+    #[error("cryptographic message contains invalid Base64: {0}")]
     Base64(#[from] base64::DecodeError),
 
     #[error("HPKE operation failed: {0}")]

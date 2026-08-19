@@ -284,7 +284,7 @@ pub enum PairingRemoveError {
     #[error(transparent)]
     Request(RequestError),
 
-    #[error("device accepted pairing removal, but local pairing removal failed: {0}")]
+    #[error("device removed the pairing, but local pairing removal failed: {0}")]
     LocalState(ConfigurationError),
 }
 

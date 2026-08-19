@@ -464,9 +464,9 @@ fn rejects_a_missing_command_before_requesting_credentials() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("could not select the command"), "{stderr}");
+    assert!(stderr.contains("wasn't found"), "{stderr}");
     assert!(
-        stderr.contains("The profile access request did not start."),
+        stderr.contains("No profile access request was sent."),
         "{stderr}"
     );
     assert!(!stderr.contains("relay"), "{stderr}");
@@ -483,11 +483,11 @@ fn explains_that_the_command_separator_is_required() {
     assert_eq!(output.stdout, b"");
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "error: `--` is required before the command to execute\n\
+        "error: add `--` before the command to run\n\
          \n\
          Usage: agentknock exec -p <PROFILE>... -- <COMMAND> [ARGUMENT]...\n\
          \n\
-         For more information, try '--help'.\n"
+         For more information, run 'agentknock exec --help'.\n"
     );
 }
 
@@ -731,7 +731,7 @@ async fn signal_before_response_sends_an_aborted_completion() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("A signal interrupted"));
+    assert!(stderr.contains("received a signal"));
     assert!(!stderr.contains("Suggested action:"));
     server.await.unwrap();
 }
@@ -821,7 +821,7 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
             .contains("AGENTKNOCK_MUST_NOT_EXEC")
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("A signal interrupted"));
+    assert!(stderr.contains("received a signal"), "{stderr}");
     assert!(!stderr.contains("Suggested action:"));
     server.await.unwrap();
 }

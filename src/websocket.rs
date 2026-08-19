@@ -255,7 +255,7 @@ impl RelayExchange {
     {
         if self.request.is_none() {
             return Err(Error::Protocol(
-                "completion cannot be sent before a request".into(),
+                "completion can't be sent before a request".into(),
             ));
         }
         if self.completion.is_none() {
@@ -521,7 +521,7 @@ impl RelayExchange {
                         Err(_) => {
                             self.socket = None;
                             retry
-                                .failed_with("relay did not answer a WebSocket ping".into())
+                                .failed_with("relay didn't answer a WebSocket ping".into())
                                 .await?;
                             return Ok(None);
                         }
@@ -869,7 +869,7 @@ pub(crate) enum Error {
     #[error("relay protocol error: {0}")]
     Protocol(String),
 
-    #[error("relay response did not include a response message")]
+    #[error("relay response doesn't include a response message")]
     MissingResponse,
 
     #[error("received unauthenticated error {code}: {message:?}")]
@@ -881,7 +881,7 @@ pub(crate) enum Error {
     #[error("relay reported that the exchange is inactive")]
     Inactive { kind: Option<MessageKind> },
 
-    #[error("paired client is not active ({code} {reason})")]
+    #[error("paired client is inactive ({code} {reason})")]
     ClientInactive { code: u16, reason: String },
 
     #[error("relay remained unavailable after {failures} consecutive failures: {last_error}")]
@@ -893,13 +893,13 @@ pub(crate) enum Error {
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(String),
 
-    #[error("client token cannot be used in an Authorization header")]
+    #[error("client token can't be used in an Authorization header")]
     InvalidClientToken,
 
     #[error("WebSocket setup failed: {0}")]
     WebSocket(#[from] tokio_websockets::Error),
 
-    #[error("{TEST_RELAY_URL_ENV} is not valid UTF-8")]
+    #[error("{TEST_RELAY_URL_ENV} isn't valid UTF-8")]
     InvalidTestRelayUrl,
 }
 

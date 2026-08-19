@@ -130,7 +130,7 @@ fn reports_when_no_pairing_exists() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("Agentknock is not paired")
+            .contains("Agentknock isn't paired")
     );
 }
 
@@ -154,7 +154,7 @@ async fn reports_inactive_client_without_suggesting_recovery() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("paired client is not active"), "{stderr}");
+    assert!(stderr.contains("paired client is inactive"), "{stderr}");
     assert!(!stderr.contains("Suggested action:"), "{stderr}");
     server.await.unwrap();
 }

@@ -222,13 +222,13 @@ impl SelectedExecutable {
         let Some(actual) = actual else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the selected executable can no longer be read for hash verification",
+                "the selected command can no longer be read for hash verification",
             ));
         };
         if actual != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the selected executable changed after the credential request",
+                "the selected command changed after the profile access request",
             ));
         }
         Ok(())
@@ -423,13 +423,13 @@ fn descriptor_path(descriptor: &OwnedFd, description: &str) -> io::Result<String
     let path = std::fs::read_link(descriptor_proc_path(descriptor)).map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("cannot read {description} through /proc/self/fd: {error}"),
+            format!("can't read {description} through /proc/self/fd: {error}"),
         )
     })?;
     path.into_os_string().into_string().map_err(|path| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{description} is not valid UTF-8: {path:?}"),
+            format!("{description} isn't valid UTF-8: {path:?}"),
         )
     })
 }
@@ -472,7 +472,10 @@ fn c_arguments(command: &str, arguments: &[String]) -> io::Result<Vec<CString>> 
         .chain(arguments.iter().map(String::as_str))
         .map(|argument| {
             CString::new(argument).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "command argument contains NUL")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command argument contains a null byte",
+                )
             })
         })
         .collect()
@@ -484,13 +487,13 @@ fn c_environment(credentials: Credentials) -> io::Result<Vec<CString>> {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("invalid returned environment variable name {name:?}"),
+                format!("profile response contains invalid environment variable name {name:?}"),
             ));
         }
         if value.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("returned environment variable {name:?} contains NUL"),
+                format!("returned environment variable {name:?} contains a null byte"),
             ));
         }
         environment.insert(OsString::from(name), OsString::from(value));
@@ -506,7 +509,7 @@ fn c_environment(credentials: Credentials) -> io::Result<Vec<CString>> {
             CString::new(entry).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "inherited environment contains NUL",
+                    "inherited environment contains a null byte",
                 )
             })
         })
@@ -523,7 +526,7 @@ fn c_pointers(values: &[CString]) -> Vec<*const libc::c_char> {
 
 fn path_c_string(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a null byte"))
 }
 
 fn signal_action(signal: libc::c_int) -> io::Result<libc::sigaction> {

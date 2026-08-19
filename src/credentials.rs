@@ -97,7 +97,7 @@ pub enum RequestError {
     #[error("received unauthenticated error {code}: {message:?}")]
     Unauthenticated { code: String, message: String },
 
-    #[error("paired client is not active: {message}")]
+    #[error("paired client is inactive: {message}")]
     ClientInactive { message: String },
 
     #[error(transparent)]
@@ -112,10 +112,10 @@ pub enum RequestError {
     #[error("pairing was rejected")]
     PairingRejected,
 
-    #[error("credential request interrupted")]
+    #[error("profile access request was interrupted")]
     Interrupted,
 
-    #[error("AGENTKNOCK_TEST_RELAY_URL is not valid UTF-8")]
+    #[error("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8")]
     InvalidTestRelayUrl,
 }
 
@@ -124,16 +124,16 @@ pub enum ProtocolError {
     #[error("pairing address must contain lowercase ASCII words separated by single hyphens")]
     InvalidPairingAddress,
 
-    #[error("invalid protocol JSON: {0}")]
+    #[error("protocol message contains invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("cannot {operation} while cryptographic session is {state}")]
+    #[error("can't {operation} while the cryptographic session is {state}")]
     MessageOrder {
         operation: &'static str,
         state: &'static str,
     },
 
-    #[error("invalid base64 in encrypted response: {0}")]
+    #[error("encrypted response contains invalid Base64: {0}")]
     Base64(#[from] base64::DecodeError),
 
     #[error("HPKE operation failed: {0}")]
@@ -148,10 +148,10 @@ pub enum ProtocolError {
     #[error("response decryption failed")]
     Decryption(#[from] chacha20poly1305::aead::Error),
 
-    #[error("relay response state did not include a response message")]
+    #[error("relay response state doesn't include a response message")]
     MissingResponse,
 
-    #[error("approved response did not contain profiles")]
+    #[error("approved response doesn't contain profiles")]
     MissingProfiles,
 
     #[error("approved profiles contain different values for environment variable {name:?}")]

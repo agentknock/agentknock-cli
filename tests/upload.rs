@@ -121,9 +121,9 @@ async fn uploads_an_environment_profile_from_multiple_sources() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         concat!(
-            "Agentknock delivered profile proposal \"bootstrap\" to the device.\n",
-            "The profile proposal has not been accepted on the device.\n",
-            "Suggested action: Review the profile proposal on the device.\n",
+            "Profile proposal \"bootstrap\" delivered to the device.\n",
+            "The profile isn't available until you accept the proposal on the device.\n",
+            "Suggested action: Review the proposal on the device.\n",
         )
     );
     assert!(
@@ -314,7 +314,7 @@ fn rejects_multiple_standard_input_sources_before_connecting() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("standard input can be used by only one profile source")
+            .contains("only one profile source can read from standard input")
     );
 }
 
@@ -338,6 +338,6 @@ fn does_not_print_a_secret_from_an_invalid_environment_file() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("environment file"));
-    assert!(stderr.contains("is invalid"));
+    assert!(stderr.contains("isn't valid"));
     assert!(!stderr.contains("do-not-print-this"));
 }

@@ -294,7 +294,7 @@ async fn starts_and_finishes_pairing_over_websockets() {
     assert!(
         String::from_utf8(finish.stdout)
             .unwrap()
-            .contains("finished pairing")
+            .contains("Pairing complete")
     );
 
     let result = server.await.unwrap();

@@ -203,33 +203,33 @@ impl Serialize for CanonicalUlid {
 
 #[derive(Debug, Error)]
 pub enum ConfigurationError {
-    #[error("HOME is not set")]
+    #[error("HOME isn't set")]
     HomeNotSet,
 
-    #[error("could not access pairing configuration {path}: {source}")]
+    #[error("couldn't access pairing file {path}: {source}")]
     Access {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
 
-    #[error("{path} must have mode 0600, found {mode:04o}")]
+    #[error("pairing file {path} has permissions {mode:04o}, but 0600 is required")]
     InsecurePermissions { path: PathBuf, mode: u32 },
 
-    #[error("invalid pairing configuration {path}: {source}")]
+    #[error("pairing file {path} isn't valid: {source}")]
     Invalid {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
 
-    #[error("pairing in {path} is still pending")]
+    #[error("pairing in {path} is waiting for confirmation")]
     PairingPending { path: PathBuf },
 
-    #[error("pairing configuration {path} already exists")]
+    #[error("pairing file {path} already exists")]
     PairingExists { path: PathBuf },
 
-    #[error("no pairing configuration exists at {path}")]
+    #[error("no pairing file exists at {path}")]
     NoPairing { path: PathBuf },
 
     #[error("pairing in {path} is already active")]
@@ -238,7 +238,7 @@ pub enum ConfigurationError {
     #[error("pairing in {path} already has a pending PSK rotation")]
     RotationPending { path: PathBuf },
 
-    #[error("pairing configuration {path} changed during the operation")]
+    #[error("pairing file {path} changed during the operation")]
     PairingChanged { path: PathBuf },
 
     #[error("system clock is before the Unix epoch: {0}")]
