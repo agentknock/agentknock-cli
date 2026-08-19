@@ -234,12 +234,13 @@ request scope.
 ULIDs serve both as unique identifiers and as carriers of a claimed creation
 time. Once an identifier is bound to a cryptographic context, the timestamp
 bits have integrity along with the rest of the identifier. This does not prove
-that a malicious client supplied the correct time. Each implementation must
-define a ULID freshness policy and must apply it to every previously unseen
-`client_id` or `request_id` before accepting that identifier. The policy may
-use the timestamp together with local state and local time. Its duration,
-clock-skew allowance, and acceptance algorithm are implementation-defined.
-Neither the timestamp nor the random field is treated as secret.
+that a malicious client supplied the correct time. Each receiver that accepts
+previously unseen identifiers must define a ULID freshness policy and apply it
+to every previously unseen `client_id` or `request_id` before accepting that
+identifier. The policy may use the timestamp together with local state and
+local time. Its duration, clock-skew allowance, and acceptance algorithm are
+implementation-defined. Neither the timestamp nor the random field is treated
+as secret.
 
 For the initial pairing exchange, its `request_id` and the new `client_id` are
 the same ULID. The all-zero 16-byte request identifier is reserved exclusively
@@ -365,11 +366,16 @@ does not repeat HPKE setup, sealing, or response encryption under the same
 identifiers. Reusing the same JSON serialization is preferable but not
 cryptographically required.
 
-An endpoint retains idempotency state for at least as long as its freshness
-policy could accept the identifier if it were previously unseen, and longer
-while a live operation depends on it. State may be discarded after both
-conditions end; subsequent handling then relies on the freshness policy rather
-than retained idempotency state.
+A receiver retains a slot's idempotency state while a live operation depends
+on it and while its freshness policy could accept the slot's identifiers as
+previously unseen. It may discard that state only when, under the policy's
+trusted time and state assumptions, the same identifiers cannot later be
+accepted as a new operation. The policy, retention method, and those
+assumptions are implementation-defined.
+
+Idempotency state may consist only of a terminal marker. It need not retain
+plaintext, ciphertext, or an exchange context after those values are no longer
+needed for redelivery.
 
 ## 6. Pairing-address derivation
 
@@ -495,8 +501,10 @@ The v1 JSON envelope mapping is:
 
 The response is not authenticated at this point. As one serialized, crash-safe
 transition, the device accepts the request and durably fixes its `commitment`,
-`device_random`, and complete response tuple. Later deliveries return that
-tuple and never create another device contribution.
+`device_random`, and complete response tuple. While the response tuple is
+retained, later deliveries return that tuple and never create another device
+contribution. After those values are discarded, the device must not generate
+another response for the slot.
 
 ### 7.2. Base-mode exchange and client PSK
 
@@ -874,8 +882,8 @@ copy, it must durably fix `response_random` and `response_ciphertext` as request
 state. Those values are sufficient to reproduce the exact encrypted response;
 this cryptosystem does not require durable retention of `response_plaintext`.
 Application state may separately retain a terminal result when needed. A later
-delivery returns the fixed encrypted values under Section 5.6. The device must
-not generate a different `paired_response` for the same request context,
+response for the slot uses the fixed encrypted values. After the device
+discards those values, it must not generate another response for the slot,
 including after a crash.
 
 ### 8.3. Completion
@@ -1042,6 +1050,11 @@ one.
 
 Only one previous generation is retained. Its overlap ends at the fixed
 deadline or upon a later rotation, whichever comes first.
+
+The one-unconfirmed-rotation limit applies to each client state, not to the
+device. A separate copy with the current PSK can authenticate a later rotation;
+accepting it replaces the previous generation and can strand another copy on
+an older pending lineage.
 
 The trigger and application semantics for invalidating or removing an active
 binding are outside this document. Rotation overlap exists only while the
@@ -1225,6 +1238,12 @@ Compromise of the current `client_psk` permits future client impersonation and
 rotation attempts until the device state changes. The PSK alone does not
 decrypt previously recorded HPKE exchanges without the corresponding device
 private key or sender ephemeral state.
+
+Disclosure of a live request context, its exporter secret, or equivalent
+record-key material is stronger than disclosure of `client_psk` alone. Access
+to the request record's sequence-zero key and nonce before device acceptance
+can permit substitution of that request. Access to the still-live context can
+permit construction of a context-consistent response or completion.
 
 Compromise of `skD` has a wider retrospective effect. If an attacker recorded
 the initial base-mode pairing exchange, `skD` lets it reconstruct that context
