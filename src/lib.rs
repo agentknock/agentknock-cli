@@ -1,3 +1,5 @@
+//! TODO: Document the Agentknock project.
+
 mod client;
 mod config;
 mod crypto;
