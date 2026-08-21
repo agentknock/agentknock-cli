@@ -1,4 +1,4 @@
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs, io, path::Path};
 
 use base64::{
     Engine as _,
@@ -9,7 +9,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    ConfigurationError, ProtocolError, RequestError,
+    ConfigurationError, RequestError,
     config::{
         CanonicalUlid, LockedPairing, abort_pending_pairing, current_timestamp,
         ensure_pairing_absent, finish_pending_pairing, lock_pairing_if_rotated_before,
@@ -55,16 +55,18 @@ where
     P: FnMut(PairingProgress),
 {
     if !is_valid_pairing_address(address) {
-        return Err(ProtocolError::InvalidPairingAddress.into());
+        return Err(RequestError::other(
+            "pairing address must contain lowercase ASCII words separated by single hyphens",
+        ));
     }
     progress(PairingProgress::Preparing);
     ensure_pairing_absent()?;
-    let client_secret = generate_client_secret().map_err(ProtocolError::from)?;
-    let commitment = derive_pairing_commitment(&client_secret).map_err(ProtocolError::from)?;
+    let client_secret = generate_client_secret().map_err(RequestError::other)?;
+    let commitment = derive_pairing_commitment(&client_secret).map_err(RequestError::other)?;
     let request_id = Ulid::generate();
     let client_id = CanonicalUlid::new(request_id);
     let client_token = generate_client_token()?;
-    let address_id = derive_address_id(address).map_err(ProtocolError::from)?;
+    let address_id = derive_address_id(address).map_err(RequestError::other)?;
     let mut relay = RelayExchange::pairing(
         &address_id.to_string(),
         &request_id.to_string(),
@@ -88,7 +90,7 @@ where
         machine_id: read_trimmed("/etc/machine-id"),
         os_version: os_version(),
     };
-    let application_plaintext = crate::protocol::encode(&contents).map_err(ProtocolError::from)?;
+    let application_plaintext = crate::protocol::encode(&contents).map_err(RequestError::other)?;
     let (completion, pairing, sas) = seal_pairing(
         client_id,
         client_token,
@@ -96,7 +98,7 @@ where
         &client_secret,
         &application_plaintext,
     )
-    .map_err(ProtocolError::from)?;
+    .map_err(RequestError::other)?;
     write_pending_pairing(&pairing)?;
 
     if let Err(error) = relay.complete(&completion).await {
@@ -123,11 +125,11 @@ where
     let plaintext = crate::protocol::encode(&MethodRequest {
         method: Method::PairingFinish,
     })
-    .map_err(ProtocolError::from)?;
-    let mut session = Session::new(&pairing, &request_id).map_err(ProtocolError::from)?;
+    .map_err(RequestError::other)?;
+    let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = relay
@@ -138,18 +140,18 @@ where
     progress(PairingProgress::Completing);
     let plaintext = session
         .open_response(response)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let result: FinishPairingResult =
-        serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
+        serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
     if result == FinishPairingResult::Rejected {
         return Err(RequestError::PairingRejected);
     }
 
     let plaintext =
-        crate::protocol::encode(&FinishPairingResult::Accepted).map_err(ProtocolError::from)?;
+        crate::protocol::encode(&FinishPairingResult::Accepted).map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     finish_pending_pairing()?;
     relay.complete(&completion).await?;
     progress(PairingProgress::Completed);
@@ -193,11 +195,11 @@ where
     let plaintext = crate::protocol::encode(&MethodRequest {
         method: Method::PairingRemove,
     })
-    .map_err(ProtocolError::from)?;
-    let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
+    .map_err(RequestError::other)?;
+    let mut session = Session::new(pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = relay
@@ -208,12 +210,12 @@ where
     progress(PairingProgress::Completing);
     let plaintext = session
         .open_response(response)
-        .map_err(ProtocolError::from)?;
-    serde_json::from_slice::<EmptyMessage>(&plaintext).map_err(ProtocolError::from)?;
-    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
+    serde_json::from_slice::<EmptyMessage>(&plaintext).map_err(RequestError::other)?;
+    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
 
     Ok((relay, completion))
 }
@@ -237,7 +239,7 @@ fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RotationError> {
 }
 
 fn rotate_locked(pairing: LockedPairing, rotated_at: u64) -> Result<(), RotationError> {
-    let rotation = derive_psk_rotation(pairing.pairing()).map_err(ProtocolError::from)?;
+    let rotation = derive_psk_rotation(pairing.pairing()).map_err(io::Error::other)?;
     pairing.write_rotation(&rotation.client_psk, &rotation.rotation_key, rotated_at)?;
     Ok(())
 }
@@ -248,7 +250,7 @@ pub(crate) enum RotationError {
     Configuration(#[from] ConfigurationError),
 
     #[error(transparent)]
-    Protocol(#[from] ProtocolError),
+    Other(#[from] io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -318,9 +320,9 @@ fn os_version() -> Option<String> {
         .map(str::to_owned)
 }
 
-fn generate_client_token() -> Result<String, ProtocolError> {
+fn generate_client_token() -> io::Result<String> {
     let mut token = [0; 32];
-    getrandom::fill(&mut token).map_err(ProtocolError::Random)?;
+    getrandom::fill(&mut token).map_err(io::Error::other)?;
     Ok(BASE64_URL_SAFE.encode(token))
 }
 

@@ -9,7 +9,7 @@ mod websocket;
 pub use config::ConfigurationError;
 pub use credentials::{
     CredentialRequest, CredentialRequestProgress, Credentials, DenialReason, ExecutableMode,
-    ProtocolError, RequestError, RequestOperation, StreamKind, request_credentials,
+    RequestError, RequestOperation, StreamKind, request_credentials,
 };
 pub use pairing::{
     PairingProgress, PairingRemoveError, PairingSas, abort_pairing, finish_pairing,

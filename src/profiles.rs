@@ -5,7 +5,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    ProtocolError, RequestError,
+    RequestError,
     config::{ConfigurationError, clear_rotation_key, read_pairing},
     crypto::Session,
     pairing::{RotationError, maybe_rotate_psk},
@@ -70,12 +70,6 @@ impl From<ConfigurationError> for ProfileUploadError {
     }
 }
 
-impl From<ProtocolError> for ProfileUploadError {
-    fn from(error: ProtocolError) -> Self {
-        Self::Request(error.into())
-    }
-}
-
 impl From<crate::websocket::Error> for ProfileUploadError {
     fn from(error: crate::websocket::Error) -> Self {
         Self::Request(error.into())
@@ -93,11 +87,11 @@ where
     let plaintext = crate::protocol::encode(&ListRequest {
         method: Method::ProfileList,
     })
-    .map_err(ProtocolError::from)?;
-    let mut session = Session::new(&pairing, &request_id).map_err(ProtocolError::from)?;
+    .map_err(RequestError::other)?;
+    let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
     progress(ProfileListProgress::WaitingForDelivery);
@@ -109,15 +103,15 @@ where
     progress(ProfileListProgress::Completing);
     let plaintext = session
         .open_response(response)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     if let Some(rotation_key) = pairing.rotation_key() {
         clear_rotation_key(rotation_key)?;
     }
-    let response: ListResponse = serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
-    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(ProtocolError::from)?;
+    let response: ListResponse = serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     relay.complete(&completion).await?;
     progress(ProfileListProgress::Completed);
 
@@ -145,11 +139,11 @@ where
         mode: mode.into(),
         profile: NamedProfileMessage::from(profile),
     };
-    let plaintext = crate::protocol::encode(&request_payload).map_err(ProtocolError::from)?;
-    let mut session = Session::new(&pairing, &request_id).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&request_payload).map_err(RequestError::other)?;
+    let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
     progress(ProfileUploadProgress::WaitingForDelivery);
@@ -161,15 +155,15 @@ where
     progress(ProfileUploadProgress::Completing);
     let plaintext = session
         .open_response(response)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     if let Some(rotation_key) = pairing.rotation_key() {
         clear_rotation_key(rotation_key)?;
     }
-    let response: UploadResult = serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
-    let completion = crate::protocol::encode(&response).map_err(ProtocolError::from)?;
+    let response: UploadResult = serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+    let completion = crate::protocol::encode(&response).map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&completion)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let _ = relay.complete_briefly(&completion).await;
     progress(ProfileUploadProgress::Completed);
 
@@ -182,7 +176,7 @@ where
 fn prepare_request() -> Result<(), RequestError> {
     maybe_rotate_psk().map_err(|error| match error {
         RotationError::Configuration(error) => RequestError::Configuration(error),
-        RotationError::Protocol(error) => RequestError::Protocol(error),
+        RotationError::Other(error) => RequestError::Other(error),
     })?;
     Ok(())
 }

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
+    io,
     pin::Pin,
 };
 
@@ -85,12 +86,6 @@ pub enum RequestError {
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),
 
-    #[error("relay request failed: {0}")]
-    Relay(String),
-
-    #[error("relay returned unexpected HTTP status {0}")]
-    UnexpectedRelayStatus(u16),
-
     #[error("relay remained unavailable after {failures} consecutive failures")]
     RelayUnavailable { failures: usize },
 
@@ -101,7 +96,7 @@ pub enum RequestError {
     ClientInactive { message: String },
 
     #[error(transparent)]
-    Protocol(#[from] ProtocolError),
+    Other(#[from] io::Error),
 
     #[error("request denied ({reason}): {message}")]
     Denied {
@@ -119,59 +114,13 @@ pub enum RequestError {
     InvalidTestRelayUrl,
 }
 
-#[derive(Debug, Error)]
-pub enum ProtocolError {
-    #[error("pairing address must contain lowercase ASCII words separated by single hyphens")]
-    InvalidPairingAddress,
-
-    #[error("protocol message contains invalid JSON: {0}")]
-    Json(#[from] serde_json::Error),
-
-    #[error("can't {operation} while the cryptographic session is {state}")]
-    MessageOrder {
-        operation: &'static str,
-        state: &'static str,
-    },
-
-    #[error("encrypted response contains invalid Base64: {0}")]
-    Base64(#[from] base64::DecodeError),
-
-    #[error("HPKE operation failed: {0}")]
-    Hpke(#[from] hpke::HpkeError),
-
-    #[error("random generation failed: {0}")]
-    Random(#[from] getrandom::Error),
-
-    #[error("key derivation failed: {0}")]
-    KeyDerivation(#[from] hkdf::InvalidLength),
-
-    #[error("response decryption failed")]
-    Decryption(#[from] chacha20poly1305::aead::Error),
-
-    #[error("relay response state doesn't include a response message")]
-    MissingResponse,
-
-    #[error("approved response doesn't contain profiles")]
-    MissingProfiles,
-
-    #[error("approved profiles contain different values for environment variable {name:?}")]
-    ConflictingEnvironmentVariable { name: String },
-
-    #[error("approved response contains profiles {received:?}, expected {expected:?}")]
-    UnexpectedProfiles {
-        expected: Vec<String>,
-        received: Vec<String>,
-    },
-
-    #[error("received an ABORTED result in a response")]
-    AbortedResponse,
-
-    #[error("{field} has length {actual}, expected {expected} bytes")]
-    InvalidLength {
-        field: &'static str,
-        actual: usize,
-        expected: usize,
-    },
+impl RequestError {
+    pub(crate) fn other<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::Other(io::Error::other(error))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -207,7 +156,7 @@ where
     progress(CredentialRequestProgress::Preparing);
     maybe_rotate_psk().map_err(|error| match error {
         RotationError::Configuration(error) => RequestError::Configuration(error),
-        RotationError::Protocol(error) => RequestError::Protocol(error),
+        RotationError::Other(error) => RequestError::Other(error),
     })?;
     let pairing = read_pairing()?;
     let operation = match request.operation {
@@ -261,11 +210,11 @@ where
     P: FnMut(CredentialRequestProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(request_payload).map_err(ProtocolError::from)?;
-    let mut session = Session::new(pairing, &request_id).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(request_payload).map_err(RequestError::other)?;
+    let mut session = Session::new(pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
 
     progress(CredentialRequestProgress::WaitingForDelivery);
@@ -302,11 +251,11 @@ where
     progress(CredentialRequestProgress::Completing);
     let plaintext = session
         .open_response(response)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     if let Some(rotation_key) = pairing.rotation_key() {
         clear_rotation_key(rotation_key)?;
     }
-    let result: RequestResult = serde_json::from_slice(&plaintext).map_err(ProtocolError::from)?;
+    let result: RequestResult = serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
     let (completion_result, exchange_result) = match result {
         RequestResult::Approved {
             profiles: Some(profiles),
@@ -323,9 +272,11 @@ where
         RequestResult::Approved { profiles: None } => (
             RequestResult::Aborted {
                 reason: AbortReason::InvalidResponse,
-                message: ProtocolError::MissingProfiles.to_string(),
+                message: "approved response doesn't contain profiles".into(),
             },
-            Err(ProtocolError::MissingProfiles.into()),
+            Err(RequestError::other(
+                "approved response doesn't contain profiles",
+            )),
         ),
         RequestResult::Denied { reason, message } => (
             RequestResult::Denied {
@@ -337,16 +288,18 @@ where
         RequestResult::Aborted { .. } => (
             RequestResult::Aborted {
                 reason: AbortReason::InvalidResponse,
-                message: ProtocolError::AbortedResponse.to_string(),
+                message: "received an ABORTED result in a response".into(),
             },
-            Err(ProtocolError::AbortedResponse.into()),
+            Err(RequestError::other(
+                "received an ABORTED result in a response",
+            )),
         ),
     };
 
-    let plaintext = crate::protocol::encode(&completion_result).map_err(ProtocolError::from)?;
+    let plaintext = crate::protocol::encode(&completion_result).map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&plaintext)
-        .map_err(ProtocolError::from)?;
+        .map_err(RequestError::other)?;
     let interrupted = tokio::select! {
         biased;
         _ = cancellation.as_mut() => true,
@@ -367,7 +320,7 @@ where
 fn credentials_from_profiles(
     profiles: BTreeMap<String, ProfileMessage<BTreeMap<String, SecretValueMessage>>>,
     requested_profiles: &[String],
-) -> Result<Credentials, ProtocolError> {
+) -> io::Result<Credentials> {
     let mut environment = BTreeMap::new();
     let received_profiles = profiles.keys().cloned().collect::<BTreeSet<_>>();
     for profile in profiles.into_values() {
@@ -377,7 +330,9 @@ fn credentials_from_profiles(
                     if let Some(previous) = environment.get(&name)
                         && previous != &variable.value
                     {
-                        return Err(ProtocolError::ConflictingEnvironmentVariable { name });
+                        return Err(io::Error::other(format!(
+                            "approved profiles contain different values for environment variable {name:?}"
+                        )));
                     }
                     environment.insert(name, variable.value);
                 }
@@ -386,10 +341,11 @@ fn credentials_from_profiles(
     }
     let expected_profiles = requested_profiles.iter().cloned().collect::<BTreeSet<_>>();
     if received_profiles != expected_profiles {
-        return Err(ProtocolError::UnexpectedProfiles {
-            expected: expected_profiles.into_iter().collect(),
-            received: received_profiles.into_iter().collect(),
-        });
+        return Err(io::Error::other(format!(
+            "approved response contains profiles {:?}, expected {:?}",
+            received_profiles.into_iter().collect::<Vec<_>>(),
+            expected_profiles.into_iter().collect::<Vec<_>>()
+        )));
     }
     Ok(Credentials { environment })
 }
@@ -426,35 +382,9 @@ async fn complete_cancelled(session: &mut Session, relay: &mut RelayExchange) {
     let _ = relay.complete_briefly(&completion).await;
 }
 
-impl From<crypto::Error> for ProtocolError {
-    fn from(error: crypto::Error) -> Self {
-        match error {
-            crypto::Error::MessageOrder { operation, state } => {
-                Self::MessageOrder { operation, state }
-            }
-            crypto::Error::Base64(error) => Self::Base64(error),
-            crypto::Error::Hpke(error) => Self::Hpke(error),
-            crypto::Error::Random(error) => Self::Random(error),
-            crypto::Error::KeyDerivation(error) => Self::KeyDerivation(error),
-            crypto::Error::Decryption(error) => Self::Decryption(error),
-            crypto::Error::InvalidLength {
-                field,
-                actual,
-                expected,
-            } => Self::InvalidLength {
-                field,
-                actual,
-                expected,
-            },
-        }
-    }
-}
-
 impl From<websocket::Error> for RequestError {
     fn from(error: websocket::Error) -> Self {
         match error {
-            websocket::Error::InvalidJson(error) => Self::Protocol(ProtocolError::Json(error)),
-            websocket::Error::UnexpectedStatus(status) => Self::UnexpectedRelayStatus(status),
             websocket::Error::RetriesExhausted { failures, .. } => {
                 Self::RelayUnavailable { failures }
             }
@@ -467,9 +397,8 @@ impl From<websocket::Error> for RequestError {
             websocket::Error::ClientInactive { reason, .. } => {
                 Self::ClientInactive { message: reason }
             }
-            websocket::Error::MissingResponse => Self::Protocol(ProtocolError::MissingResponse),
             websocket::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,
-            error => Self::Relay(error.to_string()),
+            error => Self::other(error),
         }
     }
 }
@@ -586,10 +515,13 @@ mod tests {
         ]);
         let requested = vec!["first".into(), "second".into()];
 
-        assert!(matches!(
-            credentials_from_profiles(profiles, &requested),
-            Err(ProtocolError::ConflictingEnvironmentVariable { name }) if name == "TOKEN"
-        ));
+        let error = credentials_from_profiles(profiles, &requested)
+            .err()
+            .expect("conflicting values should fail");
+        assert_eq!(
+            error.to_string(),
+            "approved profiles contain different values for environment variable \"TOKEN\""
+        );
     }
 
     #[test]
@@ -598,11 +530,13 @@ mod tests {
             BTreeMap::from([("other".into(), environment_profile([("TOKEN", "value")]))]);
         let requested = vec!["requested".into()];
 
-        assert!(matches!(
-            credentials_from_profiles(profiles, &requested),
-            Err(ProtocolError::UnexpectedProfiles { expected, received })
-                if expected == ["requested"] && received == ["other"]
-        ));
+        let error = credentials_from_profiles(profiles, &requested)
+            .err()
+            .expect("a different profile set should fail");
+        assert_eq!(
+            error.to_string(),
+            "approved response contains profiles [\"other\"], expected [\"requested\"]"
+        );
     }
 
     fn environment_profile<const N: usize>(

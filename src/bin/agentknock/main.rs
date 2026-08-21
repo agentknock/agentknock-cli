@@ -1264,9 +1264,6 @@ fn print_list_error(error: &RequestError) {
             print_plain_error("Suggested action: Check relay connectivity, then run:");
             print_plain_error("agentknock profile list");
         }
-        RequestError::Relay(_) => {
-            print_plain_error(format_args!("Agentknock couldn't list profiles: {error}."));
-        }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
             print_plain_error("Agentknock didn't receive a profile list.");
@@ -1344,12 +1341,6 @@ fn print_exec_request_error(error: &RequestError) {
                 "Suggested action: Check the network connection and relay status, then run the command again.",
             );
         }
-        RequestError::Relay(source) => {
-            print_message(format_args!(
-                "The profile access request failed because of a relay error: {source}."
-            ));
-            print_message("The command didn't run.");
-        }
         RequestError::Unauthenticated { code, message } => {
             print_unauthenticated_report(code, message);
             print_message("The command didn't run.");
@@ -1362,16 +1353,8 @@ fn print_exec_request_error(error: &RequestError) {
             ));
             print_message("The command didn't run.");
         }
-        RequestError::Protocol(source) => {
-            print_message(format_args!(
-                "The profile access request failed because of a protocol error: {source}."
-            ));
-            print_message("The command didn't run.");
-        }
-        RequestError::UnexpectedRelayStatus(status) => {
-            print_message(format_args!(
-                "The relay returned unexpected HTTP status {status}."
-            ));
+        RequestError::Other(source) => {
+            print_message(format_args!("The profile access request failed: {source}."));
             print_message("The command didn't run.");
         }
         RequestError::PairingRejected => {
@@ -1455,11 +1438,6 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error(
                 "Suggested action: Check the network connection and relay status, then run this command again.",
             );
-        }
-        RequestError::Relay(source) => {
-            print_plain_error(format_args!(
-                "Pairing didn't start because of a relay error: {source}."
-            ));
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
