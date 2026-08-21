@@ -1,4 +1,10 @@
-use std::{env, time::Duration};
+use std::time::Duration;
+
+#[cfg(all(feature = "integration-tests", debug_assertions))]
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::{HeaderValue, header::AUTHORIZATION};
@@ -11,6 +17,7 @@ use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, WebSocket
 use crate::config::Pairing;
 
 const RELAY_URL: &str = "wss://relay.agentknock.dev";
+#[cfg(all(feature = "integration-tests", debug_assertions))]
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
 const MAXIMUM_FRAME_SIZE: usize = 256 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -101,11 +108,7 @@ impl RelayExchange {
         request_id: &str,
         client_token: &str,
     ) -> Result<Self, Error> {
-        let relay_url = match env::var(TEST_RELAY_URL_ENV) {
-            Ok(relay_url) => relay_url,
-            Err(env::VarError::NotPresent) => RELAY_URL.to_owned(),
-            Err(env::VarError::NotUnicode(_)) => return Err(Error::InvalidTestRelayUrl),
-        };
+        let relay_url = relay_url()?;
         let authorization = HeaderValue::from_str(&format!("Bearer {client_token}"))
             .map_err(|_| Error::InvalidClientToken)?;
 
@@ -652,6 +655,43 @@ impl RelayExchange {
     }
 }
 
+fn relay_url() -> Result<String, Error> {
+    #[cfg(all(feature = "integration-tests", debug_assertions))]
+    {
+        match env::var(TEST_RELAY_URL_ENV) {
+            Ok(url) => return validate_test_relay_url(url),
+            Err(env::VarError::NotPresent) => {}
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(Error::InvalidRelayUrl(
+                    "integration-test relay URL isn't valid UTF-8".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(RELAY_URL.to_owned())
+}
+
+#[cfg(all(feature = "integration-tests", debug_assertions))]
+fn validate_test_relay_url(url: String) -> Result<String, Error> {
+    let uri = url
+        .parse::<http::Uri>()
+        .map_err(|_| Error::InvalidRelayUrl(url.clone()))?;
+    let address = uri
+        .authority()
+        .and_then(|authority| authority.as_str().parse::<SocketAddr>().ok());
+    let path_is_empty = uri.path_and_query().is_none_or(|path| path.as_str() == "/");
+
+    if uri.scheme_str() == Some("ws")
+        && address.is_some_and(|address| address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        && path_is_empty
+    {
+        Ok(url)
+    } else {
+        Err(Error::InvalidRelayUrl(url))
+    }
+}
+
 fn ensure_rustls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
@@ -898,9 +938,6 @@ pub(crate) enum Error {
 
     #[error("WebSocket setup failed: {0}")]
     WebSocket(#[from] tokio_websockets::Error),
-
-    #[error("{TEST_RELAY_URL_ENV} isn't valid UTF-8")]
-    InvalidTestRelayUrl,
 }
 
 #[cfg(test)]
@@ -920,6 +957,20 @@ mod tests {
     fn installs_rustls_crypto_provider() {
         super::ensure_rustls_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[cfg(all(feature = "integration-tests", debug_assertions))]
+    #[test]
+    fn accepts_a_loopback_test_relay() {
+        let url = "ws://127.0.0.1:12345".to_owned();
+
+        assert_eq!(super::validate_test_relay_url(url.clone()).unwrap(), url);
+    }
+
+    #[cfg(all(feature = "integration-tests", debug_assertions))]
+    #[test]
+    fn rejects_a_remote_test_relay() {
+        assert!(super::validate_test_relay_url("ws://relay.example:12345".into()).is_err());
     }
 
     #[test]

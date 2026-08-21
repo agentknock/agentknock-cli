@@ -109,9 +109,6 @@ pub enum RequestError {
 
     #[error("profile access request was interrupted")]
     Interrupted,
-
-    #[error("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8")]
-    InvalidTestRelayUrl,
 }
 
 impl RequestError {
@@ -397,7 +394,6 @@ impl From<websocket::Error> for RequestError {
             websocket::Error::ClientInactive { reason, .. } => {
                 Self::ClientInactive { message: reason }
             }
-            websocket::Error::InvalidTestRelayUrl => Self::InvalidTestRelayUrl,
             error => Self::other(error),
         }
     }

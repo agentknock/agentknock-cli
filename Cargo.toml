@@ -3,6 +3,9 @@ name = "agentknock"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+integration-tests = []
+
 [dependencies]
 atomic-write-file = "0.3.0"
 base64 = "0.22.1"
@@ -27,3 +30,23 @@ ulid = "3.0.0"
 
 [dev-dependencies]
 tokio-websockets = { version = "0.13.3", default-features = false, features = ["server"] }
+
+[[test]]
+name = "exec"
+path = "tests/exec.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "list"
+path = "tests/list.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "pairing"
+path = "tests/pairing.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "upload"
+path = "tests/upload.rs"
+required-features = ["integration-tests"]

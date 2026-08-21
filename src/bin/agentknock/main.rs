@@ -1227,12 +1227,6 @@ fn print_upload_error(error: &ProfileUploadError) {
             ));
             print_plain_error("The profile proposal wasn't delivered.");
         }
-        ProfileUploadError::Request(RequestError::InvalidTestRelayUrl) => {
-            print_plain_error("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8.");
-            print_plain_error(
-                "Suggested action: Set AGENTKNOCK_TEST_RELAY_URL to valid UTF-8 or unset it.",
-            );
-        }
         ProfileUploadError::Request(error) => {
             print_plain_error(format_args!(
                 "Agentknock couldn't send the profile proposal: {error}."
@@ -1275,12 +1269,6 @@ fn print_list_error(error: &RequestError) {
                 "The relay reports that this paired client is inactive: {message}"
             ));
             print_plain_error("Agentknock didn't receive a profile list.");
-        }
-        RequestError::InvalidTestRelayUrl => {
-            print_plain_error("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8.");
-            print_plain_error(
-                "Suggested action: Set AGENTKNOCK_TEST_RELAY_URL to valid UTF-8 or unset it.",
-            );
         }
         _ => {
             print_plain_error(format_args!("Agentknock couldn't list profiles: {error}."));
@@ -1361,13 +1349,6 @@ fn print_exec_request_error(error: &RequestError) {
             print_message("The device rejected this client pairing.");
             print_message("The command didn't run.");
         }
-        RequestError::InvalidTestRelayUrl => {
-            print_message("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8.");
-            print_message("The command didn't run.");
-            print_message(
-                "Suggested action: Set AGENTKNOCK_TEST_RELAY_URL to valid UTF-8 or unset it.",
-            );
-        }
     }
 }
 
@@ -1444,12 +1425,6 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error("Pairing didn't start. The local pairing state is unchanged.");
             print_plain_unauthenticated_action(code);
         }
-        RequestError::InvalidTestRelayUrl => {
-            print_plain_error("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8.");
-            print_plain_error(
-                "Suggested action: Set AGENTKNOCK_TEST_RELAY_URL to valid UTF-8 or unset it.",
-            );
-        }
         _ => {
             print_plain_error(format_args!("Agentknock couldn't start pairing: {error}."));
         }
@@ -1489,12 +1464,6 @@ fn print_finish_pairing_error(error: &RequestError) {
                 "The relay reports that the pending client is inactive: {message}"
             ));
             print_plain_error("The pending pairing remains saved.");
-        }
-        RequestError::InvalidTestRelayUrl => {
-            print_plain_error("AGENTKNOCK_TEST_RELAY_URL isn't valid UTF-8.");
-            print_plain_error(
-                "Suggested action: Set AGENTKNOCK_TEST_RELAY_URL to valid UTF-8 or unset it.",
-            );
         }
         _ => {
             print_plain_error(format_args!("Agentknock couldn't finish pairing: {error}."));
