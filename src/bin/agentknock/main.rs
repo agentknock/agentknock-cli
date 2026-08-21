@@ -43,6 +43,8 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
     name = "agentknock",
     version,
     about = "Request profile access, manage profiles, and pair with a device.",
+    long_about = "Pair this client with a device, request access to profiles stored on the device, and send profile proposals to the device.\n\nBefore you request or manage profiles, use `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
+    max_term_width = 120,
     arg_required_else_help = true,
     subcommand_required = true,
     disable_help_subcommand = true,
@@ -56,10 +58,42 @@ struct Cli {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
     /// Request access to profiles, then run a command.
-    #[command(visible_alias = "x")]
+    ///
+    /// The request includes the profile names, optional reason, command, and arguments. It also
+    /// includes the working directory, selected executable path, SHA-256 hash when available,
+    /// paths of the programs that launched Agentknock, and how standard input, output, and error
+    /// are connected. If the device approves the request, Agentknock adds the returned variables to
+    /// the command's environment. Returned values replace existing values with the same names.
+    /// Agentknock then replaces itself with the command.
+    ///
+    /// Specify each profile with a separate `--profile` option. The `--` separator is required;
+    /// Agentknock treats everything after it as the command and its arguments. Agentknock doesn't
+    /// invoke a shell or interpret those arguments.
+    ///
+    /// If multiple profiles provide the same environment variable, their values must match.
+    /// Otherwise, Agentknock doesn't run the command.
+    ///
+    /// Agentknock writes its messages to standard error. The command inherits standard input,
+    /// standard output, and standard error. While the request waits for the device, Agentknock
+    /// reports progress and total elapsed time every 30 seconds unless you use `--quiet`.
+    /// Interrupting Agentknock prevents the command from running.
+    ///
+    /// You can use `agentknock x` as a shorter alias for `agentknock exec`.
+    #[command(
+        visible_alias = "x",
+        after_long_help = "Examples:\n  Request one profile:\n    agentknock exec -p github -- gh issue list\n\n  Request multiple profiles and explain why:\n    agentknock exec -p github -p cloudflare --reason \"Deploy the release\" -- wrangler deploy"
+    )]
     Exec(ExecCommand),
 
     /// Pair this client with a device or remove its pairing.
+    ///
+    /// Pairing creates an encrypted relationship between this client and one device. Start with
+    /// the pairing address displayed on the device, confirm the full verification code, approve
+    /// the pairing on the device, and then finish the pairing on this client.
+    ///
+    /// This client can have only one pairing, either pending or active. Abort a pending pairing if
+    /// you don't complete it. Remove an active pairing when this client must no longer access the
+    /// device.
     #[command(
         arg_required_else_help = true,
         subcommand_required = true,
@@ -71,6 +105,12 @@ enum Command {
     },
 
     /// List profiles or send a profile proposal to the paired device.
+    ///
+    /// A profile defines data or operations that the paired device can provide. This version of
+    /// Agentknock can request environment profiles and send environment profile proposals.
+    ///
+    /// Profile commands require an active pairing. Listing returns profile metadata without
+    /// secret values. Uploading sends secret values to the device in an encrypted proposal.
     #[command(
         arg_required_else_help = true,
         subcommand_required = true,
@@ -84,7 +124,10 @@ enum Command {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 struct ExecCommand {
-    /// Profile to include in the access request. Repeat for each profile.
+    /// Name of a profile to request from the device.
+    ///
+    /// Repeat this option to request more than one profile. A profile name can't be empty or
+    /// contain a comma. To find available names, use `agentknock profile list`.
     #[arg(
         short = 'p',
         long = "profile",
@@ -95,7 +138,9 @@ struct ExecCommand {
     )]
     profiles: Vec<String>,
 
-    /// Reason to include in the profile access request.
+    /// Explanation for why the command needs profile access.
+    ///
+    /// Agentknock sends this text unchanged to the device as part of the access request.
     #[arg(
         long,
         value_name = "REASON",
@@ -103,15 +148,24 @@ struct ExecCommand {
     )]
     reason: Option<String>,
 
-    /// Hide Agentknock status messages.
+    /// Suppress Agentknock request and command-launch messages.
+    ///
+    /// This option doesn't suppress output from the command.
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
 
-    /// Show every profile access request state change.
+    /// Show each profile access request state change.
+    ///
+    /// Before Agentknock runs the command, it lists the names of the environment variables that
+    /// it received. It never displays their values.
     #[arg(long, conflicts_with = "quiet")]
     verbose: bool,
 
-    /// Command to run and its arguments after `--`.
+    /// Executable name or path, followed by its arguments.
+    ///
+    /// Put the command after the required `--` separator. If the executable name doesn't contain
+    /// a slash, Agentknock searches `PATH`, or the system default search path if `PATH` isn't set.
+    /// Agentknock passes each argument unchanged.
     #[arg(last = true, num_args = 1.., required = true, value_name = "COMMAND")]
     command: Vec<String>,
 }
@@ -119,21 +173,64 @@ struct ExecCommand {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum PairingCommand {
     /// Start pairing with a device.
+    ///
+    /// Use the pairing address displayed on the device to create a pending pairing. Agentknock
+    /// displays a 12-digit verification code. Confirm the full code on the device before you
+    /// approve the pairing.
+    ///
+    /// If the codes match, approve the pairing on the device and then use `agentknock pairing
+    /// finish`. If they don't match, reject the pairing on the device and use `agentknock pairing
+    /// abort`.
+    ///
+    /// This command doesn't replace an existing pending or active pairing.
+    ///
+    /// While the request waits for the device, Agentknock reports progress and total elapsed time
+    /// every 30 seconds.
     Start {
-        /// Pairing address displayed on the device.
+        /// Exact pairing address displayed on the device.
+        ///
+        /// The address contains lowercase ASCII words separated by single hyphens, such as
+        /// `calm-river-lantern`.
         #[arg(value_name = "PAIRING_ADDRESS", value_parser = parse_pairing_address)]
         address: String,
     },
 
     /// Activate a pairing that you approved on the device.
+    ///
+    /// Use this command after `agentknock pairing start`, but only after you confirm that the full
+    /// verification code matches and approve the pairing on the device. Agentknock asks the device
+    /// to confirm the pairing and then marks the local pairing as active.
+    ///
+    /// If the verification codes don't match, use `agentknock pairing abort` instead.
+    ///
+    /// While the request waits for the device, Agentknock reports progress and total elapsed time
+    /// every 30 seconds.
     Finish,
 
     /// Discard a pending pairing.
+    ///
+    /// Use this command if you reject or abandon a pairing, including when the verification codes
+    /// don't match. Agentknock deletes the pending pairing from this client without contacting the
+    /// device.
+    ///
+    /// This command doesn't remove an active pairing. To remove one, use `agentknock pairing
+    /// remove`.
     Abort,
 
     /// Remove an active pairing from this client and the device.
+    ///
+    /// By default, Agentknock asks the device to remove the pairing and waits for an authenticated
+    /// response before it deletes the local pairing. After removal, this client can no longer
+    /// request profiles from the device.
+    ///
+    /// If the device can't be contacted, use `--force` to delete only the local pairing.
+    /// Without `--force`, Agentknock reports progress and total elapsed time every 30 seconds while
+    /// it waits for the device.
     Remove {
-        /// Remove the local pairing without contacting the device.
+        /// Delete only the local pairing without contacting the device.
+        ///
+        /// The device retains its pairing record. Use this option only when normal removal can't
+        /// complete, such as when the device is no longer available.
         #[arg(long)]
         force: bool,
     },
@@ -142,31 +239,72 @@ enum PairingCommand {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum ProfileCommand {
     /// List profiles available from the paired device.
+    ///
+    /// Request metadata for the profiles that this client can access. Agentknock writes a JSON
+    /// object to standard output. Each profile includes its type, optional description, and the
+    /// environment variable names that it provides. The output never includes secret values.
+    ///
+    /// Agentknock writes progress and error messages to standard error, so you can redirect or
+    /// process the JSON output separately.
+    ///
+    /// While the request waits for the device, Agentknock reports progress and total elapsed time
+    /// every 30 seconds.
+    #[command(
+        after_long_help = "Example output:\n  {\n    \"profiles\": {\n      \"github\": {\n        \"description\": \"GitHub API access\",\n        \"type\": \"environment\",\n        \"variables\": [\"GH_TOKEN\"]\n      }\n    }\n  }"
+    )]
     List,
 
     /// Send a profile proposal to the paired device.
+    ///
+    /// Build an environment profile from one or more local sources and send it to the paired
+    /// device in an encrypted proposal. The command completes after the device confirms that it
+    /// stored the proposal. The device doesn't apply the proposed changes until you accept them;
+    /// Agentknock doesn't wait for that decision.
+    ///
+    /// Without `--replace` or `--update`, the proposal creates a profile when accepted. Use
+    /// `--replace` to propose replacing an existing profile completely. Use `--update` to propose
+    /// changing supplied variables while retaining variables that you don't supply.
+    ///
+    /// You can combine and repeat input options, but each environment variable name can occur only
+    /// once. At most one input can read from standard input. Names must be portable shell variable
+    /// names, and all names and values must be valid UTF-8.
+    ///
+    /// While the proposal waits for the device, Agentknock reports progress and total elapsed time
+    /// every 30 seconds.
+    #[command(
+        after_long_help = "Examples:\n  Create a profile from the current environment:\n    agentknock profile upload github --description \"GitHub API access\" --from-env GH_TOKEN\n\n  Create a profile from a dotenv file:\n    agentknock profile upload development --from-env-file .env\n\n  Update one variable in an existing profile:\n    agentknock profile upload github --update --from-prompt GH_TOKEN"
+    )]
     Upload(ProfileUploadCommand),
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
 struct ProfileUploadCommand {
-    /// Name for the profile.
+    /// Name of the new or existing profile.
     ///
-    /// With --replace or --update, use the name of an existing profile.
+    /// Without `--replace` or `--update`, this value is the proposed name for a new profile. You
+    /// can rename the profile when you accept it on the device.
     ///
-    /// When you accept a new profile on the device, you can rename it.
+    /// With `--replace` or `--update`, use the exact name of the existing profile. The device
+    /// doesn't rename an existing profile. A profile name can't be empty or contain a comma.
     #[arg(value_name = "NAME", value_parser = parse_profile)]
     name: String,
 
-    /// Description to include in the profile proposal.
+    /// Description for the profile.
+    ///
+    /// With `--update`, omit this option to retain the existing description. Specify an empty
+    /// string to remove the description.
     #[arg(long, value_name = "DESCRIPTION")]
     description: Option<String>,
 
-    /// Replace the entire existing profile.
+    /// Propose replacing an existing profile with the supplied profile.
+    ///
+    /// Existing environment variables that you don't supply are removed.
     #[arg(long, conflicts_with = "update")]
     replace: bool,
 
-    /// Update the supplied fields in an existing profile.
+    /// Propose updating the supplied fields in an existing profile.
+    ///
+    /// Existing environment variables that you don't supply are retained.
     #[arg(long, conflicts_with = "replace")]
     update: bool,
 
@@ -177,19 +315,31 @@ struct ProfileUploadCommand {
 #[derive(Debug, Args, PartialEq, Eq)]
 #[group(required = true, multiple = true)]
 struct EnvironmentProfileInput {
-    /// Read NAME from the current environment.
+    /// Read an environment variable from the current process environment.
+    ///
+    /// NAME is both the source and destination variable name. Repeat this option to read more
+    /// variables.
     #[arg(long, action = ArgAction::Append, value_name = "NAME", value_parser = parse_environment_name)]
     from_env: Vec<String>,
 
-    /// Read NAME from PATH. Use NAME=- to read from standard input.
+    /// Read an environment variable value from a file.
+    ///
+    /// Use `NAME=PATH`, where NAME is the destination variable name. Agentknock reads the complete
+    /// file without trimming whitespace. Use `NAME=-` to read the value from standard input.
+    /// Repeat this option to read more variables.
     #[arg(long, action = ArgAction::Append, value_name = "NAME=PATH")]
     from_file: Vec<VariableFile>,
 
-    /// Prompt for NAME in the terminal without displaying its value.
+    /// Prompt for an environment variable without displaying its value.
+    ///
+    /// NAME is the destination variable name. Repeat this option to prompt for more variables.
     #[arg(long, action = ArgAction::Append, value_name = "NAME", value_parser = parse_environment_name)]
     from_prompt: Vec<String>,
 
-    /// Read a dotenv file. Use - to read from standard input.
+    /// Read environment variables from a dotenv file.
+    ///
+    /// Agentknock uses the names and values defined in the file. Use `-` to read dotenv data from
+    /// standard input. Repeat this option to read more files.
     #[arg(long, action = ArgAction::Append, value_name = "PATH", value_parser = parse_path)]
     from_env_file: Vec<PathBuf>,
 }
@@ -1934,15 +2084,112 @@ mod tests {
     }
 
     #[test]
-    fn describes_profile_upload_without_assuming_an_environment_profile() {
-        let help = Cli::try_parse_from(["agentknock", "profile", "upload", "--help"]).unwrap_err();
+    fn documents_every_command() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["--help"],
+                &[
+                    "Pair this client with a device",
+                    "Before you request or manage profiles",
+                ],
+            ),
+            (
+                &["exec", "--help"],
+                &[
+                    "adds the returned variables",
+                    "The `--` separator is required",
+                    "doesn't invoke a shell",
+                    "Repeat this option",
+                    "doesn't suppress output from the command",
+                ],
+            ),
+            (
+                &["pairing", "--help"],
+                &[
+                    "Pairing creates an encrypted relationship",
+                    "confirm the full verification code",
+                ],
+            ),
+            (
+                &["pairing", "start", "--help"],
+                &[
+                    "12-digit verification code",
+                    "agentknock pairing finish",
+                    "lowercase ASCII words separated by single hyphens",
+                ],
+            ),
+            (
+                &["pairing", "finish", "--help"],
+                &[
+                    "only after you confirm",
+                    "marks the local pairing as active",
+                ],
+            ),
+            (
+                &["pairing", "abort", "--help"],
+                &[
+                    "without contacting the device",
+                    "doesn't remove an active pairing",
+                ],
+            ),
+            (
+                &["pairing", "remove", "--help"],
+                &[
+                    "waits for an authenticated response",
+                    "delete only the local pairing",
+                    "device retains its pairing record",
+                ],
+            ),
+            (
+                &["profile", "--help"],
+                &[
+                    "Profile commands require an active pairing",
+                    "without secret values",
+                ],
+            ),
+            (
+                &["profile", "list", "--help"],
+                &[
+                    "JSON object to standard output",
+                    "never includes secret values",
+                    "Example output:",
+                ],
+            ),
+            (
+                &["profile", "upload", "--help"],
+                &[
+                    "doesn't wait for that decision",
+                    "Use `--replace`",
+                    "At most one input can read from standard input",
+                    "Environment variable sources:",
+                    "without trimming whitespace",
+                    "Examples:",
+                ],
+            ),
+        ];
 
-        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
-        let help = help.to_string();
-        assert!(help.contains("Send a profile proposal to the paired device"));
-        assert!(help.contains("Environment variable sources:"));
-        assert!(help.contains("Name for the profile."));
-        assert!(!help.contains("Suggested profile name"));
+        for (arguments, expected) in cases {
+            let help = help_text(arguments);
+            let normalized_help = normalize_whitespace(&help);
+            for text in *expected {
+                assert!(
+                    normalized_help.contains(&normalize_whitespace(text)),
+                    "help for {arguments:?} doesn't contain {text:?}:\n{help}"
+                );
+            }
+        }
+    }
+
+    fn help_text(arguments: &[&str]) -> String {
+        let error =
+            Cli::try_parse_from(std::iter::once("agentknock").chain(arguments.iter().copied()))
+                .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        error.to_string()
+    }
+
+    fn normalize_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     #[test]
