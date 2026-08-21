@@ -22,96 +22,203 @@ use crate::{
     websocket::{self, RelayExchange},
 };
 
+/// Describes a request to use one or more secrets.
+///
+/// The device uses this metadata to decide whether to approve the request. The
+/// client that constructs it is responsible for reporting the operation and
+/// launcher information accurately.
 pub struct SecretUseRequest<'a> {
+    /// The unique names of the secrets requested together.
     pub secrets: &'a BTreeSet<String>,
+
+    /// The operation that will receive or use the approved secret material.
     pub operation: SecretUseOperation<'a>,
+
+    /// An optional explanation shown with the request.
+    ///
+    /// Agentknock transmits this value unchanged.
     pub reason: Option<&'a str>,
+
+    /// The programs that launched the embedding application.
+    ///
+    /// Order and selection are defined by the embedding application.
     pub launcher_chain: &'a [String],
 }
 
+/// Describes how a command's standard stream is connected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamKind {
+    /// The stream is connected to a terminal.
     Terminal,
+
+    /// The stream is connected to a null device such as `/dev/null`.
     NullDevice,
+
+    /// The stream is connected to a pipe.
     Pipe,
+
+    /// The stream is connected to a socket.
     Socket,
+
+    /// The stream is connected to a regular file.
     RegularFile,
+
+    /// The connection type is unavailable or isn't represented by another variant.
     Unknown,
 }
 
+/// An operation for which secret use can be requested.
 #[non_exhaustive]
 pub enum SecretUseOperation<'a> {
+    /// Executes a program with approved secret material in its environment.
     Exec {
+        /// The executable name or path supplied by the caller.
         command: &'a str,
+
+        /// The executable arguments, excluding argument zero.
         arguments: &'a [String],
+
+        /// The working directory in which the executable will run.
         working_directory: &'a str,
+
+        /// The resolved path of the executable selected for execution.
         executable_path: &'a str,
+
+        /// The SHA-256 digest of the selected executable, when available.
         executable_hash: Option<&'a [u8; 32]>,
+
+        /// Whether the selected executable is a native binary or a script.
         executable_mode: ExecutableMode,
+
+        /// How the executable's standard input is connected.
         stdin: StreamKind,
+
+        /// How the executable's standard output is connected.
         stdout: StreamKind,
+
+        /// How the executable's standard error is connected.
         stderr: StreamKind,
     },
 }
 
+/// The form of a selected executable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExecutableMode {
+    /// A native executable binary.
     Binary,
+
+    /// A script that selects an interpreter with a shebang line.
     Script,
 }
 
+/// Secret material returned for an approved use request.
+///
+/// This type doesn't implement [`Debug`](std::fmt::Debug) because it contains
+/// secret values. Use [`SecretUseOutput::environment_variable_names`] to
+/// inspect names without exposing values, or consume the output with
+/// [`SecretUseOutput::into_environment`].
 pub struct SecretUseOutput {
     environment: BTreeMap<String, String>,
 }
 
+/// A stage reported while a secret use request is running.
+///
+/// A completed exchange reports `Preparing`, `WaitingForDelivery`, optionally
+/// one or more `WaitingForResponse` updates, `Completing`, and `Completed`, in
+/// that order. A request can still return a device denial after reporting
+/// `Completed`; other failures stop without reporting `Completed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SecretUseProgress {
+    /// Agentknock is reading local state and preparing the protected request.
     Preparing,
+
+    /// The request is waiting to be delivered to the device.
     WaitingForDelivery,
+
+    /// The device has received the request but hasn't returned a decision.
     WaitingForResponse,
+
+    /// Agentknock is validating the response and handing off the completion.
     Completing,
+
+    /// The exchange and completion handoff finished successfully.
     Completed,
 }
 
 impl SecretUseOutput {
+    /// Returns the names of the approved environment variables.
+    ///
+    /// Names are yielded in lexicographic order. Values aren't exposed by this
+    /// iterator.
     pub fn environment_variable_names(&self) -> impl Iterator<Item = &str> {
         self.environment.keys().map(String::as_str)
     }
 
+    /// Consumes the output and returns its environment variables and values.
+    ///
+    /// The map is keyed by environment variable name and ordered
+    /// lexicographically.
     pub fn into_environment(self) -> BTreeMap<String, String> {
         self.environment
     }
 }
 
+/// An error during an operation that communicates with the relay or device.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RequestError {
+    /// Local pairing state couldn't be read or updated safely.
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),
 
+    /// Consecutive transport or relay failures exhausted the retry policy.
+    ///
+    /// Valid relay traffic resets the consecutive-failure count.
     #[error("relay remained unavailable after {failures} consecutive failures")]
-    RelayUnavailable { failures: usize },
+    RelayUnavailable {
+        /// The number of consecutive failures observed.
+        failures: usize,
+    },
 
+    /// An error report wasn't authenticated by the device.
+    ///
+    /// Callers must not treat this as a trusted device decision or use it to
+    /// change cryptographic state.
     #[error("received unauthenticated error {code}: {message:?}")]
-    Unauthenticated { code: String, message: String },
-
-    #[error("paired client is inactive: {message}")]
-    ClientInactive { message: String },
-
-    #[error(transparent)]
-    Other(#[from] io::Error),
-
-    #[error("request denied ({reason}): {message}")]
-    Denied {
-        reason: SecretUseDenialReason,
+    Unauthenticated {
+        /// A machine-readable error code supplied by the relay.
+        code: String,
+        /// Human-readable diagnostic text supplied by the relay.
         message: String,
     },
 
+    /// The relay reports that the paired client is inactive.
+    #[error("paired client is inactive: {message}")]
+    ClientInactive {
+        /// Human-readable context supplied by the relay.
+        message: String,
+    },
+
+    /// The operation failed without a more specific public error category.
+    #[error(transparent)]
+    Other(#[from] io::Error),
+
+    /// The device denied a secret use request.
+    #[error("request denied ({reason}): {message}")]
+    Denied {
+        /// The device's denial category.
+        reason: SecretUseDenialReason,
+        /// Human-readable context supplied by the device.
+        message: String,
+    },
+
+    /// The device rejected a pending pairing during activation.
     #[error("pairing was rejected")]
     PairingRejected,
 
+    /// The cancellation future resolved before the operation returned its result.
     #[error("request was interrupted")]
     Interrupted,
 }
@@ -125,12 +232,20 @@ impl RequestError {
     }
 }
 
+/// The reason that the device denied a secret use request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SecretUseDenialReason {
+    /// A user explicitly denied the request.
     UserDenied,
+
+    /// Device policy denied the request.
     PolicyDenied,
+
+    /// The device considered the request malformed or unsupported.
     InvalidRequest,
+
+    /// The device denied the request for another reason.
     Other,
 }
 
@@ -146,6 +261,65 @@ impl fmt::Display for SecretUseDenialReason {
 }
 
 impl Client {
+    /// Requests secret use and returns the approved environment values.
+    ///
+    /// The authenticated response must contain exactly the requested secret
+    /// names. If multiple secrets provide the same environment variable, their
+    /// values must be identical. Otherwise, the method sends an aborted
+    /// completion and returns an error.
+    ///
+    /// The `progress` callback receives lifecycle updates synchronously and
+    /// should return promptly. If `cancellation` resolves before approval is
+    /// returned, Agentknock sends a best-effort aborted completion when the
+    /// request was sent and returns [`RequestError::Interrupted`]. Cancellation
+    /// after a response prevents approved values from being returned. Pass
+    /// [`std::future::pending()`] when the operation doesn't need cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] if local pairing state isn't active, the relay
+    /// exchange fails, the device denies the request, the response is invalid,
+    /// or the operation is canceled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::BTreeSet, future};
+    ///
+    /// use agentknock::{
+    ///     Client, ExecutableMode, RequestError, SecretUseOperation, SecretUseRequest,
+    ///     StreamKind,
+    /// };
+    ///
+    /// # async fn request_secrets(client: &Client) -> Result<(), RequestError> {
+    /// let secrets = BTreeSet::from(["github".to_owned()]);
+    /// let arguments = ["issue".to_owned(), "list".to_owned()];
+    /// let launcher_chain = ["/usr/bin/bash".to_owned()];
+    /// let request = SecretUseRequest {
+    ///     secrets: &secrets,
+    ///     operation: SecretUseOperation::Exec {
+    ///         command: "gh",
+    ///         arguments: &arguments,
+    ///         working_directory: "/work/project",
+    ///         executable_path: "/usr/bin/gh",
+    ///         executable_hash: None,
+    ///         executable_mode: ExecutableMode::Binary,
+    ///         stdin: StreamKind::Terminal,
+    ///         stdout: StreamKind::Terminal,
+    ///         stderr: StreamKind::Terminal,
+    ///     },
+    ///     reason: Some("Review open issues"),
+    ///     launcher_chain: &launcher_chain,
+    /// };
+    ///
+    /// let output = client
+    ///     .request_secret_use(request, future::pending(), |_| {})
+    ///     .await?;
+    /// let environment = output.into_environment();
+    /// # let _ = environment;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn request_secret_use<P>(
         &self,
         request: SecretUseRequest<'_>,

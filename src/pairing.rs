@@ -26,15 +26,35 @@ use crate::{
 
 const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
+/// A short authentication string for verifying an initial pairing.
+///
+/// Its [`fmt::Display`] representation contains 12 decimal digits in three
+/// groups, such as `1234 5678 9012`. The user must confirm the full displayed
+/// value against the value shown by the device before accepting the pairing.
 pub struct PairingSas(u64);
 
+/// A stage reported while a pairing operation is running.
+///
+/// A successful operation reports `Preparing`, `WaitingForDelivery`,
+/// optionally one or more `WaitingForResponse` updates, `Completing`, and
+/// `Completed`, in that order. An operation that fails stops without reporting
+/// `Completed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PairingProgress {
+    /// Agentknock is reading local state and preparing the protected request.
     Preparing,
+
+    /// The request is waiting to be delivered to the device.
     WaitingForDelivery,
+
+    /// The device has received the request but hasn't returned a response.
     WaitingForResponse,
+
+    /// Agentknock is processing the response and handing off the completion.
     Completing,
+
+    /// The operation has finished successfully.
     Completed,
 }
 
@@ -52,6 +72,24 @@ impl fmt::Display for PairingSas {
 }
 
 impl Client {
+    /// Starts pairing with the device displaying `address`.
+    ///
+    /// `address` must contain one or more lowercase ASCII words separated by
+    /// single hyphens. The method creates a pending local pairing and returns
+    /// the [`PairingSas`] after the initial exchange is complete. The pairing
+    /// remains pending until [`Client::finish_pairing`] succeeds.
+    ///
+    /// The `progress` callback receives lifecycle updates synchronously and
+    /// should return promptly. If `cancellation` resolves before the method
+    /// returns, Agentknock stops the exchange, removes any pending state it
+    /// created, and returns [`RequestError::Interrupted`]. Pass
+    /// [`std::future::pending()`] when the operation doesn't need cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address is invalid, local pairing state already
+    /// exists, the state can't be read or written safely, the exchange fails,
+    /// or the operation is canceled.
     pub async fn start_pairing<P>(
         &self,
         address: &str,
@@ -133,6 +171,28 @@ fn is_valid_pairing_address(address: &str) -> bool {
 }
 
 impl Client {
+    /// Activates the pending pairing after the user verifies and accepts it.
+    ///
+    /// Call this only after the user confirms the complete [`PairingSas`] on
+    /// the device and accepts the pairing there. Agentknock requires an
+    /// authenticated acceptance response before it marks the local pairing as
+    /// active.
+    ///
+    /// The `progress` callback receives lifecycle updates synchronously and
+    /// should return promptly. Cancellation before authenticated acceptance
+    /// leaves the pairing pending and returns [`RequestError::Interrupted`].
+    /// Once acceptance is authenticated and local activation is durable, the
+    /// pairing remains active even if the completion handoff fails.
+    /// Cancellation after activation only shortens that handoff and doesn't
+    /// undo or report failure. Pass [`std::future::pending()`] when the
+    /// operation doesn't need cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no pending pairing, local state is invalid,
+    /// the device rejects the pairing, the operation is canceled before
+    /// activation, or the exchange fails. An exchange error during completion
+    /// can be returned after the local pairing becomes active.
     pub async fn finish_pairing<P>(
         &self,
         cancellation: impl Future<Output = ()>,
@@ -197,14 +257,50 @@ impl Client {
         Ok(())
     }
 
+    /// Deletes a pending local pairing without contacting the device.
+    ///
+    /// Use this after the user rejects or abandons an initial pairing. This
+    /// method refuses to delete an active pairing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::NoPairing`] if no pairing exists,
+    /// [`ConfigurationError::PairingNotPending`] if the pairing is active, or
+    /// another configuration error if the pending state can't be removed.
     pub fn abort_pairing(&self) -> Result<(), ConfigurationError> {
         abort_pending_pairing(&self.pairing_path()?)
     }
 
+    /// Deletes the local pairing without contacting the device.
+    ///
+    /// This is a recovery operation for state that can't be removed through
+    /// [`Client::remove_pairing`]. It can delete either a pending or an active
+    /// pairing, and it leaves any corresponding device state unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if no local pairing exists or the pairing
+    /// file can't be removed.
     pub fn force_remove_pairing(&self) -> Result<(), ConfigurationError> {
         remove_pairing_file(&self.pairing_path()?)
     }
 
+    /// Removes an active pairing from both the device and this client.
+    ///
+    /// Agentknock waits for an authenticated device response before deleting
+    /// local state. It then hands off a best-effort completion to tell the
+    /// device that local removal succeeded.
+    ///
+    /// The `progress` callback receives lifecycle updates synchronously and
+    /// should return promptly. Cancellation before the authenticated response
+    /// leaves local state unchanged. Cancellation after local removal only
+    /// shortens the best-effort completion attempt. Pass
+    /// [`std::future::pending()`] when the operation doesn't need cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingRemoveError`] if the pairing isn't active, the exchange
+    /// fails before authenticated removal, or local deletion fails.
     pub async fn remove_pairing<P>(
         &self,
         cancellation: impl Future<Output = ()>,
@@ -316,15 +412,19 @@ pub(crate) enum RotationError {
     Other(#[from] io::Error),
 }
 
+/// An error removing an active pairing.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PairingRemoveError {
+    /// Local state prevented the removal request from starting.
     #[error(transparent)]
     Configuration(ConfigurationError),
 
+    /// The authenticated removal exchange didn't complete successfully.
     #[error(transparent)]
     Request(RequestError),
 
+    /// The device accepted removal, but deleting local state failed.
     #[error("device removed the pairing, but local pairing removal failed: {0}")]
     LocalState(ConfigurationError),
 }

@@ -13,60 +13,126 @@ use crate::{
     websocket::RelayExchange,
 };
 
+/// Metadata for a secret available from the paired device.
+///
+/// This type never contains secret values.
 #[derive(Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Secret {
+    /// A secret that provides environment variables.
     #[non_exhaustive]
     Environment {
+        /// An optional human-readable description.
         description: Option<String>,
+        /// The environment variable names provided by the secret.
+        ///
+        /// Names are sorted and contain no duplicates.
         variables: Vec<String>,
     },
 }
 
+/// Secret metadata keyed by secret name.
+///
+/// Iteration yields secret names in lexicographic order.
 pub type Secrets = BTreeMap<String, Secret>;
 
+/// An environment-variable secret to upload to the device.
 #[derive(Debug, Eq, PartialEq)]
 pub struct EnvironmentSecret {
+    /// The name of the new or existing secret.
+    ///
+    /// In [`SecretUploadMode::Create`] the device can let the user choose a
+    /// different name when accepting the upload. In the other modes, this must
+    /// identify the existing secret to change.
     pub name: String,
+
+    /// The proposed description.
+    ///
+    /// In [`SecretUploadMode::Update`], `None` retains the existing
+    /// description. An empty string proposes removing it.
     pub description: Option<String>,
+
+    /// Environment variable values keyed by variable name.
     pub variables: BTreeMap<String, String>,
 }
 
+/// How an uploaded secret changes device state after user acceptance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SecretUploadMode {
+    /// Proposes a new secret whose final name the user can choose on the device.
     Create,
+
+    /// Replaces an existing secret, removing variables that aren't supplied.
     Replace,
+
+    /// Updates supplied fields while retaining variables that aren't supplied.
     Update,
 }
 
+/// A stage reported while a secret-list request is running.
+///
+/// A successful operation reports `Preparing`, `WaitingForDelivery`,
+/// optionally one or more `WaitingForResponse` updates, `Completing`, and
+/// `Completed`, in that order. An operation that fails stops without reporting
+/// `Completed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SecretListProgress {
+    /// Agentknock is reading local state and preparing the protected request.
     Preparing,
+
+    /// The request is waiting to be delivered to the device.
     WaitingForDelivery,
+
+    /// The device has received the request but hasn't returned a response.
     WaitingForResponse,
+
+    /// Agentknock is validating the response and handing off the completion.
     Completing,
+
+    /// The operation has finished successfully.
     Completed,
 }
 
+/// A stage reported while a secret upload is running.
+///
+/// A completed exchange reports `Preparing`, `WaitingForDelivery`, optionally
+/// one or more `WaitingForResponse` updates, `Completing`, and `Completed`, in
+/// that order. A rejected upload can return an error after reporting
+/// `Completed`; other failures stop without reporting `Completed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SecretUploadProgress {
+    /// Agentknock is reading local state and preparing the protected upload.
     Preparing,
+
+    /// The upload is waiting to be delivered to the device.
     WaitingForDelivery,
+
+    /// The device has received the upload but hasn't confirmed receipt.
     WaitingForResponse,
+
+    /// Agentknock is validating the response and handing off the completion.
     Completing,
+
+    /// The device confirmed receipt and the operation has finished.
     Completed,
 }
 
+/// An error uploading a secret.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SecretUploadError {
+    /// The authenticated exchange failed.
     #[error(transparent)]
     Request(#[from] RequestError),
 
+    /// The device rejected the upload instead of storing it for user review.
     #[error("the device rejected the secret upload: {message}")]
-    Rejected { message: String },
+    Rejected {
+        /// Human-readable context supplied by the device.
+        message: String,
+    },
 }
 
 impl From<ConfigurationError> for SecretUploadError {
@@ -82,6 +148,23 @@ impl From<crate::websocket::Error> for SecretUploadError {
 }
 
 impl Client {
+    /// Lists metadata for secrets available from the paired device.
+    ///
+    /// The returned [`Secrets`] includes names, types, descriptions, and the
+    /// names of values each secret provides. It never includes secret values.
+    ///
+    /// The `progress` callback receives lifecycle updates synchronously and
+    /// should return promptly. Cancellation before an authenticated response
+    /// returns [`RequestError::Interrupted`]. After a response is
+    /// authenticated, cancellation only shortens the best-effort completion
+    /// handoff and the method still returns the decoded list. Pass
+    /// [`std::future::pending()`] when the operation doesn't need cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] if local pairing state isn't active, the relay
+    /// exchange fails, the response is invalid, or the operation is canceled
+    /// before a response is authenticated.
     pub async fn list_secrets<P>(
         &self,
         cancellation: impl Future<Output = ()>,
@@ -148,6 +231,27 @@ impl Client {
             .collect())
     }
 
+    /// Uploads an environment-variable secret for review on the device.
+    ///
+    /// Success means that the device received and stored the upload proposal.
+    /// It doesn't mean that the user accepted the proposal or that the secret
+    /// is available for use. Upload mode controls how a later acceptance would
+    /// change device state.
+    ///
+    /// The `progress` callback receives lifecycle updates synchronously and
+    /// should return promptly. Cancellation before an authenticated response
+    /// returns [`RequestError::Interrupted`] through [`SecretUploadError`].
+    /// After a response is authenticated, cancellation only shortens the
+    /// best-effort completion handoff and the method still returns the device's
+    /// result. Pass [`std::future::pending()`] when the operation doesn't need
+    /// cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretUploadError`] if local pairing state isn't active, the
+    /// relay exchange fails, the device rejects the proposal, the response is
+    /// invalid, or the operation is canceled before a response is
+    /// authenticated.
     pub async fn upload_secret<P>(
         &self,
         secret: &EnvironmentSecret,

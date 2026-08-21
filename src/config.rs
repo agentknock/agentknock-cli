@@ -206,44 +206,79 @@ impl Serialize for CanonicalUlid {
     }
 }
 
+/// An error reading or updating local Agentknock state.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigurationError {
+    /// `HOME` wasn't set when the client selected its default state directory.
     #[error("HOME isn't set")]
     HomeNotSet,
 
+    /// Agentknock couldn't access a pairing file or its parent directory.
     #[error("couldn't access pairing file {path}: {source}")]
     Access {
+        /// The path that Agentknock couldn't access.
         path: PathBuf,
+        /// The underlying file-system error.
         #[source]
         source: io::Error,
     },
 
+    /// The pairing file doesn't have the required Unix mode `0600`.
     #[error("pairing file {path} has permissions {mode:04o}, but 0600 is required")]
-    InsecurePermissions { path: PathBuf, mode: u32 },
+    InsecurePermissions {
+        /// The insecure pairing file.
+        path: PathBuf,
+        /// The file's Unix permission bits.
+        mode: u32,
+    },
 
+    /// The pairing file isn't valid Agentknock state.
     #[error("pairing file {path} isn't valid: {source}")]
     Invalid {
+        /// The invalid pairing file.
         path: PathBuf,
+        /// The decoding or validation error.
         #[source]
         source: serde_json::Error,
     },
 
+    /// An operation that requires an active pairing found a pending pairing.
     #[error("pairing in {path} is waiting for confirmation")]
-    PairingPending { path: PathBuf },
+    PairingPending {
+        /// The pending pairing file.
+        path: PathBuf,
+    },
 
+    /// Pairing couldn't start because a pairing file already exists.
     #[error("pairing file {path} already exists")]
-    PairingExists { path: PathBuf },
+    PairingExists {
+        /// The existing pairing file.
+        path: PathBuf,
+    },
 
+    /// An operation that requires pairing found no pairing file.
     #[error("no pairing file exists at {path}")]
-    NoPairing { path: PathBuf },
+    NoPairing {
+        /// The expected pairing-file path.
+        path: PathBuf,
+    },
 
+    /// An operation that requires a pending pairing found an active pairing.
     #[error("pairing in {path} is already active")]
-    PairingNotPending { path: PathBuf },
+    PairingNotPending {
+        /// The active pairing file.
+        path: PathBuf,
+    },
 
+    /// The pairing changed while an operation was using it.
     #[error("pairing file {path} changed during the operation")]
-    PairingChanged { path: PathBuf },
+    PairingChanged {
+        /// The pairing file that changed.
+        path: PathBuf,
+    },
 
+    /// The system clock reported a time before the Unix epoch.
     #[error("system clock is before the Unix epoch: {0}")]
     InvalidSystemTime(#[from] SystemTimeError),
 }
