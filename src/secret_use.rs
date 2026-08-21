@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub struct SecretUseRequest<'a> {
-    pub secrets: &'a [String],
+    pub secrets: &'a BTreeSet<String>,
     pub operation: SecretUseOperation<'a>,
     pub reason: Option<&'a str>,
     pub launcher_chain: &'a [String],
@@ -323,7 +323,7 @@ where
 
 fn secret_use_output_from_secrets(
     secrets: BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>,
-    requested_secrets: &[String],
+    requested_secrets: &BTreeSet<String>,
 ) -> io::Result<SecretUseOutput> {
     let mut environment = BTreeMap::new();
     let received_secrets = secrets.keys().cloned().collect::<BTreeSet<_>>();
@@ -343,12 +343,11 @@ fn secret_use_output_from_secrets(
             }
         }
     }
-    let expected_secrets = requested_secrets.iter().cloned().collect::<BTreeSet<_>>();
-    if received_secrets != expected_secrets {
+    if &received_secrets != requested_secrets {
         return Err(io::Error::other(format!(
             "approved response contains secrets {:?}, expected {:?}",
             received_secrets.into_iter().collect::<Vec<_>>(),
-            expected_secrets.into_iter().collect::<Vec<_>>()
+            requested_secrets.iter().collect::<Vec<_>>()
         )));
     }
     Ok(SecretUseOutput { environment })
@@ -410,7 +409,7 @@ impl From<websocket::Error> for RequestError {
 #[derive(Serialize)]
 struct SecretUseRequestPayload<'a> {
     method: Method,
-    secrets: &'a [String],
+    secrets: &'a BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     operation: SecretUseOperationMessage<'a>,
@@ -499,7 +498,7 @@ mod tests {
                 environment_secret([("TOKEN", "same"), ("OTHER", "value")]),
             ),
         ]);
-        let requested = vec!["first".into(), "second".into()];
+        let requested = BTreeSet::from(["first".into(), "second".into()]);
 
         let secret_use_output = secret_use_output_from_secrets(secrets, &requested).unwrap();
 
@@ -518,7 +517,7 @@ mod tests {
             ("first".into(), environment_secret([("TOKEN", "one")])),
             ("second".into(), environment_secret([("TOKEN", "two")])),
         ]);
-        let requested = vec!["first".into(), "second".into()];
+        let requested = BTreeSet::from(["first".into(), "second".into()]);
 
         let error = secret_use_output_from_secrets(secrets, &requested)
             .err()
@@ -532,7 +531,7 @@ mod tests {
     #[test]
     fn rejects_a_different_secret_set() {
         let secrets = BTreeMap::from([("other".into(), environment_secret([("TOKEN", "value")]))]);
-        let requested = vec!["requested".into()];
+        let requested = BTreeSet::from(["requested".into()]);
 
         let error = secret_use_output_from_secrets(secrets, &requested)
             .err()

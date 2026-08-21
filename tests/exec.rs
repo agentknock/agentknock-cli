@@ -56,7 +56,7 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &request);
         assert_eq!(plaintext["method"], "SecretUse");
-        assert_eq!(plaintext["secrets"], json!(["github", "cloudflare"]));
+        assert_eq!(plaintext["secrets"], json!(["cloudflare", "github"]));
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
@@ -484,6 +484,25 @@ fn explains_that_the_command_separator_is_required() {
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "error: add `--` before the command to run\n\
+         \n\
+         Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...\n\
+         \n\
+         For more information, run 'agentknock exec --help'.\n"
+    );
+}
+
+#[test]
+fn rejects_a_duplicate_secret() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .args(["exec", "-s", "github", "--secret", "github", "--", "true"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: secret \"github\" was specified more than once\n\
          \n\
          Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...\n\
          \n\

@@ -5,7 +5,7 @@ mod executable;
 
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
     fs,
@@ -125,8 +125,8 @@ enum Command {
 struct ExecCommand {
     /// Name of a secret to use for the command.
     ///
-    /// Repeat this option to use more than one secret. A secret name can't be empty or
-    /// contain a comma. To find available names, use `agentknock secret list`.
+    /// Repeat this option to use more than one secret. Each name must be unique. A secret name
+    /// can't be empty or contain a comma. To find available names, use `agentknock secret list`.
     #[arg(
         short = 's',
         long = "secret",
@@ -347,7 +347,7 @@ struct EnvironmentSecretInput {
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
     Exec {
-        secrets: Vec<String>,
+        secrets: BTreeSet<String>,
         reason: Option<String>,
         command: Vec<String>,
     },
@@ -505,13 +505,25 @@ fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
 }
 
 impl Cli {
+    fn duplicate_secret(&self) -> Option<&str> {
+        let Command::Exec(command) = &self.command else {
+            return None;
+        };
+        let mut seen = BTreeSet::new();
+        command
+            .secrets
+            .iter()
+            .find(|secret| !seen.insert(secret.as_str()))
+            .map(String::as_str)
+    }
+
     fn into_operation(self) -> (Operation, OutputMode) {
         match self.command {
             Command::Exec(command) => {
                 let output = command.output_mode();
                 (
                     Operation::Exec {
-                        secrets: command.secrets,
+                        secrets: command.secrets.into_iter().collect(),
                         reason: command.reason,
                         command: command.command,
                     },
@@ -573,7 +585,17 @@ fn exec_is_missing_separator(arguments: &[OsString]) -> bool {
 }
 
 fn print_missing_exec_separator() {
-    eprintln!("error: add `--` before the command to run");
+    print_exec_usage_error("add `--` before the command to run");
+}
+
+fn print_duplicate_secret(secret: &str) {
+    print_exec_usage_error(format_args!(
+        "secret {secret:?} was specified more than once"
+    ));
+}
+
+fn print_exec_usage_error(message: impl std::fmt::Display) {
+    eprintln!("error: {message}");
     eprintln!();
     eprintln!("Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...");
     eprintln!();
@@ -588,7 +610,12 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let (operation, output) = Cli::parse_from(arguments).into_operation();
+    let cli = Cli::parse_from(arguments);
+    if let Some(secret) = cli.duplicate_secret() {
+        print_duplicate_secret(secret);
+        return ExitCode::from(2);
+    }
+    let (operation, output) = cli.into_operation();
     match run(operation, output).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -1755,6 +1782,8 @@ fn print_message(message: impl std::fmt::Display) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use clap::{Parser, error::ErrorKind};
 
     use super::{
@@ -1787,7 +1816,7 @@ mod tests {
             cli.into_operation(),
             (
                 Operation::Exec {
-                    secrets: vec!["gh-token".into(), "cf-wrangler".into()],
+                    secrets: BTreeSet::from(["cf-wrangler".into(), "gh-token".into()]),
                     reason: Some("needed by the deployment agent".into()),
                     command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
                         .map(String::from)
@@ -1806,7 +1835,7 @@ mod tests {
             cli.into_operation(),
             (
                 Operation::Exec {
-                    secrets: vec!["github".into()],
+                    secrets: BTreeSet::from(["github".into()]),
                     reason: None,
                     command: vec!["true".into()],
                 },
