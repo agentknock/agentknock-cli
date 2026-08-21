@@ -112,7 +112,7 @@ pub enum RequestError {
     #[error("pairing was rejected")]
     PairingRejected,
 
-    #[error("secret use request was interrupted")]
+    #[error("request was interrupted")]
     Interrupted,
 }
 
@@ -146,14 +146,13 @@ impl fmt::Display for SecretUseDenialReason {
 }
 
 impl Client {
-    pub async fn request_secret_use<C, P>(
+    pub async fn request_secret_use<P>(
         &self,
         request: SecretUseRequest<'_>,
-        cancellation: C,
+        cancellation: impl Future<Output = ()>,
         mut progress: P,
     ) -> Result<SecretUseOutput, RequestError>
     where
-        C: Future<Output = ()>,
         P: FnMut(SecretUseProgress),
     {
         tokio::pin!(cancellation);
@@ -196,6 +195,7 @@ impl Client {
         };
 
         message_exchange(
+            self,
             &pairing_path,
             &pairing,
             &request_payload,
@@ -207,6 +207,7 @@ impl Client {
 }
 
 async fn message_exchange<C, P>(
+    client: &Client,
     pairing_path: &Path,
     pairing: &Pairing,
     request_payload: &SecretUseRequestPayload<'_>,
@@ -218,7 +219,9 @@ where
     P: FnMut(SecretUseProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(request_payload).map_err(RequestError::other)?;
+    let plaintext = client
+        .encode(request_payload)
+        .map_err(RequestError::other)?;
     let mut session = Session::new(pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
@@ -230,7 +233,7 @@ where
         biased;
         _ = cancellation.as_mut() => {
             if relay.request_was_sent() {
-                complete_cancelled(&mut session, &mut relay).await;
+                complete_cancelled(client, &mut session, &mut relay).await;
             }
             return Err(RequestError::Interrupted);
         }
@@ -242,7 +245,7 @@ where
         Err(error) => {
             let abort_reason = abort_reason(&error);
             let error = RequestError::from(error);
-            let completion = seal_aborted(&mut session, abort_reason, error.to_string());
+            let completion = seal_aborted(client, &mut session, abort_reason, error.to_string());
             if let Some(completion) = completion {
                 tokio::select! {
                     biased;
@@ -308,7 +311,9 @@ where
         ),
     };
 
-    let plaintext = crate::protocol::encode(&completion_result).map_err(RequestError::other)?;
+    let plaintext = client
+        .encode(&completion_result)
+        .map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&plaintext)
         .map_err(RequestError::other)?;
@@ -372,19 +377,20 @@ fn abort_reason(error: &websocket::Error) -> SecretUseAbortReason {
 }
 
 fn seal_aborted(
+    client: &Client,
     session: &mut Session,
     reason: SecretUseAbortReason,
     message: String,
 ) -> Option<crypto::Completion> {
-    let Ok(plaintext) = crate::protocol::encode(&SecretUseResult::Aborted { reason, message })
-    else {
+    let Ok(plaintext) = client.encode(&SecretUseResult::Aborted { reason, message }) else {
         return None;
     };
     session.seal_completion(&plaintext).ok()
 }
 
-async fn complete_cancelled(session: &mut Session, relay: &mut RelayExchange) {
+async fn complete_cancelled(client: &Client, session: &mut Session, relay: &mut RelayExchange) {
     let Some(completion) = seal_aborted(
+        client,
         session,
         SecretUseAbortReason::Cancelled,
         RequestError::Interrupted.to_string(),

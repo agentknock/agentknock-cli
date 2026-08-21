@@ -7,7 +7,7 @@ mod secret_use;
 mod secrets;
 mod websocket;
 
-pub use client::Client;
+pub use client::{ApplicationInfo, Client};
 pub use config::ConfigurationError;
 pub use pairing::{PairingProgress, PairingRemoveError, PairingSas};
 pub use secret_use::{

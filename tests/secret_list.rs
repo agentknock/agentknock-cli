@@ -2,7 +2,11 @@
 
 mod support;
 
-use std::process::Command;
+use std::{
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::Duration,
+};
 
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
@@ -25,7 +29,11 @@ async fn lists_secret_metadata_without_secret_values() {
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &frame["payload"]);
         assert_eq!(plaintext["method"], "SecretList");
-        assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(plaintext["app_info"]["name"], "agentknock");
+        assert_eq!(plaintext["app_info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(plaintext["lib_info"]["name"], "agentknock");
+        assert_eq!(plaintext["lib_info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(plaintext.get("cli_version").is_none());
 
         send_json(
             &mut socket,
@@ -71,7 +79,14 @@ async fn lists_secret_metadata_without_secret_values() {
         assert_eq!(
             open_completion(&mut context, &completion["payload"]),
             json!({
-                "cli_version": env!("CARGO_PKG_VERSION")
+                "app_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "lib_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
             })
         );
         send_json(
@@ -157,4 +172,60 @@ async fn reports_inactive_client_without_suggesting_recovery() {
     assert!(stderr.contains("paired client is inactive"), "{stderr}");
     assert!(!stderr.contains("Suggested action:"), "{stderr}");
     server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_cancels_a_waiting_secret_list_request() {
+    let home = TestHome::active();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": request["client_id"],
+                "request_id": request["request_id"],
+                "kind": "request",
+            }),
+        )
+        .await;
+        ready_sender.send(()).unwrap();
+        release_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    })
+    .await;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["secret", "list"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    interrupt(&child);
+    release_sender.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("canceled the secret list request")
+    );
+    server.await.unwrap();
+}
+
+fn interrupt(child: &std::process::Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

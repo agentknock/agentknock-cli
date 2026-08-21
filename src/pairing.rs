@@ -1,4 +1,4 @@
-use std::{fmt, fs, io, path::Path};
+use std::{fmt, fs, future::Future, io, path::Path, pin::Pin};
 
 use base64::{
     Engine as _,
@@ -55,11 +55,13 @@ impl Client {
     pub async fn start_pairing<P>(
         &self,
         address: &str,
+        cancellation: impl Future<Output = ()>,
         mut progress: P,
     ) -> Result<PairingSas, RequestError>
     where
         P: FnMut(PairingProgress),
     {
+        tokio::pin!(cancellation);
         if !is_valid_pairing_address(address) {
             return Err(RequestError::other(
                 "pairing address must contain lowercase ASCII words separated by single hyphens",
@@ -84,11 +86,13 @@ impl Client {
             commitment: BASE64_STANDARD.encode(commitment),
         };
         progress(PairingProgress::WaitingForDelivery);
-        let response: PairingResponse = relay
-            .request(&request, || {
+        let response: PairingResponse = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
+            response = relay.request(&request, || {
                 progress(PairingProgress::WaitingForResponse);
-            })
-            .await?;
+            }) => response?,
+        };
         progress(PairingProgress::Completing);
         let contents = PairingMetadata {
             platform: std::env::consts::OS,
@@ -97,8 +101,7 @@ impl Client {
             machine_id: read_trimmed("/etc/machine-id"),
             os_version: os_version(),
         };
-        let application_plaintext =
-            crate::protocol::encode(&contents).map_err(RequestError::other)?;
+        let application_plaintext = self.encode(&contents).map_err(RequestError::other)?;
         let (completion, pairing, sas) = seal_pairing(
             client_id,
             client_token,
@@ -109,9 +112,14 @@ impl Client {
         .map_err(RequestError::other)?;
         write_pending_pairing(&pairing_path, &pairing)?;
 
-        if let Err(error) = relay.complete(&completion).await {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => Err(RequestError::Interrupted),
+            result = relay.complete(&completion) => result.map_err(RequestError::from),
+        };
+        if let Err(error) = result {
             let _ = abort_pending_pairing(&pairing_path);
-            return Err(error.into());
+            return Err(error);
         }
         progress(PairingProgress::Completed);
         Ok(PairingSas(sas))
@@ -125,29 +133,37 @@ fn is_valid_pairing_address(address: &str) -> bool {
 }
 
 impl Client {
-    pub async fn finish_pairing<P>(&self, mut progress: P) -> Result<(), RequestError>
+    pub async fn finish_pairing<P>(
+        &self,
+        cancellation: impl Future<Output = ()>,
+        mut progress: P,
+    ) -> Result<(), RequestError>
     where
         P: FnMut(PairingProgress),
     {
+        tokio::pin!(cancellation);
         progress(PairingProgress::Preparing);
         let pairing_path = self.pairing_path()?;
         let pairing = read_pending_pairing(&pairing_path)?;
         let request_id = Ulid::generate();
-        let plaintext = crate::protocol::encode(&MethodRequest {
-            method: Method::PairingFinish,
-        })
-        .map_err(RequestError::other)?;
+        let plaintext = self
+            .encode(&MethodRequest {
+                method: Method::PairingFinish,
+            })
+            .map_err(RequestError::other)?;
         let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
         let request = session
             .seal_request(&plaintext)
             .map_err(RequestError::other)?;
         let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
         progress(PairingProgress::WaitingForDelivery);
-        let response = relay
-            .request(&request, || {
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
+            response = relay.request(&request, || {
                 progress(PairingProgress::WaitingForResponse);
-            })
-            .await?;
+            }) => response?,
+        };
         progress(PairingProgress::Completing);
         let plaintext = session
             .open_response(response)
@@ -158,13 +174,24 @@ impl Client {
             return Err(RequestError::PairingRejected);
         }
 
-        let plaintext =
-            crate::protocol::encode(&FinishPairingResult::Accepted).map_err(RequestError::other)?;
+        let plaintext = self
+            .encode(&FinishPairingResult::Accepted)
+            .map_err(RequestError::other)?;
         let completion = session
             .seal_completion(&plaintext)
             .map_err(RequestError::other)?;
         finish_pending_pairing(&pairing_path)?;
-        relay.complete(&completion).await?;
+        let interrupted = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => true,
+            result = relay.complete(&completion) => {
+                result?;
+                false
+            }
+        };
+        if interrupted {
+            let _ = relay.complete_briefly(&completion).await;
+        }
         progress(PairingProgress::Completed);
 
         Ok(())
@@ -178,10 +205,15 @@ impl Client {
         remove_pairing_file(&self.pairing_path()?)
     }
 
-    pub async fn remove_pairing<P>(&self, mut progress: P) -> Result<(), PairingRemoveError>
+    pub async fn remove_pairing<P>(
+        &self,
+        cancellation: impl Future<Output = ()>,
+        mut progress: P,
+    ) -> Result<(), PairingRemoveError>
     where
         P: FnMut(PairingProgress),
     {
+        tokio::pin!(cancellation);
         progress(PairingProgress::Preparing);
         let pairing_path = self
             .pairing_path()
@@ -190,46 +222,58 @@ impl Client {
             read_pairing_from(&pairing_path).map_err(PairingRemoveError::Configuration)?;
         let device_id = pairing.device_id_bytes();
         let client_id = pairing.client_id_bytes();
-        let (mut relay, completion) = prepare_pairing_removal(&pairing, &mut progress)
-            .await
-            .map_err(PairingRemoveError::Request)?;
+        let (mut relay, completion) =
+            prepare_pairing_removal(self, &pairing, cancellation.as_mut(), &mut progress)
+                .await
+                .map_err(PairingRemoveError::Request)?;
         remove_active_pairing(&pairing_path, device_id, client_id)
             .map_err(PairingRemoveError::LocalState)?;
-        let _ = relay.complete_briefly(&completion).await;
+        tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => {},
+            _ = relay.complete_briefly(&completion) => {},
+        }
         progress(PairingProgress::Completed);
         Ok(())
     }
 }
 
 async fn prepare_pairing_removal<P>(
+    client: &Client,
     pairing: &crate::config::Pairing,
+    mut cancellation: Pin<&mut impl Future<Output = ()>>,
     progress: &mut P,
 ) -> Result<(RelayExchange, crypto::Completion), RequestError>
 where
     P: FnMut(PairingProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(&MethodRequest {
-        method: Method::PairingRemove,
-    })
-    .map_err(RequestError::other)?;
+    let plaintext = client
+        .encode(&MethodRequest {
+            method: Method::PairingRemove,
+        })
+        .map_err(RequestError::other)?;
     let mut session = Session::new(pairing, &request_id).map_err(RequestError::other)?;
     let request = session
         .seal_request(&plaintext)
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
-    let response = relay
-        .request(&request, || {
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
+        response = relay.request(&request, || {
             progress(PairingProgress::WaitingForResponse);
-        })
-        .await?;
+        }) => response?,
+    };
     progress(PairingProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(RequestError::other)?;
     serde_json::from_slice::<EmptyMessage>(&plaintext).map_err(RequestError::other)?;
-    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(RequestError::other)?;
+    let plaintext = client
+        .encode(&EmptyMessage {})
+        .map_err(RequestError::other)?;
     let completion = session
         .seal_completion(&plaintext)
         .map_err(RequestError::other)?;

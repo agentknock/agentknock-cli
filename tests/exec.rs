@@ -68,7 +68,11 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
             executable_hash,
             Sha256::digest(fs::read(executable_path).unwrap()).as_slice()
         );
-        assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(plaintext["app_info"]["name"], "agentknock");
+        assert_eq!(plaintext["app_info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(plaintext["lib_info"]["name"], "agentknock");
+        assert_eq!(plaintext["lib_info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(plaintext.get("cli_version").is_none());
 
         send_json(
             &mut socket,

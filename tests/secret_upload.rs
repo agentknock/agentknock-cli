@@ -35,7 +35,14 @@ async fn uploads_an_environment_secret_from_multiple_sources() {
         assert_eq!(
             plaintext,
             json!({
-                "cli_version": env!("CARGO_PKG_VERSION"),
+                "app_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "lib_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
                 "method": "SecretUpload",
                 "mode": "CREATE",
                 "secret": {
@@ -77,7 +84,14 @@ async fn uploads_an_environment_secret_from_multiple_sources() {
         assert_eq!(
             open_completion(&mut context, &completion["payload"]),
             json!({
-                "cli_version": env!("CARGO_PKG_VERSION"),
+                "app_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "lib_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
                 "result": "RECEIVED",
             })
         );

@@ -2,7 +2,13 @@
 
 mod support;
 
-use std::{fs, os::unix::fs::PermissionsExt as _, process::Command};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt as _,
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::Duration,
+};
 
 use base64::{
     Engine as _,
@@ -36,6 +42,76 @@ struct PairingResult {
     client_token: String,
     client_psk: Vec<u8>,
     sas: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_while_starting_pairing_discards_local_state() {
+    let home = TestHome::empty();
+    let pairing_path = home.pairing_path();
+    let device_public_key = home.device_public_key.clone();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (upgrade, mut socket) = accept(&listener).await;
+        let client_id = upgrade.uri().path().rsplit('/').next().unwrap().to_owned();
+        let request = receive_json(&mut socket).await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": client_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": client_id,
+                "kind": "response",
+                "payload": {
+                    "device_id": DEVICE_ID,
+                    "device_key": BASE64_STANDARD.encode(device_public_key.to_bytes()),
+                    "device_random": BASE64_STANDARD.encode(DEVICE_RANDOM),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(request["request_id"], client_id);
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        assert_eq!(receive_json(&mut socket).await["kind"], "completion");
+        assert!(pairing_path.exists());
+        ready_sender.send(()).unwrap();
+        release_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    })
+    .await;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["pairing", "start", "yup-its-free"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    interrupt(&child);
+    release_sender.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(!home.pairing_path().exists());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("canceled pairing")
+    );
+    server.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -140,7 +216,11 @@ async fn starts_and_finishes_pairing_over_websockets() {
             .unwrap();
         let plaintext: Value =
             serde_json::from_slice(&context.open(&ciphertext, b"").unwrap()).unwrap();
-        assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(plaintext["app_info"]["name"], "agentknock");
+        assert_eq!(plaintext["app_info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(plaintext["lib_info"]["name"], "agentknock");
+        assert_eq!(plaintext["lib_info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(plaintext.get("cli_version").is_none());
         assert_eq!(plaintext["platform"], std::env::consts::OS);
         assert_eq!(plaintext["architecture"], std::env::consts::ARCH);
         assert!(plaintext.get("client_secret").is_none());
@@ -371,7 +451,16 @@ async fn removes_pairing_after_an_authenticated_device_response() {
         assert!(!pairing_path.exists());
         assert_eq!(
             open_completion(&mut context, &completion["payload"]),
-            json!({"cli_version": env!("CARGO_PKG_VERSION")})
+            json!({
+                "app_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "lib_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            })
         );
         send_json(
             &mut socket,
@@ -432,4 +521,12 @@ fn open_authenticated_request(
         .unwrap();
     let plaintext = context.open(&ciphertext, b"").unwrap();
     (context, key, serde_json::from_slice(&plaintext).unwrap())
+}
+
+fn interrupt(child: &std::process::Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

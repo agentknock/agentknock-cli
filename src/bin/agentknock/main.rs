@@ -19,10 +19,10 @@ use std::{
 };
 
 use agentknock::{
-    Client, ConfigurationError, EnvironmentSecret, PairingProgress, PairingRemoveError, PairingSas,
-    RequestError, Secret, SecretListProgress, SecretUploadError, SecretUploadMode,
-    SecretUploadProgress, SecretUseDenialReason, SecretUseOperation, SecretUseOutput,
-    SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
+    ApplicationInfo, Client, ConfigurationError, EnvironmentSecret, PairingProgress,
+    PairingRemoveError, PairingSas, RequestError, Secret, SecretListProgress, SecretUploadError,
+    SecretUploadMode, SecretUploadProgress, SecretUseDenialReason, SecretUseOperation,
+    SecretUseOutput, SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
@@ -624,7 +624,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandError> {
-    let client = Client::new();
+    let client = Client::new(ApplicationInfo::new(
+        "agentknock",
+        env!("CARGO_PKG_VERSION"),
+    ));
     match operation {
         Operation::Exec {
             secrets,
@@ -656,7 +659,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 reason: reason.as_deref(),
                 launcher_chain: &launcher_chain,
             };
-            let mut signals = ExecSignals::new().map_err(CommandError::ExecSignal)?;
+            let mut signals = CommandSignals::new().map_err(CommandError::ExecSignal)?;
             let secret_use_output =
                 request_exec_secrets(&client, request, output, &mut signals).await?;
             let blocked_signals = signal_state
@@ -734,9 +737,10 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
 }
 
 async fn start_pairing_for_cli(client: &Client, address: &str) -> Result<PairingSas, RequestError> {
+    let mut signals = CommandSignals::new().map_err(RequestError::Other)?;
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = client.start_pairing(address, move |current| {
+    let request = client.start_pairing(address, signals.wait(), move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -746,9 +750,10 @@ async fn start_pairing_for_cli(client: &Client, address: &str) -> Result<Pairing
 }
 
 async fn finish_pairing_for_cli(client: &Client) -> Result<(), RequestError> {
+    let mut signals = CommandSignals::new().map_err(RequestError::Other)?;
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = client.finish_pairing(move |current| {
+    let request = client.finish_pairing(signals.wait(), move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -758,9 +763,12 @@ async fn finish_pairing_for_cli(client: &Client) -> Result<(), RequestError> {
 }
 
 async fn remove_pairing_for_cli(client: &Client) -> Result<(), PairingRemoveError> {
+    let mut signals = CommandSignals::new()
+        .map_err(RequestError::Other)
+        .map_err(PairingRemoveError::Request)?;
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = client.remove_pairing(move |current| {
+    let request = client.remove_pairing(signals.wait(), move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -770,9 +778,10 @@ async fn remove_pairing_for_cli(client: &Client) -> Result<(), PairingRemoveErro
 }
 
 async fn list_secrets_for_cli(client: &Client) -> Result<Secrets, RequestError> {
+    let mut signals = CommandSignals::new().map_err(RequestError::Other)?;
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = client.list_secrets(move |current| {
+    let request = client.list_secrets(signals.wait(), move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, secret_list_progress_message).await
@@ -783,9 +792,12 @@ async fn upload_secret_for_cli(
     secret: &EnvironmentSecret,
     mode: SecretUploadMode,
 ) -> Result<(), SecretUploadError> {
+    let mut signals = CommandSignals::new()
+        .map_err(RequestError::Other)
+        .map_err(SecretUploadError::Request)?;
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = client.upload_secret(secret, mode, move |current| {
+    let request = client.upload_secret(secret, mode, signals.wait(), move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, secret_upload_progress_message).await
@@ -1054,12 +1066,12 @@ fn pairing_progress_message(
     }
 }
 
-struct ExecSignals {
+struct CommandSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
-impl ExecSignals {
+impl CommandSignals {
     fn new() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
 
@@ -1073,35 +1085,31 @@ impl ExecSignals {
         self.interrupt.recv().now_or_never().flatten().is_some()
             || self.terminate.recv().now_or_never().flatten().is_some()
     }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
 }
 
 async fn request_exec_secrets(
     client: &Client,
     request: SecretUseRequest<'_>,
     output: OutputMode,
-    signals: &mut ExecSignals,
+    signals: &mut CommandSignals,
 ) -> Result<SecretUseOutput, CommandError> {
     use tokio::time::{Instant, sleep};
 
     let current_progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&current_progress);
-    let interrupt = &mut signals.interrupt;
-    let terminate = &mut signals.terminate;
-    let request = client.request_secret_use(
-        request,
-        async {
-            tokio::select! {
-                _ = interrupt.recv() => {}
-                _ = terminate.recv() => {}
-            }
-        },
-        move |progress| {
-            let changed = observed_progress.replace(Some(progress)) != Some(progress);
-            if changed && output == OutputMode::Verbose {
-                print_progress(progress);
-            }
-        },
-    );
+    let request = client.request_secret_use(request, signals.wait(), move |progress| {
+        let changed = observed_progress.replace(Some(progress)) != Some(progress);
+        if changed && output == OutputMode::Verbose {
+            print_progress(progress);
+        }
+    });
     tokio::pin!(request);
     let started = Instant::now();
     let heartbeat = sleep(PROGRESS_INTERVAL);
@@ -1261,6 +1269,10 @@ fn print_upload_error(error: &SecretUploadError) {
             ));
             print_plain_error("The secret upload wasn't delivered.");
         }
+        SecretUploadError::Request(RequestError::Interrupted) => {
+            print_plain_error("Agentknock received a signal and canceled the secret upload.");
+            print_plain_error("The device might still have received the upload.");
+        }
         SecretUploadError::Request(error) => {
             print_plain_error(format_args!(
                 "Agentknock couldn't send the secret upload: {error}."
@@ -1308,6 +1320,9 @@ fn print_list_error(error: &RequestError) {
                 "The relay reports that this paired client is inactive: {message}"
             ));
             print_plain_error("Agentknock didn't receive a secret list.");
+        }
+        RequestError::Interrupted => {
+            print_plain_error("Agentknock received a signal and canceled the secret list request.");
         }
         _ => {
             print_plain_error(format_args!("Agentknock couldn't list secrets: {error}."));
@@ -1466,6 +1481,10 @@ fn print_start_pairing_error(error: &RequestError) {
             print_plain_error("Pairing didn't start. The local pairing state is unchanged.");
             print_plain_unauthenticated_action(code);
         }
+        RequestError::Interrupted => {
+            print_plain_error("Agentknock received a signal and canceled pairing.");
+            print_plain_error("No pending pairing was saved on this client.");
+        }
         _ => {
             print_plain_error(format_args!("Agentknock couldn't start pairing: {error}."));
         }
@@ -1505,6 +1524,10 @@ fn print_finish_pairing_error(error: &RequestError) {
                 "The relay reports that the pending client is inactive: {message}"
             ));
             print_plain_error("The pending pairing remains saved.");
+        }
+        RequestError::Interrupted => {
+            print_plain_error("Agentknock received a signal and canceled pairing confirmation.");
+            print_plain_error("The pairing remains pending.");
         }
         _ => {
             print_plain_error(format_args!("Agentknock couldn't finish pairing: {error}."));
@@ -1549,6 +1572,10 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
                 "Agentknock couldn't start pairing removal: {error}."
             ));
             print_plain_configuration_action(error);
+        }
+        PairingRemoveError::Request(RequestError::Interrupted) => {
+            print_plain_error("Agentknock received a signal and canceled pairing removal.");
+            print_plain_error("The local pairing is unchanged. The device state is unknown.");
         }
         PairingRemoveError::Request(error) => {
             match error {

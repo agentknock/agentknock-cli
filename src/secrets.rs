@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -82,19 +82,25 @@ impl From<crate::websocket::Error> for SecretUploadError {
 }
 
 impl Client {
-    pub async fn list_secrets<P>(&self, mut progress: P) -> Result<Secrets, RequestError>
+    pub async fn list_secrets<P>(
+        &self,
+        cancellation: impl Future<Output = ()>,
+        mut progress: P,
+    ) -> Result<Secrets, RequestError>
     where
         P: FnMut(SecretListProgress),
     {
+        tokio::pin!(cancellation);
         progress(SecretListProgress::Preparing);
         self.prepare_request()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
-        let plaintext = crate::protocol::encode(&ListRequest {
-            method: Method::SecretList,
-        })
-        .map_err(RequestError::other)?;
+        let plaintext = self
+            .encode(&ListRequest {
+                method: Method::SecretList,
+            })
+            .map_err(RequestError::other)?;
         let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
         let request = session
             .seal_request(&plaintext)
@@ -102,11 +108,13 @@ impl Client {
         let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
         progress(SecretListProgress::WaitingForDelivery);
-        let response = relay
-            .request(&request, || {
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
+            response = relay.request(&request, || {
                 progress(SecretListProgress::WaitingForResponse);
-            })
-            .await?;
+            }) => response?,
+        };
         progress(SecretListProgress::Completing);
         let plaintext = session
             .open_response(response)
@@ -116,11 +124,21 @@ impl Client {
         }
         let response: ListResponse =
             serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
-        let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(RequestError::other)?;
+        let plaintext = self.encode(&EmptyMessage {}).map_err(RequestError::other)?;
         let completion = session
             .seal_completion(&plaintext)
             .map_err(RequestError::other)?;
-        relay.complete(&completion).await?;
+        let interrupted = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => true,
+            result = relay.complete(&completion) => {
+                result?;
+                false
+            }
+        };
+        if interrupted {
+            let _ = relay.complete_briefly(&completion).await;
+        }
         progress(SecretListProgress::Completed);
 
         Ok(response
@@ -134,11 +152,13 @@ impl Client {
         &self,
         secret: &EnvironmentSecret,
         mode: SecretUploadMode,
+        cancellation: impl Future<Output = ()>,
         mut progress: P,
     ) -> Result<(), SecretUploadError>
     where
         P: FnMut(SecretUploadProgress),
     {
+        tokio::pin!(cancellation);
         progress(SecretUploadProgress::Preparing);
         self.prepare_request()?;
         let pairing_path = self.pairing_path()?;
@@ -149,7 +169,7 @@ impl Client {
             mode: mode.into(),
             secret: NamedSecretMessage::from(secret),
         };
-        let plaintext = crate::protocol::encode(&request_payload).map_err(RequestError::other)?;
+        let plaintext = self.encode(&request_payload).map_err(RequestError::other)?;
         let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
         let request = session
             .seal_request(&plaintext)
@@ -157,11 +177,15 @@ impl Client {
         let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
         progress(SecretUploadProgress::WaitingForDelivery);
-        let response = relay
-            .request(&request, || {
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => {
+                return Err(RequestError::Interrupted.into());
+            }
+            response = relay.request(&request, || {
                 progress(SecretUploadProgress::WaitingForResponse);
-            })
-            .await?;
+            }) => response?,
+        };
         progress(SecretUploadProgress::Completing);
         let plaintext = session
             .open_response(response)
@@ -171,11 +195,15 @@ impl Client {
         }
         let response: UploadResult =
             serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
-        let completion = crate::protocol::encode(&response).map_err(RequestError::other)?;
+        let completion = self.encode(&response).map_err(RequestError::other)?;
         let completion = session
             .seal_completion(&completion)
             .map_err(RequestError::other)?;
-        let _ = relay.complete_briefly(&completion).await;
+        tokio::select! {
+            biased;
+            _ = cancellation.as_mut() => {},
+            _ = relay.complete_briefly(&completion) => {},
+        }
         progress(SecretUploadProgress::Completed);
 
         match response {
