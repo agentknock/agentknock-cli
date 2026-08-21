@@ -16,10 +16,10 @@ use support::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn uploads_an_environment_profile_from_multiple_sources() {
+async fn uploads_an_environment_secret_from_multiple_sources() {
     let home = TestHome::active();
     let value_path = home.path().join("token");
-    let environment_path = home.path().join("profile.env");
+    let environment_path = home.path().join("secret.env");
     fs::write(&value_path, "file value\n").unwrap();
     fs::write(&environment_path, "FROM_ENV_FILE='dotenv value'\n").unwrap();
 
@@ -36,9 +36,9 @@ async fn uploads_an_environment_profile_from_multiple_sources() {
             plaintext,
             json!({
                 "cli_version": env!("CARGO_PKG_VERSION"),
-                "method": "ProfileUpload",
+                "method": "SecretUpload",
                 "mode": "CREATE",
-                "profile": {
+                "secret": {
                     "name": "bootstrap",
                     "description": "Initial imported values",
                     "type": "environment",
@@ -99,7 +99,7 @@ async fn uploads_an_environment_profile_from_multiple_sources() {
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("FROM_PROCESS", "process value")
         .args([
-            "profile",
+            "secret",
             "upload",
             "bootstrap",
             "--description",
@@ -121,9 +121,9 @@ async fn uploads_an_environment_profile_from_multiple_sources() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         concat!(
-            "Profile proposal \"bootstrap\" delivered to the device.\n",
-            "The profile isn't available until you accept the proposal on the device.\n",
-            "Suggested action: Review the proposal on the device.\n",
+            "Secret upload \"bootstrap\" delivered to the device.\n",
+            "The secret isn't available until you approve the upload on the device.\n",
+            "Suggested action: Review the secret upload on the device.\n",
         )
     );
     assert!(
@@ -146,9 +146,9 @@ async fn updates_an_environment_variable_from_standard_input() {
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &frame["payload"]);
         assert_eq!(plaintext["mode"], "UPDATE");
-        assert_eq!(plaintext["profile"]["type"], "environment");
+        assert_eq!(plaintext["secret"]["type"], "environment");
         assert_eq!(
-            plaintext["profile"]["variables"]["TOKEN"]["value"],
+            plaintext["secret"]["variables"]["TOKEN"]["value"],
             "standard input value\n"
         );
 
@@ -193,7 +193,7 @@ async fn updates_an_environment_variable_from_standard_input() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
-            "profile",
+            "secret",
             "upload",
             "existing",
             "--update",
@@ -221,7 +221,7 @@ async fn updates_an_environment_variable_from_standard_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reports_a_rejected_profile_proposal() {
+async fn reports_a_rejected_secret_upload() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
@@ -253,7 +253,7 @@ async fn reports_a_rejected_profile_proposal() {
                     &key,
                     &json!({
                         "result": "REJECTED",
-                        "message": "The proposal is not valid.",
+                        "message": "The upload is not valid.",
                     }),
                 ),
             }),
@@ -282,13 +282,13 @@ async fn reports_a_rejected_profile_proposal() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("TOKEN", "must not appear")
-        .args(["profile", "upload", "rejected", "--from-env", "TOKEN"])
+        .args(["secret", "upload", "rejected", "--from-env", "TOKEN"])
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("The device rejected the profile proposal"));
-    assert!(stderr.contains("The proposal is not valid."));
+    assert!(stderr.contains("The device rejected the secret upload"));
+    assert!(stderr.contains("The upload is not valid."));
     assert!(!stderr.contains("must not appear"));
     server.await.unwrap();
 }
@@ -299,7 +299,7 @@ fn rejects_multiple_standard_input_sources_before_connecting() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .args([
-            "profile",
+            "secret",
             "upload",
             "invalid",
             "--from-file",
@@ -314,7 +314,7 @@ fn rejects_multiple_standard_input_sources_before_connecting() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("only one profile source can read from standard input")
+            .contains("only one secret source can read from standard input")
     );
 }
 
@@ -326,7 +326,7 @@ fn does_not_print_a_secret_from_an_invalid_environment_file() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .args([
-            "profile",
+            "secret",
             "upload",
             "invalid",
             "--from-env-file",

@@ -19,18 +19,18 @@ use std::{
 };
 
 use agentknock::{
-    ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
-    EnvironmentProfile, PairingProgress, PairingRemoveError, PairingSas, Profile,
-    ProfileListProgress, ProfileUploadError, ProfileUploadMode, ProfileUploadProgress, Profiles,
-    RequestError, RequestOperation, StreamKind, abort_pairing, finish_pairing,
-    force_remove_pairing, list_profiles, remove_pairing, start_pairing, upload_profile,
+    ConfigurationError, EnvironmentSecret, PairingProgress, PairingRemoveError, PairingSas,
+    RequestError, Secret, SecretListProgress, SecretUploadError, SecretUploadMode,
+    SecretUploadProgress, SecretUseDenialReason, SecretUseOperation, SecretUseOutput,
+    SecretUseProgress, SecretUseRequest, Secrets, StreamKind, abort_pairing, finish_pairing,
+    force_remove_pairing, list_secrets, remove_pairing, start_pairing, upload_secret,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
 use thiserror::Error;
 
-use agentknock::request_credentials;
+use agentknock::request_secret_use;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -41,8 +41,8 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
 #[command(
     name = "agentknock",
     version,
-    about = "Request profile access, manage profiles, and pair with a device.",
-    long_about = "Pair this client with a device, request access to profiles stored on the device, and send profile proposals to the device.\n\nBefore you request or manage profiles, use `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
+    about = "Use and manage secrets, or pair with a device.",
+    long_about = "Pair this client with a device, request secret use, list available secrets, and upload secrets for review on the device.\n\nBefore you use or manage secrets, run `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
     max_term_width = 120,
     arg_required_else_help = true,
     subcommand_required = true,
@@ -56,20 +56,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
-    /// Request access to profiles, then run a command.
+    /// Request secret use, then run a command.
     ///
-    /// The request includes the profile names, optional reason, command, and arguments. It also
+    /// The request includes the secret names, optional reason, command, and arguments. It also
     /// includes the working directory, selected executable path, SHA-256 hash when available,
     /// paths of the programs that launched Agentknock, and how standard input, output, and error
-    /// are connected. If the device approves the request, Agentknock adds the returned variables to
-    /// the command's environment. Returned values replace existing values with the same names.
-    /// Agentknock then replaces itself with the command.
+    /// are connected. If the device approves the secret use request, Agentknock adds the returned
+    /// environment variables to the command's environment. Returned values replace existing
+    /// values with the same names. Agentknock then replaces itself with the command.
     ///
-    /// Specify each profile with a separate `--profile` option. The `--` separator is required;
+    /// Specify each secret with a separate `--secret` option. The `--` separator is required;
     /// Agentknock treats everything after it as the command and its arguments. Agentknock doesn't
     /// invoke a shell or interpret those arguments.
     ///
-    /// If multiple profiles provide the same environment variable, their values must match.
+    /// If multiple secrets provide the same environment variable, their values must match.
     /// Otherwise, Agentknock doesn't run the command.
     ///
     /// Agentknock writes its messages to standard error. The command inherits standard input,
@@ -80,7 +80,7 @@ enum Command {
     /// You can use `agentknock x` as a shorter alias for `agentknock exec`.
     #[command(
         visible_alias = "x",
-        after_long_help = "Examples:\n  Request one profile:\n    agentknock exec -p github -- gh issue list\n\n  Request multiple profiles and explain why:\n    agentknock exec -p github -p cloudflare --reason \"Deploy the release\" -- wrangler deploy"
+        after_long_help = "Examples:\n  Use one secret:\n    agentknock exec -s github -- gh issue list\n\n  Use multiple secrets and explain why:\n    agentknock exec -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy"
     )]
     Exec(ExecCommand),
 
@@ -103,43 +103,43 @@ enum Command {
         command: PairingCommand,
     },
 
-    /// List profiles or send a profile proposal to the paired device.
+    /// List secrets or upload a secret to the paired device.
     ///
-    /// A profile defines data or operations that the paired device can provide. This version of
-    /// Agentknock can request environment profiles and send environment profile proposals.
+    /// A secret defines data or operations that the paired device can provide. This version of
+    /// Agentknock can use, list, and upload secrets of type Environment variables.
     ///
-    /// Profile commands require an active pairing. Listing returns profile metadata without
-    /// secret values. Uploading sends secret values to the device in an encrypted proposal.
+    /// Secret commands require an active pairing. Listing returns secret metadata without secret
+    /// values. Uploading sends secret data to the device for review.
     #[command(
         arg_required_else_help = true,
         subcommand_required = true,
         disable_help_subcommand = true
     )]
-    Profile {
+    Secret {
         #[command(subcommand)]
-        command: ProfileCommand,
+        command: SecretCommand,
     },
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
 struct ExecCommand {
-    /// Name of a profile to request from the device.
+    /// Name of a secret to use for the command.
     ///
-    /// Repeat this option to request more than one profile. A profile name can't be empty or
-    /// contain a comma. To find available names, use `agentknock profile list`.
+    /// Repeat this option to use more than one secret. A secret name can't be empty or
+    /// contain a comma. To find available names, use `agentknock secret list`.
     #[arg(
-        short = 'p',
-        long = "profile",
+        short = 's',
+        long = "secret",
         action = ArgAction::Append,
         required = true,
-        value_name = "PROFILE",
-        value_parser = parse_profile
+        value_name = "SECRET",
+        value_parser = parse_secret
     )]
-    profiles: Vec<String>,
+    secrets: Vec<String>,
 
-    /// Explanation for why the command needs profile access.
+    /// Explanation for the secret use request.
     ///
-    /// Agentknock sends this text unchanged to the device as part of the access request.
+    /// Agentknock sends this text unchanged to the device as part of the secret use request.
     #[arg(
         long,
         value_name = "REASON",
@@ -147,13 +147,13 @@ struct ExecCommand {
     )]
     reason: Option<String>,
 
-    /// Suppress Agentknock request and command-launch messages.
+    /// Suppress Agentknock secret use and command-launch messages.
     ///
     /// This option doesn't suppress output from the command.
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
 
-    /// Show each profile access request state change.
+    /// Show each secret use request state change.
     ///
     /// Before Agentknock runs the command, it lists the names of the environment variables that
     /// it received. It never displays their values.
@@ -220,7 +220,7 @@ enum PairingCommand {
     ///
     /// By default, Agentknock asks the device to remove the pairing and waits for an authenticated
     /// response before it deletes the local pairing. After removal, this client can no longer
-    /// request profiles from the device.
+    /// request secret use from the device.
     ///
     /// If the device can't be contacted, use `--force` to delete only the local pairing.
     /// Without `--force`, Agentknock reports progress and total elapsed time every 30 seconds while
@@ -236,11 +236,11 @@ enum PairingCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
-enum ProfileCommand {
-    /// List profiles available from the paired device.
+enum SecretCommand {
+    /// List secrets available from the paired device.
     ///
-    /// Request metadata for the profiles that this client can access. Agentknock writes a JSON
-    /// object to standard output. Each profile includes its type, optional description, and the
+    /// Request metadata for the secrets available to this client. Agentknock writes a JSON
+    /// object to standard output. Each secret includes its type, optional description, and the
     /// environment variable names that it provides. The output never includes secret values.
     ///
     /// Agentknock writes progress and error messages to standard error, so you can redirect or
@@ -249,89 +249,90 @@ enum ProfileCommand {
     /// While the request waits for the device, Agentknock reports progress and total elapsed time
     /// every 30 seconds.
     #[command(
-        after_long_help = "Example output:\n  {\n    \"profiles\": {\n      \"github\": {\n        \"description\": \"GitHub API access\",\n        \"type\": \"environment\",\n        \"variables\": [\"GH_TOKEN\"]\n      }\n    }\n  }"
+        after_long_help = "Example output:\n  {\n    \"secrets\": {\n      \"github\": {\n        \"description\": \"GitHub API access\",\n        \"type\": \"environment\",\n        \"variables\": [\"GH_TOKEN\"]\n      }\n    }\n  }"
     )]
     List,
 
-    /// Send a profile proposal to the paired device.
+    /// Upload a secret to the paired device.
     ///
-    /// Build an environment profile from one or more local sources and send it to the paired
-    /// device in an encrypted proposal. The command completes after the device confirms that it
-    /// stored the proposal. The device doesn't apply the proposed changes until you accept them;
+    /// Build a secret of type Environment variables from one or more local sources and upload it
+    /// to the paired device. The command completes after the device confirms that it stored the
+    /// upload. The secret remains unavailable until you approve the upload on the device.
     /// Agentknock doesn't wait for that decision.
     ///
-    /// Without `--replace` or `--update`, the proposal creates a profile when accepted. Use
-    /// `--replace` to propose replacing an existing profile completely. Use `--update` to propose
-    /// changing supplied variables while retaining variables that you don't supply.
+    /// Without `--replace` or `--update`, the upload uses Create mode. Use `--replace` to upload
+    /// the complete replacement for an existing secret. Use `--update` to upload only the fields
+    /// to change while retaining fields that you don't supply.
     ///
     /// You can combine and repeat input options, but each environment variable name can occur only
-    /// once. At most one input can read from standard input. Names must be portable shell variable
-    /// names, and all names and values must be valid UTF-8.
+    /// once. At most one input can read from standard input. Environment variable names must be
+    /// portable shell identifiers. All names and values must be valid UTF-8.
     ///
-    /// While the proposal waits for the device, Agentknock reports progress and total elapsed time
+    /// While the upload waits for the device, Agentknock reports progress and total elapsed time
     /// every 30 seconds.
     #[command(
-        after_long_help = "Examples:\n  Create a profile from the current environment:\n    agentknock profile upload github --description \"GitHub API access\" --from-env GH_TOKEN\n\n  Create a profile from a dotenv file:\n    agentknock profile upload development --from-env-file .env\n\n  Update one variable in an existing profile:\n    agentknock profile upload github --update --from-prompt GH_TOKEN"
+        after_long_help = "Examples:\n  Create a secret from the current environment:\n    agentknock secret upload github --description \"GitHub API access\" --from-env GH_TOKEN\n\n  Create a secret from a dotenv file:\n    agentknock secret upload development --from-env-file .env\n\n  Update one environment variable in an existing secret:\n    agentknock secret upload github --update --from-prompt GH_TOKEN"
     )]
-    Upload(ProfileUploadCommand),
+    Upload(SecretUploadCommand),
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
-struct ProfileUploadCommand {
-    /// Name of the new or existing profile.
+struct SecretUploadCommand {
+    /// Name of the new or existing secret.
     ///
-    /// Without `--replace` or `--update`, this value is the proposed name for a new profile. You
-    /// can rename the profile when you accept it on the device.
+    /// In Create mode, this value is the initial name for the new secret. You can rename the secret
+    /// when you approve the upload on the device.
     ///
-    /// With `--replace` or `--update`, use the exact name of the existing profile. The device
-    /// doesn't rename an existing profile. A profile name can't be empty or contain a comma.
-    #[arg(value_name = "NAME", value_parser = parse_profile)]
+    /// With `--replace` or `--update`, use the exact name of the existing secret. The device
+    /// doesn't rename an existing secret. A secret name can't be empty or contain a comma.
+    #[arg(value_name = "NAME", value_parser = parse_secret)]
     name: String,
 
-    /// Description for the profile.
+    /// Description for the secret.
     ///
     /// With `--update`, omit this option to retain the existing description. Specify an empty
     /// string to remove the description.
     #[arg(long, value_name = "DESCRIPTION")]
     description: Option<String>,
 
-    /// Propose replacing an existing profile with the supplied profile.
+    /// Use Replace mode for an existing secret.
     ///
     /// Existing environment variables that you don't supply are removed.
     #[arg(long, conflicts_with = "update")]
     replace: bool,
 
-    /// Propose updating the supplied fields in an existing profile.
+    /// Use Update mode for an existing secret.
     ///
     /// Existing environment variables that you don't supply are retained.
     #[arg(long, conflicts_with = "replace")]
     update: bool,
 
     #[command(flatten, next_help_heading = "Environment variable sources")]
-    environment: EnvironmentProfileInput,
+    environment: EnvironmentSecretInput,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
 #[group(required = true, multiple = true)]
-struct EnvironmentProfileInput {
+struct EnvironmentSecretInput {
     /// Read an environment variable from the current process environment.
     ///
-    /// NAME is both the source and destination variable name. Repeat this option to read more
-    /// variables.
+    /// NAME is both the source and destination environment variable name. Repeat this option to
+    /// read more environment variables.
     #[arg(long, action = ArgAction::Append, value_name = "NAME", value_parser = parse_environment_name)]
     from_env: Vec<String>,
 
     /// Read an environment variable value from a file.
     ///
-    /// Use `NAME=PATH`, where NAME is the destination variable name. Agentknock reads the complete
-    /// file without trimming whitespace. Use `NAME=-` to read the value from standard input.
-    /// Repeat this option to read more variables.
+    /// Use `NAME=PATH`, where NAME is the destination environment variable name. Agentknock reads
+    /// the complete file without trimming whitespace. Use `NAME=-` to read the value from standard
+    /// input. Repeat this option to read more environment variables.
     #[arg(long, action = ArgAction::Append, value_name = "NAME=PATH")]
     from_file: Vec<VariableFile>,
 
     /// Prompt for an environment variable without displaying its value.
     ///
-    /// NAME is the destination variable name. Repeat this option to prompt for more variables.
+    /// NAME is the destination environment variable name. Repeat this option to prompt for more
+    /// environment variables.
     #[arg(long, action = ArgAction::Append, value_name = "NAME", value_parser = parse_environment_name)]
     from_prompt: Vec<String>,
 
@@ -346,7 +347,7 @@ struct EnvironmentProfileInput {
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
     Exec {
-        profiles: Vec<String>,
+        secrets: Vec<String>,
         reason: Option<String>,
         command: Vec<String>,
     },
@@ -356,8 +357,8 @@ enum Operation {
     RemovePairing {
         force: bool,
     },
-    ListProfiles,
-    UploadProfile(ProfileUploadCommand),
+    ListSecrets,
+    UploadSecret(SecretUploadCommand),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,9 +387,9 @@ enum CommandError {
     AbortPairing(ConfigurationError),
     ForceRemovePairing(ConfigurationError),
     RemovePairing(PairingRemoveError),
-    ListProfiles(RequestError),
-    ProfileInput(ProfileInputError),
-    UploadProfile(ProfileUploadError),
+    ListSecrets(RequestError),
+    SecretInput(SecretInputError),
+    UploadSecret(SecretUploadError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,8 +399,8 @@ struct VariableFile {
 }
 
 #[derive(Debug, Error)]
-enum ProfileInputError {
-    #[error("only one profile source can read from standard input")]
+enum SecretInputError {
+    #[error("only one secret source can read from standard input")]
     MultipleStdinSources,
 
     #[error("environment variable {name:?} isn't set")]
@@ -431,7 +432,7 @@ enum ProfileInputError {
     #[error("environment variable {name:?} contains a null byte")]
     NullEnvironmentVariable { name: String },
 
-    #[error("the environment profile doesn't contain any variables")]
+    #[error("the secret doesn't contain any environment variables")]
     NoEnvironmentVariables,
 
     #[error("couldn't read environment variable {name:?} from the terminal: {source}")]
@@ -442,13 +443,13 @@ enum ProfileInputError {
     },
 }
 
-fn parse_profile(profile: &str) -> Result<String, &'static str> {
-    if profile.is_empty() {
-        Err("the profile name can't be empty")
-    } else if profile.contains(',') {
-        Err("a profile name can't contain a comma. Repeat -p or --profile for each profile")
+fn parse_secret(secret: &str) -> Result<String, &'static str> {
+    if secret.is_empty() {
+        Err("the secret name can't be empty")
+    } else if secret.contains(',') {
+        Err("a secret name can't contain a comma. Repeat -s or --secret for each secret")
     } else {
-        Ok(profile.to_owned())
+        Ok(secret.to_owned())
     }
 }
 
@@ -510,7 +511,7 @@ impl Cli {
                 let output = command.output_mode();
                 (
                     Operation::Exec {
-                        profiles: command.profiles,
+                        secrets: command.secrets,
                         reason: command.reason,
                         command: command.command,
                     },
@@ -529,12 +530,12 @@ impl Cli {
             Command::Pairing {
                 command: PairingCommand::Remove { force },
             } => (Operation::RemovePairing { force }, OutputMode::Normal),
-            Command::Profile {
-                command: ProfileCommand::List,
-            } => (Operation::ListProfiles, OutputMode::Normal),
-            Command::Profile {
-                command: ProfileCommand::Upload(command),
-            } => (Operation::UploadProfile(command), OutputMode::Normal),
+            Command::Secret {
+                command: SecretCommand::List,
+            } => (Operation::ListSecrets, OutputMode::Normal),
+            Command::Secret {
+                command: SecretCommand::Upload(command),
+            } => (Operation::UploadSecret(command), OutputMode::Normal),
         }
     }
 }
@@ -574,7 +575,7 @@ fn exec_is_missing_separator(arguments: &[OsString]) -> bool {
 fn print_missing_exec_separator() {
     eprintln!("error: add `--` before the command to run");
     eprintln!();
-    eprintln!("Usage: agentknock exec -p <PROFILE>... -- <COMMAND> [ARGUMENT]...");
+    eprintln!("Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...");
     eprintln!();
     eprintln!("For more information, run 'agentknock exec --help'.");
 }
@@ -600,7 +601,7 @@ async fn main() -> ExitCode {
 async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandError> {
     match operation {
         Operation::Exec {
-            profiles,
+            secrets,
             reason,
             command,
         } => {
@@ -613,9 +614,9 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             })?;
             let signal_state = SignalState::capture().map_err(CommandError::ExecSignal)?;
             let launcher_chain = launcher_chain();
-            let request = CredentialRequest {
-                profiles: &profiles,
-                operation: RequestOperation::Exec {
+            let request = SecretUseRequest {
+                secrets: &secrets,
+                operation: SecretUseOperation::Exec {
                     command: program,
                     arguments,
                     working_directory: selected.working_directory(),
@@ -630,7 +631,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 launcher_chain: &launcher_chain,
             };
             let mut signals = ExecSignals::new().map_err(CommandError::ExecSignal)?;
-            let credentials = request_exec_credentials(request, output, &mut signals).await?;
+            let secret_use_output = request_exec_secrets(request, output, &mut signals).await?;
             let blocked_signals = signal_state
                 .block_interrupts()
                 .map_err(CommandError::ExecSignal)?;
@@ -642,12 +643,12 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 return Err(CommandError::ExecInterrupted);
             }
             if output == OutputMode::Verbose {
-                print_received_environment(&credentials);
+                print_received_environment(&secret_use_output);
                 print_message(format_args!("Running command {program:?}."));
             }
             let program = program.clone();
             selected
-                .execute(arguments, credentials, &signal_state, blocked_signals)
+                .execute(arguments, secret_use_output, &signal_state, blocked_signals)
                 .map_err(|source| {
                     if source.kind() == io::ErrorKind::Interrupted {
                         CommandError::ExecInterrupted
@@ -666,7 +667,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             finish_pairing_for_cli()
                 .await
                 .map_err(CommandError::FinishPairing)?;
-            println!("Pairing complete. Agentknock is ready to request profile access.");
+            println!("Pairing complete. Agentknock is ready to request secret use.");
         }
         Operation::AbortPairing => {
             abort_pairing().map_err(CommandError::AbortPairing)?;
@@ -683,23 +684,20 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 println!("Pairing removed from this client and the device.");
             }
         }
-        Operation::ListProfiles => {
-            let profiles = list_profiles_for_cli()
+        Operation::ListSecrets => {
+            let secrets = list_secrets_for_cli()
                 .await
-                .map_err(CommandError::ListProfiles)?;
-            print_profiles(&profiles);
+                .map_err(CommandError::ListSecrets)?;
+            print_secrets(&secrets);
         }
-        Operation::UploadProfile(command) => {
-            let (profile, mode) = read_profile(command).map_err(CommandError::ProfileInput)?;
-            upload_profile_for_cli(&profile, mode)
+        Operation::UploadSecret(command) => {
+            let (secret, mode) = read_secret(command).map_err(CommandError::SecretInput)?;
+            upload_secret_for_cli(&secret, mode)
                 .await
-                .map_err(CommandError::UploadProfile)?;
-            println!(
-                "Profile proposal {:?} delivered to the device.",
-                profile.name
-            );
-            println!("The profile isn't available until you accept the proposal on the device.");
-            println!("Suggested action: Review the proposal on the device.");
+                .map_err(CommandError::UploadSecret)?;
+            println!("Secret upload {:?} delivered to the device.", secret.name);
+            println!("The secret isn't available until you approve the upload on the device.");
+            println!("Suggested action: Review the secret upload on the device.");
         }
     }
 
@@ -742,30 +740,30 @@ async fn remove_pairing_for_cli() -> Result<(), PairingRemoveError> {
     .await
 }
 
-async fn list_profiles_for_cli() -> Result<Profiles, RequestError> {
+async fn list_secrets_for_cli() -> Result<Secrets, RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = list_profiles(move |current| {
+    let request = list_secrets(move |current| {
         observed_progress.set(Some(current));
     });
-    monitor_operation(request, progress, profile_list_progress_message).await
+    monitor_operation(request, progress, secret_list_progress_message).await
 }
 
-async fn upload_profile_for_cli(
-    profile: &EnvironmentProfile,
-    mode: ProfileUploadMode,
-) -> Result<(), ProfileUploadError> {
+async fn upload_secret_for_cli(
+    secret: &EnvironmentSecret,
+    mode: SecretUploadMode,
+) -> Result<(), SecretUploadError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = upload_profile(profile, mode, move |current| {
+    let request = upload_secret(secret, mode, move |current| {
         observed_progress.set(Some(current));
     });
-    monitor_operation(request, progress, profile_upload_progress_message).await
+    monitor_operation(request, progress, secret_upload_progress_message).await
 }
 
-fn read_profile(
-    command: ProfileUploadCommand,
-) -> Result<(EnvironmentProfile, ProfileUploadMode), ProfileInputError> {
+fn read_secret(
+    command: SecretUploadCommand,
+) -> Result<(EnvironmentSecret, SecretUploadMode), SecretInputError> {
     let stdin_sources = command
         .environment
         .from_file
@@ -779,7 +777,7 @@ fn read_profile(
             .filter(|path| path.as_path() == Path::new("-"))
             .count();
     if stdin_sources > 1 {
-        return Err(ProfileInputError::MultipleStdinSources);
+        return Err(SecretInputError::MultipleStdinSources);
     }
 
     let mut variables = BTreeMap::new();
@@ -787,39 +785,39 @@ fn read_profile(
         let value = match env::var(&name) {
             Ok(value) => value,
             Err(env::VarError::NotPresent) => {
-                return Err(ProfileInputError::MissingEnvironmentVariable { name });
+                return Err(SecretInputError::MissingEnvironmentVariable { name });
             }
             Err(env::VarError::NotUnicode(_)) => {
-                return Err(ProfileInputError::NonUtf8EnvironmentVariable { name });
+                return Err(SecretInputError::NonUtf8EnvironmentVariable { name });
             }
         };
         insert_environment_variable(&mut variables, name, value)?;
     }
     for source in command.environment.from_file {
-        let value = read_profile_source(&source.path)?;
+        let value = read_secret_source(&source.path)?;
         insert_environment_variable(&mut variables, source.name, value)?;
     }
     for path in command.environment.from_env_file {
-        let source_name = profile_source_name(&path);
-        let contents = read_profile_source(&path)?;
+        let source_name = secret_source_name(&path);
+        let contents = read_secret_source(&path)?;
         for entry in dotenvy::from_read_iter(contents.as_bytes()) {
-            let (name, value) = entry.map_err(|source| ProfileInputError::EnvironmentFile {
+            let (name, value) = entry.map_err(|source| SecretInputError::EnvironmentFile {
                 source_name: source_name.clone(),
                 source,
             })?;
             if !valid_environment_name(&name) {
-                return Err(ProfileInputError::InvalidEnvironmentVariableName { name });
+                return Err(SecretInputError::InvalidEnvironmentVariableName { name });
             }
             insert_environment_variable(&mut variables, name, value)?;
         }
     }
     for name in command.environment.from_prompt {
         if variables.contains_key(&name) {
-            return Err(ProfileInputError::DuplicateEnvironmentVariable { name });
+            return Err(SecretInputError::DuplicateEnvironmentVariable { name });
         }
         let value =
             rpassword::prompt_password(format!("Value for {name}: ")).map_err(|source| {
-                ProfileInputError::Prompt {
+                SecretInputError::Prompt {
                     name: name.clone(),
                     source,
                 }
@@ -827,18 +825,18 @@ fn read_profile(
         insert_environment_variable(&mut variables, name, value)?;
     }
     if variables.is_empty() {
-        return Err(ProfileInputError::NoEnvironmentVariables);
+        return Err(SecretInputError::NoEnvironmentVariables);
     }
 
     let mode = if command.replace {
-        ProfileUploadMode::Replace
+        SecretUploadMode::Replace
     } else if command.update {
-        ProfileUploadMode::Update
+        SecretUploadMode::Update
     } else {
-        ProfileUploadMode::Create
+        SecretUploadMode::Create
     };
     Ok((
-        EnvironmentProfile {
+        EnvironmentSecret {
             name: command.name,
             description: command.description,
             variables,
@@ -847,26 +845,26 @@ fn read_profile(
     ))
 }
 
-fn read_profile_source(path: &Path) -> Result<String, ProfileInputError> {
-    let source_name = profile_source_name(path);
+fn read_secret_source(path: &Path) -> Result<String, SecretInputError> {
+    let source_name = secret_source_name(path);
     if path == Path::new("-") {
         let mut contents = String::new();
         io::stdin()
             .read_to_string(&mut contents)
-            .map_err(|source| ProfileInputError::Read {
+            .map_err(|source| SecretInputError::Read {
                 source_name,
                 source,
             })?;
         Ok(contents)
     } else {
-        fs::read_to_string(path).map_err(|source| ProfileInputError::Read {
+        fs::read_to_string(path).map_err(|source| SecretInputError::Read {
             source_name,
             source,
         })
     }
 }
 
-fn profile_source_name(path: &Path) -> String {
+fn secret_source_name(path: &Path) -> String {
     if path == Path::new("-") {
         "standard input".into()
     } else {
@@ -878,12 +876,12 @@ fn insert_environment_variable(
     variables: &mut BTreeMap<String, String>,
     name: String,
     value: String,
-) -> Result<(), ProfileInputError> {
+) -> Result<(), SecretInputError> {
     if value.contains('\0') {
-        return Err(ProfileInputError::NullEnvironmentVariable { name });
+        return Err(SecretInputError::NullEnvironmentVariable { name });
     }
     if variables.insert(name.clone(), value).is_some() {
-        return Err(ProfileInputError::DuplicateEnvironmentVariable { name });
+        return Err(SecretInputError::DuplicateEnvironmentVariable { name });
     }
     Ok(())
 }
@@ -946,35 +944,35 @@ fn format_elapsed_time(elapsed: Duration) -> String {
     }
 }
 
-fn profile_list_progress_message(progress: ProfileListProgress) -> &'static str {
+fn secret_list_progress_message(progress: SecretListProgress) -> &'static str {
     match progress {
-        ProfileListProgress::Preparing => "Preparing the profile list request.",
-        ProfileListProgress::WaitingForDelivery => {
-            "Waiting for the device to receive the profile list request."
+        SecretListProgress::Preparing => "Preparing the secret list request.",
+        SecretListProgress::WaitingForDelivery => {
+            "Waiting for the device to receive the secret list request."
         }
-        ProfileListProgress::WaitingForResponse => {
-            "The device received the profile list request. Waiting for its response."
+        SecretListProgress::WaitingForResponse => {
+            "The device received the secret list request. Waiting for its response."
         }
-        ProfileListProgress::Completing => {
-            "Profile list received. Confirming receipt with the device."
+        SecretListProgress::Completing => {
+            "Secret list received. Confirming receipt with the device."
         }
-        ProfileListProgress::Completed => "Profile list request complete.",
-        _ => "Processing the profile list request.",
+        SecretListProgress::Completed => "Secret list request complete.",
+        _ => "Processing the secret list request.",
     }
 }
 
-fn profile_upload_progress_message(progress: ProfileUploadProgress) -> &'static str {
+fn secret_upload_progress_message(progress: SecretUploadProgress) -> &'static str {
     match progress {
-        ProfileUploadProgress::Preparing => "Preparing the profile proposal.",
-        ProfileUploadProgress::WaitingForDelivery => {
-            "Waiting for the device to receive the profile proposal."
+        SecretUploadProgress::Preparing => "Preparing the secret upload.",
+        SecretUploadProgress::WaitingForDelivery => {
+            "Waiting for the device to receive the secret upload."
         }
-        ProfileUploadProgress::WaitingForResponse => {
-            "The device received the profile proposal. Waiting for confirmation that it saved the proposal."
+        SecretUploadProgress::WaitingForResponse => {
+            "The device received the secret upload. Waiting for confirmation that it saved the upload."
         }
-        ProfileUploadProgress::Completing => "Device response received. Confirming receipt.",
-        ProfileUploadProgress::Completed => "Profile proposal request complete.",
-        _ => "Processing the profile proposal.",
+        SecretUploadProgress::Completing => "Device response received. Confirming receipt.",
+        SecretUploadProgress::Completed => "Secret upload complete.",
+        _ => "Processing the secret upload.",
     }
 }
 
@@ -1047,18 +1045,18 @@ impl ExecSignals {
     }
 }
 
-async fn request_exec_credentials(
-    request: CredentialRequest<'_>,
+async fn request_exec_secrets(
+    request: SecretUseRequest<'_>,
     output: OutputMode,
     signals: &mut ExecSignals,
-) -> Result<Credentials, CommandError> {
+) -> Result<SecretUseOutput, CommandError> {
     use tokio::time::{Instant, sleep};
 
     let current_progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&current_progress);
     let interrupt = &mut signals.interrupt;
     let terminate = &mut signals.terminate;
-    let request = request_credentials(
+    let request = request_secret_use(
         request,
         async {
             tokio::select! {
@@ -1124,7 +1122,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                     ));
                 }
             }
-            print_message("No profile access request was sent.");
+            print_message("No secret use request was sent.");
             match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message("Suggested action: Check the command name or path.");
@@ -1148,7 +1146,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "Profile access was approved, but Agentknock couldn't run command {program:?}: {source}."
+                "Secret use was approved, but Agentknock couldn't run command {program:?}: {source}."
             ));
             match source.kind() {
                 io::ErrorKind::NotFound => {
@@ -1172,74 +1170,74 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         CommandError::AbortPairing(error) => print_abort_pairing_error(error),
         CommandError::ForceRemovePairing(error) => print_force_remove_pairing_error(error),
         CommandError::RemovePairing(error) => print_remove_pairing_error(error),
-        CommandError::ListProfiles(error) => print_list_error(error),
-        CommandError::ProfileInput(error) => {
+        CommandError::ListSecrets(error) => print_list_error(error),
+        CommandError::SecretInput(error) => {
             print_plain_error(format_args!(
-                "Couldn't create the profile proposal: {error}."
+                "Agentknock couldn't prepare the secret upload: {error}."
             ));
         }
-        CommandError::UploadProfile(error) => print_upload_error(error),
+        CommandError::UploadSecret(error) => print_upload_error(error),
     }
 }
 
-fn print_upload_error(error: &ProfileUploadError) {
+fn print_upload_error(error: &SecretUploadError) {
     match error {
-        ProfileUploadError::Rejected { message } => {
+        SecretUploadError::Rejected { message } => {
             print_plain_error(format_args!(
-                "The device rejected the profile proposal: {message}"
+                "The device rejected the secret upload: {message}"
             ));
         }
-        ProfileUploadError::Request(RequestError::Configuration(
+        SecretUploadError::Request(RequestError::Configuration(
             ConfigurationError::NoPairing { .. },
         )) => {
-            print_plain_error("Agentknock isn't paired, so it can't send the profile proposal.");
+            print_plain_error("Agentknock isn't paired, so it can't send the secret upload.");
             print_plain_error("Suggested action: Get a pairing address, then run:");
             print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
-        ProfileUploadError::Request(RequestError::Configuration(
+        SecretUploadError::Request(RequestError::Configuration(
             ConfigurationError::PairingPending { .. },
         )) => {
             print_plain_error(
-                "Pairing is waiting for confirmation, so Agentknock can't send the profile proposal.",
+                "Pairing is waiting for confirmation, so Agentknock can't send the secret upload.",
             );
             print_plain_error("Suggested action: After you approve the pairing, run:");
             print_plain_error("agentknock pairing finish");
         }
-        ProfileUploadError::Request(RequestError::Configuration(error)) => {
+        SecretUploadError::Request(RequestError::Configuration(error)) => {
             print_plain_error(format_args!(
-                "Agentknock couldn't send the profile proposal: {error}."
+                "Agentknock couldn't send the secret upload: {error}."
             ));
             print_plain_configuration_action(error);
         }
-        ProfileUploadError::Request(RequestError::RelayUnavailable { failures }) => {
+        SecretUploadError::Request(RequestError::RelayUnavailable { failures }) => {
             print_plain_error(format_args!(
                 "Agentknock couldn't confirm delivery after {failures} consecutive relay errors."
             ));
             print_plain_error(
-                "Suggested action: Check whether the proposal reached the device before you try again.",
+                "Suggested action: Check whether the upload reached the device before you try again.",
             );
         }
-        ProfileUploadError::Request(RequestError::Unauthenticated { code, message }) => {
+        SecretUploadError::Request(RequestError::Unauthenticated { code, message }) => {
             print_plain_unauthenticated_report(code, message);
             print_plain_error(
-                "Agentknock didn't receive authenticated confirmation that the device saved the proposal.",
+                "Agentknock didn't receive authenticated confirmation that the device saved the upload.",
             );
             print_plain_unauthenticated_action(code);
         }
-        ProfileUploadError::Request(RequestError::ClientInactive { message }) => {
+        SecretUploadError::Request(RequestError::ClientInactive { message }) => {
             print_plain_error(format_args!(
                 "The relay reports that this paired client is inactive: {message}"
             ));
-            print_plain_error("The profile proposal wasn't delivered.");
+            print_plain_error("The secret upload wasn't delivered.");
         }
-        ProfileUploadError::Request(error) => {
+        SecretUploadError::Request(error) => {
             print_plain_error(format_args!(
-                "Agentknock couldn't send the profile proposal: {error}."
+                "Agentknock couldn't send the secret upload: {error}."
             ));
         }
         _ => {
             print_plain_error(format_args!(
-                "Agentknock couldn't send the profile proposal: {error}."
+                "Agentknock couldn't send the secret upload: {error}."
             ));
         }
     }
@@ -1248,29 +1246,29 @@ fn print_upload_error(error: &ProfileUploadError) {
 fn print_list_error(error: &RequestError) {
     match error {
         RequestError::Configuration(ConfigurationError::NoPairing { .. }) => {
-            print_plain_error("Agentknock isn't paired, so it can't list profiles.");
+            print_plain_error("Agentknock isn't paired, so it can't list secrets.");
             print_plain_error("Suggested action: Get a pairing address, then run:");
             print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
         }
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error(
-                "Pairing is waiting for confirmation, so Agentknock can't list profiles.",
+                "Pairing is waiting for confirmation, so Agentknock can't list secrets.",
             );
             print_plain_error("Suggested action: After you approve the pairing, run:");
             print_plain_error("agentknock pairing finish");
         }
         RequestError::Configuration(error) => {
-            print_plain_error(format_args!("Agentknock couldn't list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock couldn't list secrets: {error}."));
             print_plain_configuration_action(error);
         }
         RequestError::RelayUnavailable { .. } => {
-            print_plain_error(format_args!("Agentknock couldn't list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock couldn't list secrets: {error}."));
             print_plain_error("Suggested action: Check relay connectivity, then run:");
-            print_plain_error("agentknock profile list");
+            print_plain_error("agentknock secret list");
         }
         RequestError::Unauthenticated { code, message } => {
             print_plain_unauthenticated_report(code, message);
-            print_plain_error("Agentknock didn't receive a profile list.");
+            print_plain_error("Agentknock didn't receive a secret list.");
             print_plain_error("The unauthenticated report didn't change the local pairing.");
             print_plain_unauthenticated_action(code);
         }
@@ -1278,10 +1276,10 @@ fn print_list_error(error: &RequestError) {
             print_plain_error(format_args!(
                 "The relay reports that this paired client is inactive: {message}"
             ));
-            print_plain_error("Agentknock didn't receive a profile list.");
+            print_plain_error("Agentknock didn't receive a secret list.");
         }
         _ => {
-            print_plain_error(format_args!("Agentknock couldn't list profiles: {error}."));
+            print_plain_error(format_args!("Agentknock couldn't list secrets: {error}."));
         }
     }
 }
@@ -1290,44 +1288,42 @@ fn print_exec_request_error(error: &RequestError) {
     match error {
         RequestError::Configuration(error) => print_exec_configuration_error(error),
         RequestError::Denied {
-            reason: DenialReason::UserDenied,
+            reason: SecretUseDenialReason::UserDenied,
             message,
         } => {
             print_message(format_args!(
-                "The device denied the profile access request: {message}"
+                "The device denied the secret use request: {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Denied {
-            reason: DenialReason::PolicyDenied,
+            reason: SecretUseDenialReason::PolicyDenied,
             message,
         } => {
             print_message(format_args!(
-                "Device policy denied the profile access request: {message}"
+                "Device policy denied the secret use request: {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Denied {
-            reason: DenialReason::InvalidRequest,
+            reason: SecretUseDenialReason::InvalidRequest,
             message,
         } => {
             print_message(format_args!(
-                "The device rejected the profile access request as invalid: {message}"
+                "The device rejected the secret use request as invalid: {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Denied {
-            reason: DenialReason::Other,
+            reason: SecretUseDenialReason::Other,
             message,
         } => {
-            print_message(format_args!(
-                "The profile access request was denied: {message}"
-            ));
+            print_message(format_args!("The secret use request was denied: {message}"));
             print_message("The command didn't run.");
         }
         RequestError::Interrupted => {
             print_message(
-                "Agentknock received a signal and canceled the profile access request. The command didn't run.",
+                "Agentknock received a signal and canceled the secret use request. The command didn't run.",
             );
         }
         RequestError::RelayUnavailable { failures } => {
@@ -1352,7 +1348,7 @@ fn print_exec_request_error(error: &RequestError) {
             print_message("The command didn't run.");
         }
         RequestError::Other(source) => {
-            print_message(format_args!("The profile access request failed: {source}."));
+            print_message(format_args!("The secret use request failed: {source}."));
             print_message("The command didn't run.");
         }
         RequestError::PairingRejected => {
@@ -1360,7 +1356,7 @@ fn print_exec_request_error(error: &RequestError) {
             print_message("The command didn't run.");
         }
         _ => {
-            print_message(format_args!("The profile access request failed: {error}."));
+            print_message(format_args!("The secret use request failed: {error}."));
             print_message("The command didn't run.");
         }
     }
@@ -1454,7 +1450,7 @@ fn print_finish_pairing_error(error: &RequestError) {
         }
         RequestError::Configuration(ConfigurationError::PairingNotPending { .. }) => {
             print_plain_error(
-                "Pairing is already complete. Agentknock is ready to request profile access.",
+                "Pairing is already complete. Agentknock is ready to request secret use.",
             );
         }
         RequestError::Configuration(error) => {
@@ -1628,31 +1624,29 @@ fn print_plain_error(message: impl std::fmt::Display) {
     }
 }
 
-fn print_progress(progress: CredentialRequestProgress) {
+fn print_progress(progress: SecretUseProgress) {
     print_message(progress_message(progress));
 }
 
-fn print_received_environment(credentials: &Credentials) {
-    let mut names = credentials.environment_variable_names().peekable();
+fn print_received_environment(secret_use_output: &SecretUseOutput) {
+    let mut names = secret_use_output.environment_variable_names().peekable();
     if names.peek().is_none() {
-        print_message(
-            "Profile access approved, but the profiles provided no environment variables.",
-        );
+        print_message("Secret use approved, but the secrets provided no environment variables.");
         return;
     }
 
-    print_message("Profile access approved. Received these environment variables:");
+    print_message("Secret use approved. Received these environment variables:");
     for name in names {
         print_message(format_args!("- {name}"));
     }
 }
 
-fn print_profiles(profiles: &Profiles) {
-    let profiles = profiles
+fn print_secrets(secrets: &Secrets) {
+    let secrets = secrets
         .iter()
-        .map(|(name, profile)| {
-            let output = match profile {
-                Profile::Environment {
+        .map(|(name, secret)| {
+            let output = match secret {
+                Secret::Environment {
                     description,
                     variables,
                     ..
@@ -1666,10 +1660,10 @@ fn print_profiles(profiles: &Profiles) {
             (name, output)
         })
         .collect::<BTreeMap<_, _>>();
-    let output = serde_json::json!({"profiles": profiles});
+    let output = serde_json::json!({"secrets": secrets});
     println!(
         "{}",
-        serde_json::to_string_pretty(&output).expect("profile metadata is valid JSON")
+        serde_json::to_string_pretty(&output).expect("secret metadata is valid JSON")
     );
 }
 
@@ -1738,18 +1732,18 @@ fn parent_id(status: &str) -> Option<u32> {
         .ok()
 }
 
-fn progress_message(progress: CredentialRequestProgress) -> &'static str {
+fn progress_message(progress: SecretUseProgress) -> &'static str {
     match progress {
-        CredentialRequestProgress::Preparing => "Preparing the profile access request.",
-        CredentialRequestProgress::WaitingForDelivery => {
-            "Waiting for the device to receive the profile access request."
+        SecretUseProgress::Preparing => "Preparing the secret use request.",
+        SecretUseProgress::WaitingForDelivery => {
+            "Waiting for the device to receive the secret use request."
         }
-        CredentialRequestProgress::WaitingForResponse => {
-            "The device received the profile access request. Waiting for its response."
+        SecretUseProgress::WaitingForResponse => {
+            "The device received the secret use request. Waiting for its response."
         }
-        CredentialRequestProgress::Completing => "Device response received. Confirming receipt.",
-        CredentialRequestProgress::Completed => "Profile access request complete.",
-        _ => "Processing the profile access request.",
+        SecretUseProgress::Completing => "Device response received. Confirming receipt.",
+        SecretUseProgress::Completed => "Secret use request complete.",
+        _ => "Processing the secret use request.",
     }
 }
 
@@ -1764,7 +1758,7 @@ mod tests {
     use clap::{Parser, error::ErrorKind};
 
     use super::{
-        Cli, EnvironmentProfileInput, Operation, OutputMode, ProfileUploadCommand, VariableFile,
+        Cli, EnvironmentSecretInput, Operation, OutputMode, SecretUploadCommand, VariableFile,
         exec_is_missing_separator, format_elapsed_time, progress_message, progress_report,
     };
 
@@ -1776,9 +1770,9 @@ mod tests {
         let cli = Cli::try_parse_from([
             "agentknock",
             "exec",
-            "-p",
+            "-s",
             "gh-token",
-            "--profile",
+            "--secret",
             "cf-wrangler",
             "--reason",
             "needed by the deployment agent",
@@ -1793,7 +1787,7 @@ mod tests {
             cli.into_operation(),
             (
                 Operation::Exec {
-                    profiles: vec!["gh-token".into(), "cf-wrangler".into()],
+                    secrets: vec!["gh-token".into(), "cf-wrangler".into()],
                     reason: Some("needed by the deployment agent".into()),
                     command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
                         .map(String::from)
@@ -1806,13 +1800,13 @@ mod tests {
 
     #[test]
     fn parses_exec_alias() {
-        let cli = Cli::try_parse_from(["agentknock", "x", "-p", "github", "--", "true"]).unwrap();
+        let cli = Cli::try_parse_from(["agentknock", "x", "-s", "github", "--", "true"]).unwrap();
 
         assert_eq!(
             cli.into_operation(),
             (
                 Operation::Exec {
-                    profiles: vec!["github".into()],
+                    secrets: vec!["github".into()],
                     reason: None,
                     command: vec!["true".into()],
                 },
@@ -1831,13 +1825,13 @@ mod tests {
     #[test]
     fn parses_output_modes() {
         let normal =
-            Cli::try_parse_from(["agentknock", "exec", "-p", "profile", "--", "true"]).unwrap();
+            Cli::try_parse_from(["agentknock", "exec", "-s", "secret", "--", "true"]).unwrap();
         let quiet = Cli::try_parse_from([
             "agentknock",
             "exec",
             "--quiet",
-            "-p",
-            "profile",
+            "-s",
+            "secret",
             "--",
             "true",
         ])
@@ -1846,8 +1840,8 @@ mod tests {
             "agentknock",
             "exec",
             "--verbose",
-            "-p",
-            "profile",
+            "-s",
+            "secret",
             "--",
             "true",
         ])
@@ -1865,8 +1859,8 @@ mod tests {
             "exec",
             "--quiet",
             "--verbose",
-            "-p",
-            "profile",
+            "-s",
+            "secret",
             "--",
             "true",
         ])
@@ -1876,16 +1870,16 @@ mod tests {
     }
 
     #[test]
-    fn describes_credential_request_progress() {
-        use agentknock::CredentialRequestProgress::*;
+    fn describes_secret_use_progress() {
+        use agentknock::SecretUseProgress::*;
 
         assert_eq!(
             progress_message(WaitingForDelivery),
-            "Waiting for the device to receive the profile access request."
+            "Waiting for the device to receive the secret use request."
         );
         assert_eq!(
             progress_message(WaitingForResponse),
-            "The device received the profile access request. Waiting for its response."
+            "The device received the secret use request. Waiting for its response."
         );
         assert_eq!(
             progress_message(Completing),
@@ -1998,20 +1992,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_profile_list_command() {
-        let cli = Cli::try_parse_from(["agentknock", "profile", "list"]).unwrap();
+    fn parses_secret_list_command() {
+        let cli = Cli::try_parse_from(["agentknock", "secret", "list"]).unwrap();
 
         assert_eq!(
             cli.into_operation(),
-            (Operation::ListProfiles, OutputMode::Normal)
+            (Operation::ListSecrets, OutputMode::Normal)
         );
     }
 
     #[test]
-    fn parses_profile_upload_command() {
+    fn parses_secret_upload_command() {
         let cli = Cli::try_parse_from([
             "agentknock",
-            "profile",
+            "secret",
             "upload",
             "github",
             "--description",
@@ -2031,12 +2025,12 @@ mod tests {
         assert_eq!(
             cli.into_operation(),
             (
-                Operation::UploadProfile(ProfileUploadCommand {
+                Operation::UploadSecret(SecretUploadCommand {
                     name: "github".into(),
                     description: Some("GitHub API access".into()),
                     replace: false,
                     update: true,
-                    environment: EnvironmentProfileInput {
+                    environment: EnvironmentSecretInput {
                         from_env: vec!["GH_TOKEN".into()],
                         from_file: vec![VariableFile {
                             name: "GH_HOST".into(),
@@ -2058,13 +2052,13 @@ mod tests {
                 &["--help"],
                 &[
                     "Pair this client with a device",
-                    "Before you request or manage profiles",
+                    "Before you use or manage secrets",
                 ],
             ),
             (
                 &["exec", "--help"],
                 &[
-                    "adds the returned variables",
+                    "adds the returned environment variables",
                     "The `--` separator is required",
                     "doesn't invoke a shell",
                     "Repeat this option",
@@ -2109,14 +2103,14 @@ mod tests {
                 ],
             ),
             (
-                &["profile", "--help"],
+                &["secret", "--help"],
                 &[
-                    "Profile commands require an active pairing",
+                    "Secret commands require an active pairing",
                     "without secret values",
                 ],
             ),
             (
-                &["profile", "list", "--help"],
+                &["secret", "list", "--help"],
                 &[
                     "JSON object to standard output",
                     "never includes secret values",
@@ -2124,7 +2118,7 @@ mod tests {
                 ],
             ),
             (
-                &["profile", "upload", "--help"],
+                &["secret", "upload", "--help"],
                 &[
                     "doesn't wait for that decision",
                     "Use `--replace`",
@@ -2161,17 +2155,17 @@ mod tests {
     }
 
     #[test]
-    fn requires_a_profile_upload_source() {
-        let error = Cli::try_parse_from(["agentknock", "profile", "upload", "github"]).unwrap_err();
+    fn requires_a_secret_upload_source() {
+        let error = Cli::try_parse_from(["agentknock", "secret", "upload", "github"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
-    fn rejects_multiple_profile_upload_modes() {
+    fn rejects_multiple_secret_upload_modes() {
         let error = Cli::try_parse_from([
             "agentknock",
-            "profile",
+            "secret",
             "upload",
             "github",
             "--replace",
@@ -2229,8 +2223,8 @@ mod tests {
     }
 
     #[test]
-    fn shows_help_without_a_profile_command() {
-        let error = Cli::try_parse_from(["agentknock", "profile"]).unwrap_err();
+    fn shows_help_without_a_secret_command() {
+        let error = Cli::try_parse_from(["agentknock", "secret"]).unwrap_err();
 
         assert_eq!(
             error.kind(),
@@ -2242,11 +2236,11 @@ mod tests {
     fn does_not_define_help_subcommands() {
         let root_error = Cli::try_parse_from(["agentknock", "help"]).unwrap_err();
         let pairing_error = Cli::try_parse_from(["agentknock", "pairing", "help"]).unwrap_err();
-        let profile_error = Cli::try_parse_from(["agentknock", "profile", "help"]).unwrap_err();
+        let secret_error = Cli::try_parse_from(["agentknock", "secret", "help"]).unwrap_err();
 
         assert_eq!(root_error.kind(), ErrorKind::InvalidSubcommand);
         assert_eq!(pairing_error.kind(), ErrorKind::InvalidSubcommand);
-        assert_eq!(profile_error.kind(), ErrorKind::InvalidSubcommand);
+        assert_eq!(secret_error.kind(), ErrorKind::InvalidSubcommand);
     }
 
     #[test]
@@ -2260,11 +2254,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_space_separated_profiles() {
+    fn rejects_space_separated_secrets() {
         let error = Cli::try_parse_from([
             "agentknock",
             "exec",
-            "-p",
+            "-s",
             "gh-token",
             "cf-wrangler",
             "--",
@@ -2280,14 +2274,14 @@ mod tests {
         assert!(exec_is_missing_separator(&[
             "agentknock".into(),
             "exec".into(),
-            "-p".into(),
+            "-s".into(),
             "gh-token".into(),
             "echo".into(),
         ]));
         assert!(exec_is_missing_separator(&[
             "agentknock".into(),
             "x".into(),
-            "-p".into(),
+            "-s".into(),
             "gh-token".into(),
             "echo".into(),
         ]));
@@ -2301,17 +2295,17 @@ mod tests {
     #[test]
     fn rejects_empty_command_after_delimiter() {
         let error =
-            Cli::try_parse_from(["agentknock", "exec", "-p", "gh-token", "--"]).unwrap_err();
+            Cli::try_parse_from(["agentknock", "exec", "-s", "gh-token", "--"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
-    fn rejects_comma_separated_profiles() {
+    fn rejects_comma_separated_secrets() {
         let error = Cli::try_parse_from([
             "agentknock",
             "exec",
-            "-p",
+            "-s",
             "gh-token,cf-wrangler",
             "--",
             "echo",
@@ -2331,7 +2325,7 @@ mod tests {
             vec![
                 "agentknock".into(),
                 "exec".into(),
-                "-p".into(),
+                "-s".into(),
                 invalid_utf8.clone(),
                 "--".into(),
                 "echo".into(),
@@ -2339,7 +2333,7 @@ mod tests {
             vec![
                 "agentknock".into(),
                 "exec".into(),
-                "-p".into(),
+                "-s".into(),
                 "gh-token".into(),
                 "--".into(),
                 invalid_utf8.clone(),
@@ -2347,7 +2341,7 @@ mod tests {
             vec![
                 "agentknock".into(),
                 "exec".into(),
-                "-p".into(),
+                "-s".into(),
                 "gh-token".into(),
                 "--".into(),
                 "echo".into(),
@@ -2355,7 +2349,7 @@ mod tests {
             ],
             vec![
                 "agentknock".into(),
-                "profile".into(),
+                "secret".into(),
                 "upload".into(),
                 "test".into(),
                 "--from-env-file".into(),

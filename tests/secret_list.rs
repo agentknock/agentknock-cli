@@ -13,7 +13,7 @@ use support::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lists_profile_metadata_without_secret_values() {
+async fn lists_secret_metadata_without_secret_values() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
@@ -24,7 +24,7 @@ async fn lists_profile_metadata_without_secret_values() {
         let request_id = frame["request_id"].as_str().unwrap().to_owned();
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &frame["payload"]);
-        assert_eq!(plaintext["method"], "ProfileList");
+        assert_eq!(plaintext["method"], "SecretList");
         assert_eq!(plaintext["cli_version"], env!("CARGO_PKG_VERSION"));
 
         send_json(
@@ -48,7 +48,7 @@ async fn lists_profile_metadata_without_secret_values() {
                     &context,
                     &key,
                     &json!({
-                        "profiles": {
+                        "secrets": {
                             "github": {
                                 "description": "GitHub API access",
                                 "type": "environment",
@@ -90,7 +90,7 @@ async fn lists_profile_metadata_without_secret_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["profile", "list"])
+        .args(["secret", "list"])
         .output()
         .unwrap();
     assert!(
@@ -101,7 +101,7 @@ async fn lists_profile_metadata_without_secret_values() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         json!({
-            "profiles": {
+            "secrets": {
                 "cloudflare": {
                     "description": "Cloudflare deployment access",
                     "type": "environment",
@@ -123,7 +123,7 @@ fn reports_when_no_pairing_exists() {
     let home = TestHome::empty();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
-        .args(["profile", "list"])
+        .args(["secret", "list"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -149,7 +149,7 @@ async fn reports_inactive_client_without_suggesting_recovery() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["profile", "list"])
+        .args(["secret", "list"])
         .output()
         .unwrap();
     assert!(!output.status.success());

@@ -15,14 +15,14 @@ use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
     crypto::{self, Session},
     pairing::{RotationError, maybe_rotate_psk},
-    profiles::{ProfileContentsMessage, ProfileMessage, SecretValueMessage},
     protocol::Method,
+    secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
     websocket::{self, RelayExchange},
 };
 
-pub struct CredentialRequest<'a> {
-    pub profiles: &'a [String],
-    pub operation: RequestOperation<'a>,
+pub struct SecretUseRequest<'a> {
+    pub secrets: &'a [String],
+    pub operation: SecretUseOperation<'a>,
     pub reason: Option<&'a str>,
     pub launcher_chain: &'a [String],
 }
@@ -38,7 +38,7 @@ pub enum StreamKind {
 }
 
 #[non_exhaustive]
-pub enum RequestOperation<'a> {
+pub enum SecretUseOperation<'a> {
     Exec {
         command: &'a str,
         arguments: &'a [String],
@@ -59,13 +59,13 @@ pub enum ExecutableMode {
     Script,
 }
 
-pub struct Credentials {
+pub struct SecretUseOutput {
     environment: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum CredentialRequestProgress {
+pub enum SecretUseProgress {
     Preparing,
     WaitingForDelivery,
     WaitingForResponse,
@@ -73,7 +73,7 @@ pub enum CredentialRequestProgress {
     Completed,
 }
 
-impl Credentials {
+impl SecretUseOutput {
     pub fn environment_variable_names(&self) -> impl Iterator<Item = &str> {
         self.environment.keys().map(String::as_str)
     }
@@ -103,14 +103,14 @@ pub enum RequestError {
 
     #[error("request denied ({reason}): {message}")]
     Denied {
-        reason: DenialReason,
+        reason: SecretUseDenialReason,
         message: String,
     },
 
     #[error("pairing was rejected")]
     PairingRejected,
 
-    #[error("profile access request was interrupted")]
+    #[error("secret use request was interrupted")]
     Interrupted,
 }
 
@@ -125,14 +125,14 @@ impl RequestError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum DenialReason {
+pub enum SecretUseDenialReason {
     UserDenied,
     PolicyDenied,
     InvalidRequest,
     Other,
 }
 
-impl fmt::Display for DenialReason {
+impl fmt::Display for SecretUseDenialReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::UserDenied => "USER_DENIED",
@@ -143,24 +143,24 @@ impl fmt::Display for DenialReason {
     }
 }
 
-pub async fn request_credentials<C, P>(
-    request: CredentialRequest<'_>,
+pub async fn request_secret_use<C, P>(
+    request: SecretUseRequest<'_>,
     cancellation: C,
     mut progress: P,
-) -> Result<Credentials, RequestError>
+) -> Result<SecretUseOutput, RequestError>
 where
     C: Future<Output = ()>,
-    P: FnMut(CredentialRequestProgress),
+    P: FnMut(SecretUseProgress),
 {
     tokio::pin!(cancellation);
-    progress(CredentialRequestProgress::Preparing);
+    progress(SecretUseProgress::Preparing);
     maybe_rotate_psk().map_err(|error| match error {
         RotationError::Configuration(error) => RequestError::Configuration(error),
         RotationError::Other(error) => RequestError::Other(error),
     })?;
     let pairing = read_pairing()?;
     let operation = match request.operation {
-        RequestOperation::Exec {
+        SecretUseOperation::Exec {
             command,
             arguments,
             working_directory,
@@ -170,7 +170,7 @@ where
             stdin,
             stdout,
             stderr,
-        } => OperationMessage::Exec {
+        } => SecretUseOperationMessage::Exec {
             command,
             arguments,
             working_directory,
@@ -182,9 +182,9 @@ where
             stderr: stderr.into(),
         },
     };
-    let request_payload = CredentialRequestPayload {
-        method: Method::CredentialRequest,
-        profiles: request.profiles,
+    let request_payload = SecretUseRequestPayload {
+        method: Method::SecretUse,
+        secrets: request.secrets,
         reason: request.reason,
         operation,
         launcher_chain: request.launcher_chain,
@@ -201,13 +201,13 @@ where
 
 async fn message_exchange<C, P>(
     pairing: &Pairing,
-    request_payload: &CredentialRequestPayload<'_>,
+    request_payload: &SecretUseRequestPayload<'_>,
     mut cancellation: Pin<&mut C>,
     progress: &mut P,
-) -> Result<Credentials, RequestError>
+) -> Result<SecretUseOutput, RequestError>
 where
     C: Future<Output = ()> + ?Sized,
-    P: FnMut(CredentialRequestProgress),
+    P: FnMut(SecretUseProgress),
 {
     let request_id = Ulid::generate();
     let plaintext = crate::protocol::encode(request_payload).map_err(RequestError::other)?;
@@ -217,7 +217,7 @@ where
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
 
-    progress(CredentialRequestProgress::WaitingForDelivery);
+    progress(SecretUseProgress::WaitingForDelivery);
     let response = match tokio::select! {
         biased;
         _ = cancellation.as_mut() => {
@@ -227,7 +227,7 @@ where
             return Err(RequestError::Interrupted);
         }
         response = relay.request(&request, || {
-            progress(CredentialRequestProgress::WaitingForResponse);
+            progress(SecretUseProgress::WaitingForResponse);
         }) => response,
     } {
         Ok(response) => response,
@@ -248,46 +248,50 @@ where
             return Err(error);
         }
     };
-    progress(CredentialRequestProgress::Completing);
+    progress(SecretUseProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(RequestError::other)?;
     if let Some(rotation_key) = pairing.rotation_key() {
         clear_rotation_key(rotation_key)?;
     }
-    let result: RequestResult = serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+    let result: SecretUseResult =
+        serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
     let (completion_result, exchange_result) = match result {
-        RequestResult::Approved {
-            profiles: Some(profiles),
-        } => match credentials_from_profiles(profiles, request_payload.profiles) {
-            Ok(credentials) => (RequestResult::Approved { profiles: None }, Ok(credentials)),
+        SecretUseResult::Approved {
+            secrets: Some(secrets),
+        } => match secret_use_output_from_secrets(secrets, request_payload.secrets) {
+            Ok(secret_use_output) => (
+                SecretUseResult::Approved { secrets: None },
+                Ok(secret_use_output),
+            ),
             Err(error) => (
-                RequestResult::Aborted {
-                    reason: AbortReason::InvalidResponse,
+                SecretUseResult::Aborted {
+                    reason: SecretUseAbortReason::InvalidResponse,
                     message: error.to_string(),
                 },
                 Err(error.into()),
             ),
         },
-        RequestResult::Approved { profiles: None } => (
-            RequestResult::Aborted {
-                reason: AbortReason::InvalidResponse,
-                message: "approved response doesn't contain profiles".into(),
+        SecretUseResult::Approved { secrets: None } => (
+            SecretUseResult::Aborted {
+                reason: SecretUseAbortReason::InvalidResponse,
+                message: "approved response doesn't contain secrets".into(),
             },
             Err(RequestError::other(
-                "approved response doesn't contain profiles",
+                "approved response doesn't contain secrets",
             )),
         ),
-        RequestResult::Denied { reason, message } => (
-            RequestResult::Denied {
+        SecretUseResult::Denied { reason, message } => (
+            SecretUseResult::Denied {
                 reason,
                 message: message.clone(),
             },
             Err(RequestError::Denied { reason, message }),
         ),
-        RequestResult::Aborted { .. } => (
-            RequestResult::Aborted {
-                reason: AbortReason::InvalidResponse,
+        SecretUseResult::Aborted { .. } => (
+            SecretUseResult::Aborted {
+                reason: SecretUseAbortReason::InvalidResponse,
                 message: "received an ABORTED result in a response".into(),
             },
             Err(RequestError::other(
@@ -305,7 +309,7 @@ where
         _ = cancellation.as_mut() => true,
         result = relay.complete(&completion) => {
             result?;
-            progress(CredentialRequestProgress::Completed);
+            progress(SecretUseProgress::Completed);
             false
         }
     };
@@ -317,21 +321,21 @@ where
     exchange_result
 }
 
-fn credentials_from_profiles(
-    profiles: BTreeMap<String, ProfileMessage<BTreeMap<String, SecretValueMessage>>>,
-    requested_profiles: &[String],
-) -> io::Result<Credentials> {
+fn secret_use_output_from_secrets(
+    secrets: BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>,
+    requested_secrets: &[String],
+) -> io::Result<SecretUseOutput> {
     let mut environment = BTreeMap::new();
-    let received_profiles = profiles.keys().cloned().collect::<BTreeSet<_>>();
-    for profile in profiles.into_values() {
-        match profile.contents {
-            ProfileContentsMessage::Environment { variables } => {
+    let received_secrets = secrets.keys().cloned().collect::<BTreeSet<_>>();
+    for secret in secrets.into_values() {
+        match secret.contents {
+            SecretContentsMessage::Environment { variables } => {
                 for (name, variable) in variables {
                     if let Some(previous) = environment.get(&name)
                         && previous != &variable.value
                     {
                         return Err(io::Error::other(format!(
-                            "approved profiles contain different values for environment variable {name:?}"
+                            "approved secrets contain different values for environment variable {name:?}"
                         )));
                     }
                     environment.insert(name, variable.value);
@@ -339,33 +343,34 @@ fn credentials_from_profiles(
             }
         }
     }
-    let expected_profiles = requested_profiles.iter().cloned().collect::<BTreeSet<_>>();
-    if received_profiles != expected_profiles {
+    let expected_secrets = requested_secrets.iter().cloned().collect::<BTreeSet<_>>();
+    if received_secrets != expected_secrets {
         return Err(io::Error::other(format!(
-            "approved response contains profiles {:?}, expected {:?}",
-            received_profiles.into_iter().collect::<Vec<_>>(),
-            expected_profiles.into_iter().collect::<Vec<_>>()
+            "approved response contains secrets {:?}, expected {:?}",
+            received_secrets.into_iter().collect::<Vec<_>>(),
+            expected_secrets.into_iter().collect::<Vec<_>>()
         )));
     }
-    Ok(Credentials { environment })
+    Ok(SecretUseOutput { environment })
 }
 
-fn abort_reason(error: &websocket::Error) -> AbortReason {
+fn abort_reason(error: &websocket::Error) -> SecretUseAbortReason {
     match error {
-        websocket::Error::RetriesExhausted { .. } => AbortReason::TimedOut,
+        websocket::Error::RetriesExhausted { .. } => SecretUseAbortReason::TimedOut,
         websocket::Error::UnexpectedStatus(status) if (400..500).contains(status) => {
-            AbortReason::ClientError
+            SecretUseAbortReason::ClientError
         }
-        _ => AbortReason::InvalidResponse,
+        _ => SecretUseAbortReason::InvalidResponse,
     }
 }
 
 fn seal_aborted(
     session: &mut Session,
-    reason: AbortReason,
+    reason: SecretUseAbortReason,
     message: String,
 ) -> Option<crypto::Completion> {
-    let Ok(plaintext) = crate::protocol::encode(&RequestResult::Aborted { reason, message }) else {
+    let Ok(plaintext) = crate::protocol::encode(&SecretUseResult::Aborted { reason, message })
+    else {
         return None;
     };
     session.seal_completion(&plaintext).ok()
@@ -374,7 +379,7 @@ fn seal_aborted(
 async fn complete_cancelled(session: &mut Session, relay: &mut RelayExchange) {
     let Some(completion) = seal_aborted(
         session,
-        AbortReason::Cancelled,
+        SecretUseAbortReason::Cancelled,
         RequestError::Interrupted.to_string(),
     ) else {
         return;
@@ -403,18 +408,18 @@ impl From<websocket::Error> for RequestError {
 }
 
 #[derive(Serialize)]
-struct CredentialRequestPayload<'a> {
+struct SecretUseRequestPayload<'a> {
     method: Method,
-    profiles: &'a [String],
+    secrets: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
-    operation: OperationMessage<'a>,
+    operation: SecretUseOperationMessage<'a>,
     launcher_chain: &'a [String],
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum OperationMessage<'a> {
+enum SecretUseOperationMessage<'a> {
     Exec {
         command: &'a str,
         arguments: &'a [String],
@@ -455,24 +460,25 @@ impl From<StreamKind> for StreamKindMessage {
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
-enum RequestResult {
+enum SecretUseResult {
     Approved {
         #[serde(skip_serializing_if = "Option::is_none")]
-        profiles: Option<BTreeMap<String, ProfileMessage<BTreeMap<String, SecretValueMessage>>>>,
+        secrets:
+            Option<BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>>,
     },
     Denied {
-        reason: DenialReason,
+        reason: SecretUseDenialReason,
         message: String,
     },
     Aborted {
-        reason: AbortReason,
+        reason: SecretUseAbortReason,
         message: String,
     },
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum AbortReason {
+enum SecretUseAbortReason {
     Cancelled,
     TimedOut,
     InvalidResponse,
@@ -485,20 +491,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coalesces_equal_environment_values_from_different_profiles() {
-        let profiles = BTreeMap::from([
-            ("first".into(), environment_profile([("TOKEN", "same")])),
+    fn coalesces_equal_environment_values_from_different_secrets() {
+        let secrets = BTreeMap::from([
+            ("first".into(), environment_secret([("TOKEN", "same")])),
             (
                 "second".into(),
-                environment_profile([("TOKEN", "same"), ("OTHER", "value")]),
+                environment_secret([("TOKEN", "same"), ("OTHER", "value")]),
             ),
         ]);
         let requested = vec!["first".into(), "second".into()];
 
-        let credentials = credentials_from_profiles(profiles, &requested).unwrap();
+        let secret_use_output = secret_use_output_from_secrets(secrets, &requested).unwrap();
 
         assert_eq!(
-            credentials.environment,
+            secret_use_output.environment,
             BTreeMap::from([
                 ("OTHER".into(), "value".into()),
                 ("TOKEN".into(), "same".into()),
@@ -508,48 +514,47 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_environment_values() {
-        let profiles = BTreeMap::from([
-            ("first".into(), environment_profile([("TOKEN", "one")])),
-            ("second".into(), environment_profile([("TOKEN", "two")])),
+        let secrets = BTreeMap::from([
+            ("first".into(), environment_secret([("TOKEN", "one")])),
+            ("second".into(), environment_secret([("TOKEN", "two")])),
         ]);
         let requested = vec!["first".into(), "second".into()];
 
-        let error = credentials_from_profiles(profiles, &requested)
+        let error = secret_use_output_from_secrets(secrets, &requested)
             .err()
             .expect("conflicting values should fail");
         assert_eq!(
             error.to_string(),
-            "approved profiles contain different values for environment variable \"TOKEN\""
+            "approved secrets contain different values for environment variable \"TOKEN\""
         );
     }
 
     #[test]
-    fn rejects_a_different_profile_set() {
-        let profiles =
-            BTreeMap::from([("other".into(), environment_profile([("TOKEN", "value")]))]);
+    fn rejects_a_different_secret_set() {
+        let secrets = BTreeMap::from([("other".into(), environment_secret([("TOKEN", "value")]))]);
         let requested = vec!["requested".into()];
 
-        let error = credentials_from_profiles(profiles, &requested)
+        let error = secret_use_output_from_secrets(secrets, &requested)
             .err()
-            .expect("a different profile set should fail");
+            .expect("a different secret set should fail");
         assert_eq!(
             error.to_string(),
-            "approved response contains profiles [\"other\"], expected [\"requested\"]"
+            "approved response contains secrets [\"other\"], expected [\"requested\"]"
         );
     }
 
-    fn environment_profile<const N: usize>(
+    fn environment_secret<const N: usize>(
         variables: [(&str, &str); N],
-    ) -> ProfileMessage<BTreeMap<String, SecretValueMessage>> {
-        ProfileMessage {
+    ) -> SecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
+        SecretMessage {
             description: None,
-            contents: ProfileContentsMessage::Environment {
+            contents: SecretContentsMessage::Environment {
                 variables: variables
                     .into_iter()
                     .map(|(name, value)| {
                         (
                             name.into(),
-                            SecretValueMessage {
+                            EnvironmentVariableMessage {
                                 value: value.into(),
                             },
                         )

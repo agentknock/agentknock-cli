@@ -21,25 +21,25 @@ use support::{
     open_request, receive_json, send_json, websocket_server,
 };
 
-fn approved_environment(profile: &str, variables: serde_json::Map<String, Value>) -> Value {
-    let profile_name = profile.to_owned();
+fn approved_environment(secret: &str, variables: serde_json::Map<String, Value>) -> Value {
+    let secret_name = secret.to_owned();
     let variables = variables
         .into_iter()
         .map(|(name, value)| (name, json!({"value": value})))
         .collect::<serde_json::Map<_, _>>();
-    let profile = json!({
+    let secret = json!({
         "description": null,
         "type": "environment",
         "variables": variables,
     });
     json!({
         "result": "APPROVED",
-        "profiles": serde_json::Map::from_iter([(profile_name, profile)]),
+        "secrets": serde_json::Map::from_iter([(secret_name, secret)]),
     })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn requests_credentials_and_executes_with_the_returned_environment() {
+async fn requests_secret_use_and_executes_with_the_returned_environment() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
@@ -55,8 +55,8 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
         assert!(request.get("pairing_id").is_none());
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &request);
-        assert_eq!(plaintext["method"], "CredentialRequest");
-        assert_eq!(plaintext["profiles"], json!(["github", "cloudflare"]));
+        assert_eq!(plaintext["method"], "SecretUse");
+        assert_eq!(plaintext["secrets"], json!(["github", "cloudflare"]));
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
@@ -102,7 +102,7 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
                     &key,
                     &json!({
                         "result": "APPROVED",
-                        "profiles": {
+                        "secrets": {
                             "github": {
                                 "description": "GitHub access",
                                 "type": "environment",
@@ -131,7 +131,7 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
         assert_eq!(completion["kind"], "completion");
         let completion_plaintext = open_completion(&mut context, &completion["payload"]);
         assert_eq!(completion_plaintext["result"], "APPROVED");
-        assert!(completion_plaintext.get("profiles").is_none());
+        assert!(completion_plaintext.get("secrets").is_none());
         send_json(
             &mut socket,
             json!({
@@ -152,9 +152,9 @@ async fn requests_credentials_and_executes_with_the_returned_environment() {
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "exec",
-            "-p",
+            "-s",
             "github",
-            "-p",
+            "-s",
             "cloudflare",
             "--reason",
             "integration test",
@@ -252,7 +252,7 @@ async fn reports_and_executes_a_shebang_script() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-p", "test", "--", script.to_str().unwrap()])
+        .args(["exec", "-s", "test", "--", script.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -342,7 +342,7 @@ async fn executes_the_selected_native_file_after_its_path_is_replaced() {
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("PATH", home.path())
         .arg("exec")
-        .arg("-p")
+        .arg("-s")
         .arg("test")
         .arg("--")
         .arg("selected-native")
@@ -420,7 +420,7 @@ async fn restores_sigpipe_before_executing_the_command() {
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "exec",
-            "-p",
+            "-s",
             "test",
             "--",
             "sh",
@@ -447,14 +447,14 @@ fn native_exec_probe() {
 }
 
 #[test]
-fn rejects_a_missing_command_before_requesting_credentials() {
+fn rejects_a_missing_command_before_requesting_secret_use() {
     let home = TestHome::active();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", "ws://127.0.0.1:1")
         .args([
             "exec",
-            "-p",
+            "-s",
             "test",
             "--",
             "agentknock-command-that-does-not-exist",
@@ -466,7 +466,7 @@ fn rejects_a_missing_command_before_requesting_credentials() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("wasn't found"), "{stderr}");
     assert!(
-        stderr.contains("No profile access request was sent."),
+        stderr.contains("No secret use request was sent."),
         "{stderr}"
     );
     assert!(!stderr.contains("relay"), "{stderr}");
@@ -475,7 +475,7 @@ fn rejects_a_missing_command_before_requesting_credentials() {
 #[test]
 fn explains_that_the_command_separator_is_required() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .args(["exec", "-p", "github", "gh", "issue", "list"])
+        .args(["exec", "-s", "github", "gh", "issue", "list"])
         .output()
         .unwrap();
 
@@ -485,7 +485,7 @@ fn explains_that_the_command_separator_is_required() {
         String::from_utf8(output.stderr).unwrap(),
         "error: add `--` before the command to run\n\
          \n\
-         Usage: agentknock exec -p <PROFILE>... -- <COMMAND> [ARGUMENT]...\n\
+         Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...\n\
          \n\
          For more information, run 'agentknock exec --help'.\n"
     );
@@ -554,7 +554,7 @@ async fn resends_the_exact_request_when_the_connection_closes_before_ack() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-p", "github", "--", "env"])
+        .args(["exec", "-s", "github", "--", "env"])
         .output()
         .unwrap();
     assert!(
@@ -661,7 +661,7 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-p", "github", "--", "env"])
+        .args(["exec", "-s", "github", "--", "env"])
         .output()
         .unwrap();
     assert!(
@@ -720,7 +720,7 @@ async fn signal_before_response_sends_an_aborted_completion() {
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-p", "github", "--", "env"])
+        .args(["exec", "-s", "github", "--", "env"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -805,7 +805,7 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-p", "github", "--", "env"])
+        .args(["exec", "-s", "github", "--", "env"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

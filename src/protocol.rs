@@ -4,11 +4,11 @@ pub(crate) const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Serialize)]
 pub(crate) enum Method {
-    CredentialRequest,
+    SecretUse,
     PairingFinish,
     PairingRemove,
-    ProfileList,
-    ProfileUpload,
+    SecretList,
+    SecretUpload,
 }
 
 pub(crate) fn encode<T>(contents: &T) -> Result<Vec<u8>, serde_json::Error>

@@ -1,21 +1,21 @@
 mod config;
-mod credentials;
 mod crypto;
 mod pairing;
-mod profiles;
 mod protocol;
+mod secret_use;
+mod secrets;
 mod websocket;
 
 pub use config::ConfigurationError;
-pub use credentials::{
-    CredentialRequest, CredentialRequestProgress, Credentials, DenialReason, ExecutableMode,
-    RequestError, RequestOperation, StreamKind, request_credentials,
-};
 pub use pairing::{
     PairingProgress, PairingRemoveError, PairingSas, abort_pairing, finish_pairing,
     force_remove_pairing, remove_pairing, start_pairing,
 };
-pub use profiles::{
-    EnvironmentProfile, Profile, ProfileListProgress, ProfileUploadError, ProfileUploadMode,
-    ProfileUploadProgress, Profiles, list_profiles, upload_profile,
+pub use secret_use::{
+    ExecutableMode, RequestError, SecretUseDenialReason, SecretUseOperation, SecretUseOutput,
+    SecretUseProgress, SecretUseRequest, StreamKind, request_secret_use,
+};
+pub use secrets::{
+    EnvironmentSecret, Secret, SecretListProgress, SecretUploadError, SecretUploadMode,
+    SecretUploadProgress, Secrets, list_secrets, upload_secret,
 };

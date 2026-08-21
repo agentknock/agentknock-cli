@@ -37,8 +37,8 @@ path = "tests/exec.rs"
 required-features = ["integration-tests"]
 
 [[test]]
-name = "list"
-path = "tests/list.rs"
+name = "secret_list"
+path = "tests/secret_list.rs"
 required-features = ["integration-tests"]
 
 [[test]]
@@ -47,6 +47,6 @@ path = "tests/pairing.rs"
 required-features = ["integration-tests"]
 
 [[test]]
-name = "upload"
-path = "tests/upload.rs"
+name = "secret_upload"
+path = "tests/secret_upload.rs"
 required-features = ["integration-tests"]

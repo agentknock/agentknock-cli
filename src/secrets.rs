@@ -15,7 +15,7 @@ use crate::{
 
 #[derive(Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Profile {
+pub enum Secret {
     #[non_exhaustive]
     Environment {
         description: Option<String>,
@@ -23,17 +23,17 @@ pub enum Profile {
     },
 }
 
-pub type Profiles = BTreeMap<String, Profile>;
+pub type Secrets = BTreeMap<String, Secret>;
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct EnvironmentProfile {
+pub struct EnvironmentSecret {
     pub name: String,
     pub description: Option<String>,
     pub variables: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProfileUploadMode {
+pub enum SecretUploadMode {
     Create,
     Replace,
     Update,
@@ -41,7 +41,7 @@ pub enum ProfileUploadMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum ProfileListProgress {
+pub enum SecretListProgress {
     Preparing,
     WaitingForDelivery,
     WaitingForResponse,
@@ -51,7 +51,7 @@ pub enum ProfileListProgress {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum ProfileUploadProgress {
+pub enum SecretUploadProgress {
     Preparing,
     WaitingForDelivery,
     WaitingForResponse,
@@ -61,36 +61,36 @@ pub enum ProfileUploadProgress {
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum ProfileUploadError {
+pub enum SecretUploadError {
     #[error(transparent)]
     Request(#[from] RequestError),
 
-    #[error("the device rejected the profile proposal: {message}")]
+    #[error("the device rejected the secret upload: {message}")]
     Rejected { message: String },
 }
 
-impl From<ConfigurationError> for ProfileUploadError {
+impl From<ConfigurationError> for SecretUploadError {
     fn from(error: ConfigurationError) -> Self {
         Self::Request(error.into())
     }
 }
 
-impl From<crate::websocket::Error> for ProfileUploadError {
+impl From<crate::websocket::Error> for SecretUploadError {
     fn from(error: crate::websocket::Error) -> Self {
         Self::Request(error.into())
     }
 }
 
-pub async fn list_profiles<P>(mut progress: P) -> Result<Profiles, RequestError>
+pub async fn list_secrets<P>(mut progress: P) -> Result<Secrets, RequestError>
 where
-    P: FnMut(ProfileListProgress),
+    P: FnMut(SecretListProgress),
 {
-    progress(ProfileListProgress::Preparing);
+    progress(SecretListProgress::Preparing);
     prepare_request()?;
     let pairing = read_pairing()?;
     let request_id = Ulid::generate();
     let plaintext = crate::protocol::encode(&ListRequest {
-        method: Method::ProfileList,
+        method: Method::SecretList,
     })
     .map_err(RequestError::other)?;
     let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
@@ -99,13 +99,13 @@ where
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
-    progress(ProfileListProgress::WaitingForDelivery);
+    progress(SecretListProgress::WaitingForDelivery);
     let response = relay
         .request(&request, || {
-            progress(ProfileListProgress::WaitingForResponse);
+            progress(SecretListProgress::WaitingForResponse);
         })
         .await?;
-    progress(ProfileListProgress::Completing);
+    progress(SecretListProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(RequestError::other)?;
@@ -118,31 +118,31 @@ where
         .seal_completion(&plaintext)
         .map_err(RequestError::other)?;
     relay.complete(&completion).await?;
-    progress(ProfileListProgress::Completed);
+    progress(SecretListProgress::Completed);
 
     Ok(response
-        .profiles
+        .secrets
         .into_iter()
-        .map(|(name, profile)| (name, profile.into()))
+        .map(|(name, secret)| (name, secret.into()))
         .collect())
 }
 
-pub async fn upload_profile<P>(
-    profile: &EnvironmentProfile,
-    mode: ProfileUploadMode,
+pub async fn upload_secret<P>(
+    secret: &EnvironmentSecret,
+    mode: SecretUploadMode,
     mut progress: P,
-) -> Result<(), ProfileUploadError>
+) -> Result<(), SecretUploadError>
 where
-    P: FnMut(ProfileUploadProgress),
+    P: FnMut(SecretUploadProgress),
 {
-    progress(ProfileUploadProgress::Preparing);
+    progress(SecretUploadProgress::Preparing);
     prepare_request()?;
     let pairing = read_pairing()?;
     let request_id = Ulid::generate();
     let request_payload = UploadRequest {
-        method: Method::ProfileUpload,
+        method: Method::SecretUpload,
         mode: mode.into(),
-        profile: NamedProfileMessage::from(profile),
+        secret: NamedSecretMessage::from(secret),
     };
     let plaintext = crate::protocol::encode(&request_payload).map_err(RequestError::other)?;
     let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
@@ -151,13 +151,13 @@ where
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
-    progress(ProfileUploadProgress::WaitingForDelivery);
+    progress(SecretUploadProgress::WaitingForDelivery);
     let response = relay
         .request(&request, || {
-            progress(ProfileUploadProgress::WaitingForResponse);
+            progress(SecretUploadProgress::WaitingForResponse);
         })
         .await?;
-    progress(ProfileUploadProgress::Completing);
+    progress(SecretUploadProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(RequestError::other)?;
@@ -170,11 +170,11 @@ where
         .seal_completion(&completion)
         .map_err(RequestError::other)?;
     let _ = relay.complete_briefly(&completion).await;
-    progress(ProfileUploadProgress::Completed);
+    progress(SecretUploadProgress::Completed);
 
     match response {
         UploadResult::Received => Ok(()),
-        UploadResult::Rejected { message } => Err(ProfileUploadError::Rejected { message }),
+        UploadResult::Rejected { message } => Err(SecretUploadError::Rejected { message }),
     }
 }
 
@@ -196,30 +196,30 @@ struct EmptyMessage {}
 
 #[derive(Deserialize)]
 struct ListResponse {
-    profiles: BTreeMap<String, ProfileMessage<Vec<String>>>,
+    secrets: BTreeMap<String, SecretMessage<Vec<String>>>,
 }
 
 #[derive(Serialize)]
 struct UploadRequest {
     method: Method,
-    mode: ProfileUploadModeMessage,
-    profile: NamedProfileMessage<BTreeMap<String, SecretValueMessage>>,
+    mode: SecretUploadModeMessage,
+    secret: NamedSecretMessage<BTreeMap<String, EnvironmentVariableMessage>>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum ProfileUploadModeMessage {
+enum SecretUploadModeMessage {
     Create,
     Replace,
     Update,
 }
 
-impl From<ProfileUploadMode> for ProfileUploadModeMessage {
-    fn from(mode: ProfileUploadMode) -> Self {
+impl From<SecretUploadMode> for SecretUploadModeMessage {
+    fn from(mode: SecretUploadMode) -> Self {
         match mode {
-            ProfileUploadMode::Create => Self::Create,
-            ProfileUploadMode::Replace => Self::Replace,
-            ProfileUploadMode::Update => Self::Update,
+            SecretUploadMode::Create => Self::Create,
+            SecretUploadMode::Replace => Self::Replace,
+            SecretUploadMode::Update => Self::Update,
         }
     }
 }
@@ -232,45 +232,45 @@ enum UploadResult {
 }
 
 #[derive(Deserialize, Serialize)]
-pub(crate) struct ProfileMessage<T> {
+pub(crate) struct SecretMessage<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(flatten)]
-    pub(crate) contents: ProfileContentsMessage<T>,
+    pub(crate) contents: SecretContentsMessage<T>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ProfileContentsMessage<T> {
+pub(crate) enum SecretContentsMessage<T> {
     Environment { variables: T },
 }
 
 #[derive(Deserialize, Serialize)]
-pub(crate) struct SecretValueMessage {
+pub(crate) struct EnvironmentVariableMessage {
     pub(crate) value: String,
 }
 
 #[derive(Serialize)]
-struct NamedProfileMessage<T> {
+struct NamedSecretMessage<T> {
     name: String,
     #[serde(flatten)]
-    profile: ProfileMessage<T>,
+    secret: SecretMessage<T>,
 }
 
-impl From<&EnvironmentProfile> for NamedProfileMessage<BTreeMap<String, SecretValueMessage>> {
-    fn from(profile: &EnvironmentProfile) -> Self {
+impl From<&EnvironmentSecret> for NamedSecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
+    fn from(secret: &EnvironmentSecret) -> Self {
         Self {
-            name: profile.name.clone(),
-            profile: ProfileMessage {
-                description: profile.description.clone(),
-                contents: ProfileContentsMessage::Environment {
-                    variables: profile
+            name: secret.name.clone(),
+            secret: SecretMessage {
+                description: secret.description.clone(),
+                contents: SecretContentsMessage::Environment {
+                    variables: secret
                         .variables
                         .iter()
                         .map(|(name, value)| {
                             (
                                 name.clone(),
-                                SecretValueMessage {
+                                EnvironmentVariableMessage {
                                     value: value.clone(),
                                 },
                             )
@@ -282,14 +282,14 @@ impl From<&EnvironmentProfile> for NamedProfileMessage<BTreeMap<String, SecretVa
     }
 }
 
-impl From<ProfileMessage<Vec<String>>> for Profile {
-    fn from(profile: ProfileMessage<Vec<String>>) -> Self {
-        match profile.contents {
-            ProfileContentsMessage::Environment { mut variables } => {
+impl From<SecretMessage<Vec<String>>> for Secret {
+    fn from(secret: SecretMessage<Vec<String>>) -> Self {
+        match secret.contents {
+            SecretContentsMessage::Environment { mut variables } => {
                 variables.sort();
                 variables.dedup();
                 Self::Environment {
-                    description: profile.description,
+                    description: secret.description,
                     variables,
                 }
             }

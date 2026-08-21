@@ -13,7 +13,7 @@ use std::{
     ptr,
 };
 
-use agentknock::{Credentials, ExecutableMode};
+use agentknock::{ExecutableMode, SecretUseOutput};
 use sha2::{Digest as _, Sha256};
 
 const HASH_LENGTH: usize = 32;
@@ -153,13 +153,13 @@ impl SelectedExecutable {
     pub fn execute(
         self,
         arguments: &[String],
-        credentials: Credentials,
+        secret_use_output: SecretUseOutput,
         signal_state: &SignalState,
         blocked_signals: BlockedSignals,
     ) -> io::Result<()> {
         self.verify_hash()?;
         let arguments = c_arguments(&self.command, arguments)?;
-        let environment = c_environment(credentials)?;
+        let environment = c_environment(secret_use_output)?;
         if blocked_signals.interrupted()? {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -228,7 +228,7 @@ impl SelectedExecutable {
         if actual != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the selected command changed after the profile access request",
+                "the selected command changed after the secret use request",
             ));
         }
         Ok(())
@@ -481,13 +481,13 @@ fn c_arguments(command: &str, arguments: &[String]) -> io::Result<Vec<CString>> 
         .collect()
 }
 
-fn c_environment(credentials: Credentials) -> io::Result<Vec<CString>> {
+fn c_environment(secret_use_output: SecretUseOutput) -> io::Result<Vec<CString>> {
     let mut environment = env::vars_os().collect::<BTreeMap<_, _>>();
-    for (name, value) in credentials.into_environment() {
+    for (name, value) in secret_use_output.into_environment() {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("profile response contains invalid environment variable name {name:?}"),
+                format!("secret response contains invalid environment variable name {name:?}"),
             ));
         }
         if value.contains('\0') {

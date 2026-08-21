@@ -7,7 +7,7 @@ Last reviewed: 2026-08-16
 ## Decision
 
 On Linux, Agentknock should resolve and open the requested executable before it
-sends the credential request. It should keep that file descriptor through the
+sends the secret use request. It should keep that file descriptor through the
 approval wait and, for a native executable, replace itself with that descriptor
 using `execveat(AT_EMPTY_PATH)`.
 
@@ -24,7 +24,8 @@ modify in place, such as a normally installed `/usr/bin/ssh`.
 
 Agentknock must not describe this as a sudo-like security boundary. It does not
 change user ID, capabilities, namespaces, or operating-system authority. It
-delivers credentials to a process controlled by the same user that invoked it.
+delivers returned environment variable values to a process controlled by the
+same user that invoked it.
 The executable's interpreter, dynamic loader, shared libraries, configuration,
 plugins, working-directory contents, and descendant commands remain outside the
 guarantee. An executable that the same user can modify in place is not made
@@ -41,7 +42,7 @@ Agentknock should also send a SHA-256 hash of the selected executable when the
 file is readable. The hash is not useful standalone evidence for a person or an
 LLM, and Agentknock should not build a history of executable hashes. Its narrow
 purpose is to give the device an exact equality condition for a reusable grant,
-such as "allow this executable to use these profiles for four hours." The grant
+such as "allow this executable to use these secrets for four hours." The grant
 stores the hash from the approved request and later requests must match it.
 
 Agentknock should otherwise remain a transparent, same-user launcher. It should
@@ -56,8 +57,8 @@ creating a meaningful secret boundary here.
 
 The research followed six steps:
 
-1. Audit Agentknock's current resolution, request construction, credential
-   overlay, signal handling, and process replacement code.
+1. Audit Agentknock's current resolution, secret use request construction,
+   environment overlay, signal handling, and process replacement code.
 2. Establish the exact Linux and POSIX behavior of `open`, `execve`, `execvp`,
    `execveat`, effective-access checks, scripts, descriptors, signals, dynamic
    loading, process environments, ptrace, and core dumps from primary sources.
@@ -82,18 +83,18 @@ particular, 1Password's internal executable-resolution mechanics remain unknown.
 
 The relevant assets are:
 
-- the credential values returned by the paired device;
+- the environment variable values returned by the paired device;
 - the command, arguments, working directory, and execution context shown for
   approval;
 - the binding between the approved request and the process that receives the
-  credential values; and
+  environment variable values; and
 - normal command-line behavior, including direct argument passing and process
   replacement.
 
 The desired execution properties are:
 
 1. Agentknock never introduces an implicit shell.
-2. Credential response data cannot change which top-level native executable was
+2. Secret use response data cannot change which top-level native executable was
    selected before approval.
 3. Ordinary pathname replacement during the approval wait cannot substitute a
    different top-level native executable.
@@ -101,7 +102,7 @@ The desired execution properties are:
    originally typed `argv[0]`. A script receives the kernel's normal shebang
    argument transformation.
 5. Agentknock disappears after protocol completion, so no unnecessary
-   supervisor retains decrypted credentials or changes signal and process
+   supervisor retains returned secret values or changes signal and process
    behavior.
 6. Failures are explicit. Agentknock must not silently downgrade from pinned
    native execution to a new pathname lookup.
@@ -115,7 +116,7 @@ The useful guarantee assumes that:
 - the kernel and the invoking user's operating-system account are not fully
   compromised; and
 - the paired device and the end-to-end protocol authorize the returned
-  credential values.
+  environment variable values.
 
 These assumptions are narrower than assuming that all user-controlled files or
 environment values are trustworthy. A user-local tool may still be replaced by
@@ -143,9 +144,9 @@ protection. Clearing `LD_PRELOAD` immediately before the final `exec` would be
 too late to protect Agentknock itself.
 
 Environment delivery is therefore an inheritance mechanism, not containment.
-This is consistent with the product threat model: once a credential is released,
-the approved process tree can use and disclose it. Executable pinning improves
-the fidelity of what was approved; it does not make credential delivery safe
+This is consistent with the product threat model: once a secret value is
+released, the approved process tree can use and disclose it. Executable pinning
+improves the fidelity of what was approved; it does not make secret use safe
 from a malicious invoking account.
 
 ## Current Agentknock behavior
@@ -156,7 +157,7 @@ The current Linux/Unix execution path has four important weaknesses:
    `std::process::Command::exec` performs another search after approval. The two
    searches are not bound together.
 2. The response environment is added before `Command::exec`. If a returned
-   profile contains `PATH`, the final `execvp` lookup can select a different
+   secret provides `PATH`, the final `execvp` lookup can select a different
    executable from the one reported in the request.
 3. The metadata resolver accepts a regular file when any execute bit is set. It
    does not test effective execute access for the invoking process, so its first
@@ -249,7 +250,7 @@ semantics.
 | Executable hash | Adopt only as a reusable-grant match key | A stored grant supplies the expected value. The hash is not standalone approval evidence or remote attestation. |
 | Sealed executable copy | Reject | Changes executable identity and breaks capabilities, labels, self-location, and other filesystem semantics. |
 | Preserve inherited environment | Adopt | Required for transparent general-purpose command behavior. |
-| Overlay approved variables | Adopt | Matches the credential-delivery contract; collisions must be deterministic. |
+| Overlay approved environment variables | Adopt | Matches the secret use contract; collisions must be deterministic. |
 | Environment denylist | Reject as a security boundary | Incomplete, too late for Agentknock itself, and incompatible with some real tools. |
 | Clean environment | Defer to an explicit future mode | Potentially useful for a separate workflow, but too disruptive as the default. |
 | Close Agentknock-owned descriptors | Adopt | Prevents accidental relay, config, lock, and runtime descriptor leakage. |
@@ -278,17 +279,17 @@ This type belongs in the CLI implementation. The Agentknock library receives
 only the request metadata and remains unaware of file descriptors, process
 replacement, or command-line parsing.
 
-Do not send device/inode numbers to the phone. They are useful implementation
+Do not send device/inode numbers to the device. They are useful implementation
 identifiers but poor approval context for either a person or an LLM. The
 resolved path remains the useful displayed fact. Do not add a writability field
-until a phone policy or approval UI will actually use it; it would be
+until a device policy or approval UI will actually use it; it would be
 host-reported advisory context, not attestation.
 
 The initial strong Linux implementation should require Linux 5.8 or newer and a
 mounted, usable `/proc/self/fd`. `execveat` itself arrived in Linux 3.19, but the
 fd-relative effective-access check used here requires `faccessat2` from Linux
 5.8. The reference Debian target satisfies both requirements. On an older kernel
-or a host without the required procfs view, fail before sending a credential
+or a host without the required procfs view, fail before sending a secret use
 request. Do not silently substitute a mode-bit-only check or a metadata path
 that was not derived from the opened file. The glibc `execveat` wrapper requires
 glibc 2.34; using the Linux syscall directly avoids adding that separate
@@ -300,7 +301,7 @@ Use this sequence:
 
 1. Open the current directory as
    `O_PATH|O_DIRECTORY|O_CLOEXEC`, then capture its display name and the original
-   `PATH` before any credentials are requested. The directory descriptor, not a
+   `PATH` before secret use is requested. The directory descriptor, not a
    reconstructed `getcwd()` string, is the base for every relative open.
 2. If the command contains `/`, open an absolute path directly or use `openat`
    relative to the captured current-directory descriptor.
@@ -319,7 +320,7 @@ Use this sequence:
    preflight. `execveat` remains the authoritative kernel permission check.
 7. Derive the display path by reading `/proc/self/fd/<fd>` after opening, rather
    than canonicalizing a name and opening it later. If the selected display path
-   is not valid UTF-8, fail before the credential request because the current
+   is not valid UTF-8, fail before the secret use request because the current
    protocol represents it as a JSON string.
 8. Keep the descriptor alive through request, response, and completion.
 
@@ -340,7 +341,7 @@ setup to execution but would not bind the executable shown during approval.
 
 The resolver should return a real error rather than `None`. A missing,
 non-executable, non-regular, inaccessible, or non-UTF-8 target should stop before
-any request is sent. This avoids asking for credentials for a command that
+any request is sent. This avoids requesting secret use for a command that
 Agentknock already knows it cannot launch.
 
 ### 3. Classify scripts before approval
@@ -371,7 +372,7 @@ Continue to send:
 - the optional executable hash;
 - the executable mode, as `BINARY` or `SCRIPT`;
 - the captured working directory;
-- stream kinds, launcher chain, profiles, and reason; and
+- stream kinds, launcher chain, secrets, and reason; and
 - other existing request context.
 
 The command and arguments must remain separate values. A joined command line is
@@ -380,7 +381,7 @@ reconstruct the original argument vector.
 
 The resolved path is authenticated host-reported context. It is not remote
 attestation. A compromised host can lie in the request or interfere with the
-launcher, so the phone must not present it as independently verified by the
+launcher, so the device must not present it as independently verified by the
 operating system.
 
 #### Executable hash for reusable grants
@@ -409,14 +410,14 @@ baseline for a time-bounded executable grant is therefore:
 
 - the exact `client_id`;
 - the operation or method;
-- the exact, canonicalized profile set;
+- the exact, canonicalized secret set;
 - the original command or `argv[0]`;
 - the resolved executable path;
 - the executable hash; and
 - the grant expiry.
 
-Sort and deduplicate profiles before creating or matching this key. A request
-for additional profiles must not match a grant for a smaller set. Arguments
+Sort and deduplicate secrets before creating or matching this key. A request
+for additional secrets must not match a grant for a smaller set. Arguments
 need a separately defined policy: the same `ssh`, `gh`, or `aws` executable can
 perform materially different operations, so path and hash must not silently
 mean "all arguments are approved." Exact arguments, a constrained command
@@ -454,8 +455,8 @@ After a valid approved response and completion exchange:
 
 1. Start with the environment inherited by Agentknock, using `vars_os` or an
    equivalent byte-preserving API so unrelated non-UTF-8 entries survive.
-2. Overlay the returned profile variables, with returned values winning on a
-   name collision. This preserves the current intended credential-injection
+2. Overlay the returned environment variables, with returned values winning on
+   a name collision. This preserves the current intended secret use
    behavior.
 3. Reject an empty variable name, a name containing `=` or NUL, or a value
    containing NUL. The protocol is UTF-8, so no additional byte-encoding policy
@@ -546,7 +547,7 @@ In particular, Agentknock must not set `no_new_privs`. That flag is inherited an
 irreversible, and it prevents set-user-ID, set-group-ID, and file-capability
 transitions while also affecting LSM behavior. It would unexpectedly break
 commands such as `sudo` and would not stop a same-user target from reading the
-credentials it was given.
+environment variable values it was given.
 
 Do not allocate a PTY or keep a monitoring parent. Those mechanisms are useful
 for sudo I/O policy, output masking, renewal, or process supervision, but they
@@ -556,7 +557,7 @@ conflict with Agentknock's direct-replacement contract.
 
 After implementation, documentation and UI may accurately say:
 
-- Agentknock resolves the top-level command before requesting credentials.
+- Agentknock resolves the top-level command before requesting secret use.
 - On Linux, Agentknock pins a native top-level executable and executes that same
   opened filesystem object after approval.
 - Agentknock passes the approved argument vector without an implicit shell.
@@ -574,7 +575,7 @@ They must not say:
 - that descriptor execution is unobservable through `AT_EXECFN`, auditing,
   path-oriented policy, or self-inspection;
 - that the process is unaffected by its environment;
-- that credentials are hidden from the approved process tree or other actors
+- that secret values are hidden from the approved process tree or other actors
   with sufficient same-user inspection authority; or
 - that Agentknock provides sudo, sandbox, or privilege-separation guarantees.
 
@@ -655,14 +656,14 @@ The implementation can remain small:
    dependency is appropriate if its API is used. A small audited `libc` wrapper
    is also viable; avoid a new abstraction-heavy process library.
 2. Replace `resolve_command_path` with the owning `SelectedExecutable` resolver.
-3. Pass its display path and optional SHA-256 hash into the existing credential
+3. Pass its display path and optional SHA-256 hash into the existing secret use
    request.
 4. Retain the object across the asynchronous WebSocket exchange.
 5. Replace the current `ProcessCommand::exec` function with explicit environment
    construction, signal restoration, and `execveat`/`execve` calls.
 6. Keep the entire change in the CLI except for any protocol field that is
-   explicitly chosen for the phone. Credential retrieval remains library work;
-   process selection and replacement remain CLI work.
+   explicitly chosen for the device. Secret use remains library work; process
+   selection and replacement remain CLI work.
 
 No daemon, helper process, privilege transition, hash-history database, new
 client config file, or client-side policy language is required. Reusable grants
@@ -679,14 +680,14 @@ and their expected hashes belong on the approving device.
 - Empty and relative `PATH` components use the captured working directory.
 - A command containing `/` does not search `PATH`.
 - An absent `PATH` uses `_CS_PATH`.
-- A selected non-UTF-8 display path fails before any credential request.
+- A selected non-UTF-8 display path fails before any secret use request.
 - Agentknock's own descriptors never replace the standard-descriptor state
   established by the Rust runtime.
 - Relative qualified commands and relative or empty `PATH` entries resolve from
   the captured current-directory descriptor even if its pathname is renamed.
 - Lookup continues and stops on the documented Linux/glibc error classes and
   preserves final `EACCES` precedence.
-- Linux older than 5.8 or a missing `/proc/self/fd` fails before the credential
+- Linux older than 5.8 or a missing `/proc/self/fd` fails before the secret use
   request.
 
 ### Identity-race integration tests
@@ -710,11 +711,11 @@ Use a test relay that pauses between request and approval:
   lookup.
 - Replacing or retargeting the pathname after selection does not change the hash
   sent for the retained object.
-- A later request with the same client, method, exact profile set, original
+- A later request with the same client, method, exact secret set, original
   command, resolved path, and hash matches the grant.
 - Changing either the file contents or resolved path prevents a match, including
   when identical bytes exist at a different path.
-- A larger or smaller profile set does not match.
+- A larger or smaller secret set does not match.
 - An unreadable execute-only file omits the hash and cannot use an
   executable-hash-bound reusable grant.
 - An in-place modification detected after approval aborts execution, while the
