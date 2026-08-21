@@ -12,10 +12,9 @@ use crate::{
     ConfigurationError, ProtocolError, RequestError,
     config::{
         CanonicalUlid, LockedPairing, abort_pending_pairing, current_timestamp,
-        ensure_pairing_absent, finish_pending_pairing, lock_pairing_for_rotation,
-        lock_pairing_if_rotated_before, pairing_path, read_pairing, read_pairing_from,
-        read_pending_pairing, remove_active_pairing, remove_pairing as remove_pairing_file,
-        write_pending_pairing,
+        ensure_pairing_absent, finish_pending_pairing, lock_pairing_if_rotated_before,
+        pairing_path, read_pairing, read_pairing_from, read_pending_pairing, remove_active_pairing,
+        remove_pairing as remove_pairing_file, write_pending_pairing,
     },
     crypto::{
         self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
@@ -51,14 +50,7 @@ impl fmt::Display for PairingSas {
     }
 }
 
-pub async fn start_pairing(address: &str) -> Result<PairingSas, RequestError> {
-    start_pairing_with_progress(address, |_| {}).await
-}
-
-pub async fn start_pairing_with_progress<P>(
-    address: &str,
-    mut progress: P,
-) -> Result<PairingSas, RequestError>
+pub async fn start_pairing<P>(address: &str, mut progress: P) -> Result<PairingSas, RequestError>
 where
     P: FnMut(PairingProgress),
 {
@@ -121,11 +113,7 @@ fn is_valid_pairing_address(address: &str) -> bool {
         .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
-pub async fn finish_pairing() -> Result<(), RequestError> {
-    finish_pairing_with_progress(|_| {}).await
-}
-
-pub async fn finish_pairing_with_progress<P>(mut progress: P) -> Result<(), RequestError>
+pub async fn finish_pairing<P>(mut progress: P) -> Result<(), RequestError>
 where
     P: FnMut(PairingProgress),
 {
@@ -177,11 +165,7 @@ pub fn force_remove_pairing() -> Result<(), ConfigurationError> {
     remove_pairing_file()
 }
 
-pub async fn remove_pairing() -> Result<(), PairingRemoveError> {
-    remove_pairing_with_progress(|_| {}).await
-}
-
-pub async fn remove_pairing_with_progress<P>(mut progress: P) -> Result<(), PairingRemoveError>
+pub async fn remove_pairing<P>(mut progress: P) -> Result<(), PairingRemoveError>
 where
     P: FnMut(PairingProgress),
 {
@@ -234,16 +218,7 @@ where
     Ok((relay, completion))
 }
 
-pub fn rotate_psk() -> Result<(), RotationError> {
-    rotate_psk_at(&pairing_path()?, current_timestamp()?)
-}
-
-fn rotate_psk_at(path: &Path, rotated_at: u64) -> Result<(), RotationError> {
-    let pairing = lock_pairing_for_rotation(path)?;
-    rotate_locked(pairing, rotated_at)
-}
-
-pub fn maybe_rotate_psk() -> Result<bool, RotationError> {
+pub(crate) fn maybe_rotate_psk() -> Result<bool, RotationError> {
     maybe_rotate_psk_at(&pairing_path()?, current_timestamp()?)
 }
 
@@ -268,7 +243,7 @@ fn rotate_locked(pairing: LockedPairing, rotated_at: u64) -> Result<(), Rotation
 }
 
 #[derive(Debug, Error)]
-pub enum RotationError {
+pub(crate) enum RotationError {
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),
 
@@ -385,9 +360,7 @@ mod tests {
 
     use super::is_valid_pairing_address;
     #[cfg(unix)]
-    use super::{PSK_ROTATION_INTERVAL_SECONDS, RotationError, maybe_rotate_psk_at, rotate_psk_at};
-    #[cfg(unix)]
-    use crate::ConfigurationError;
+    use super::{PSK_ROTATION_INTERVAL_SECONDS, maybe_rotate_psk_at};
 
     #[test]
     fn formats_sas_as_three_groups() {
@@ -494,12 +467,7 @@ mod tests {
             0o600
         );
 
-        assert!(matches!(
-            rotate_psk_at(&path, NOW + 2),
-            Err(RotationError::Configuration(
-                ConfigurationError::RotationPending { .. }
-            ))
-        ));
+        assert!(!maybe_rotate_psk_at(&path, NOW + 2).unwrap());
         assert_eq!(fs::read(&path).unwrap(), contents);
     }
 

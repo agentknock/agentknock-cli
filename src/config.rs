@@ -235,9 +235,6 @@ pub enum ConfigurationError {
     #[error("pairing in {path} is already active")]
     PairingNotPending { path: PathBuf },
 
-    #[error("pairing in {path} already has a pending PSK rotation")]
-    RotationPending { path: PathBuf },
-
     #[error("pairing file {path} changed during the operation")]
     PairingChanged { path: PathBuf },
 
@@ -343,17 +340,6 @@ pub(crate) fn clear_rotation_key(rotation_key: &str) -> Result<(), Configuration
         .remove("rotation_key");
     write_pairing_file(&path, &pairing)?;
     sync_directory(&directory, directory_path)
-}
-
-pub(crate) fn lock_pairing_for_rotation(path: &Path) -> Result<LockedPairing, ConfigurationError> {
-    let pairing = lock_pairing(path)?;
-    if pairing.pairing.rotation_key.is_some() {
-        return Err(ConfigurationError::RotationPending {
-            path: path.to_owned(),
-        });
-    }
-
-    Ok(pairing)
 }
 
 pub(crate) fn lock_pairing_if_rotated_before(

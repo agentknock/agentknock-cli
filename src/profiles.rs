@@ -82,11 +82,7 @@ impl From<crate::websocket::Error> for ProfileUploadError {
     }
 }
 
-pub async fn list_profiles() -> Result<Profiles, RequestError> {
-    list_profiles_with_progress(|_| {}).await
-}
-
-pub async fn list_profiles_with_progress<P>(mut progress: P) -> Result<Profiles, RequestError>
+pub async fn list_profiles<P>(mut progress: P) -> Result<Profiles, RequestError>
 where
     P: FnMut(ProfileListProgress),
 {
@@ -132,14 +128,7 @@ where
         .collect())
 }
 
-pub async fn upload_profile(
-    profile: &EnvironmentProfile,
-    mode: ProfileUploadMode,
-) -> Result<(), ProfileUploadError> {
-    upload_profile_with_progress(profile, mode, |_| {}).await
-}
-
-pub async fn upload_profile_with_progress<P>(
+pub async fn upload_profile<P>(
     profile: &EnvironmentProfile,
     mode: ProfileUploadMode,
     mut progress: P,

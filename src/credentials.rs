@@ -194,23 +194,7 @@ impl fmt::Display for DenialReason {
     }
 }
 
-pub async fn request_credentials(
-    request: CredentialRequest<'_>,
-) -> Result<Credentials, RequestError> {
-    request_credentials_with_progress(request, std::future::pending(), |_| {}).await
-}
-
-pub async fn request_credentials_until_cancelled<C>(
-    request: CredentialRequest<'_>,
-    cancellation: C,
-) -> Result<Credentials, RequestError>
-where
-    C: Future<Output = ()>,
-{
-    request_credentials_with_progress(request, cancellation, |_| {}).await
-}
-
-pub async fn request_credentials_with_progress<C, P>(
+pub async fn request_credentials<C, P>(
     request: CredentialRequest<'_>,
     cancellation: C,
     mut progress: P,

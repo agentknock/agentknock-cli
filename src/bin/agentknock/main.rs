@@ -22,16 +22,15 @@ use agentknock::{
     ConfigurationError, CredentialRequest, CredentialRequestProgress, Credentials, DenialReason,
     EnvironmentProfile, PairingProgress, PairingRemoveError, PairingSas, Profile,
     ProfileListProgress, ProfileUploadError, ProfileUploadMode, ProfileUploadProgress, Profiles,
-    RequestError, RequestOperation, StreamKind, abort_pairing, finish_pairing_with_progress,
-    force_remove_pairing, list_profiles_with_progress, remove_pairing_with_progress,
-    start_pairing_with_progress, upload_profile_with_progress,
+    RequestError, RequestOperation, StreamKind, abort_pairing, finish_pairing,
+    force_remove_pairing, list_profiles, remove_pairing, start_pairing, upload_profile,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
 use thiserror::Error;
 
-use agentknock::request_credentials_with_progress;
+use agentknock::request_credentials;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -710,7 +709,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
 async fn start_pairing_for_cli(address: &str) -> Result<PairingSas, RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = start_pairing_with_progress(address, move |current| {
+    let request = start_pairing(address, move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -722,7 +721,7 @@ async fn start_pairing_for_cli(address: &str) -> Result<PairingSas, RequestError
 async fn finish_pairing_for_cli() -> Result<(), RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = finish_pairing_with_progress(move |current| {
+    let request = finish_pairing(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -734,7 +733,7 @@ async fn finish_pairing_for_cli() -> Result<(), RequestError> {
 async fn remove_pairing_for_cli() -> Result<(), PairingRemoveError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = remove_pairing_with_progress(move |current| {
+    let request = remove_pairing(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -746,7 +745,7 @@ async fn remove_pairing_for_cli() -> Result<(), PairingRemoveError> {
 async fn list_profiles_for_cli() -> Result<Profiles, RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = list_profiles_with_progress(move |current| {
+    let request = list_profiles(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, profile_list_progress_message).await
@@ -758,7 +757,7 @@ async fn upload_profile_for_cli(
 ) -> Result<(), ProfileUploadError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = upload_profile_with_progress(profile, mode, move |current| {
+    let request = upload_profile(profile, mode, move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, profile_upload_progress_message).await
@@ -1054,7 +1053,7 @@ async fn request_exec_credentials(
     let observed_progress = Rc::clone(&current_progress);
     let interrupt = &mut signals.interrupt;
     let terminate = &mut signals.terminate;
-    let request = request_credentials_with_progress(
+    let request = request_credentials(
         request,
         async {
             tokio::select! {
