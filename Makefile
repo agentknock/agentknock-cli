@@ -1,4 +1,4 @@
-.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test release-build docs
+.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test release-build docs package-check dependency-check
 
 check: fmt-check clippy-check test release-build docs
 
@@ -24,4 +24,10 @@ release-build:
 	cargo build --locked --release --all-features
 
 docs:
-	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --locked --no-deps --all-features
+
+package-check:
+	cargo package --locked
+
+dependency-check:
+	cargo deny check
