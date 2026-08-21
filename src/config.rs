@@ -53,6 +53,11 @@ pub(crate) struct PendingPairing {
     device_key: Vec<u8>,
 }
 
+pub(crate) enum StoredPairingStatus {
+    Pending,
+    Active,
+}
+
 pub(crate) struct LockedPairing {
     path: PathBuf,
     directory_path: PathBuf,
@@ -251,6 +256,27 @@ pub(crate) fn read_pending_pairing(path: &Path) -> Result<Pairing, Configuration
             source,
         })?;
     Ok(pairing)
+}
+
+pub(crate) fn read_pairing_status(
+    path: &Path,
+) -> Result<Option<StoredPairingStatus>, ConfigurationError> {
+    let contents = match read_pairing_value(path) {
+        Ok(contents) => contents,
+        Err(ConfigurationError::NoPairing { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let pairing: Pairing =
+        serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
+            path: path.to_owned(),
+            source,
+        })?;
+
+    Ok(Some(if pairing.pending {
+        StoredPairingStatus::Pending
+    } else {
+        StoredPairingStatus::Active
+    }))
 }
 
 pub(crate) fn ensure_pairing_absent(path: &Path) -> Result<(), ConfigurationError> {

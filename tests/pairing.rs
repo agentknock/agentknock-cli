@@ -44,6 +44,45 @@ struct PairingResult {
     sas: String,
 }
 
+#[test]
+fn reports_local_pairing_status() {
+    let cases = [
+        (
+            TestHome::empty(),
+            "Pairing status: not paired.",
+            Some("agentknock pairing start <PAIRING_ADDRESS>"),
+        ),
+        (
+            TestHome::pending(),
+            "Pairing status: waiting for confirmation.",
+            Some("agentknock pairing finish"),
+        ),
+        (TestHome::active(), "Pairing status: active.", None),
+    ];
+
+    for (home, status, suggested_command) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+            .env("HOME", home.path())
+            .args(["pairing", "status"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(status), "{stdout:?}");
+        if let Some(command) = suggested_command {
+            assert!(stdout.contains("Suggested action:"), "{stdout:?}");
+            assert!(stdout.contains(command), "{stdout:?}");
+        } else {
+            assert!(!stdout.contains("Suggested action:"), "{stdout:?}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_while_starting_pairing_discards_local_state() {
     let home = TestHome::empty();

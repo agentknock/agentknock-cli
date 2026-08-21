@@ -20,9 +20,9 @@ use std::{
 
 use agentknock::{
     ApplicationInfo, Client, ConfigurationError, EnvironmentSecret, PairingProgress,
-    PairingRemoveError, PairingSas, RequestError, Secret, SecretListProgress, SecretUploadError,
-    SecretUploadMode, SecretUploadProgress, SecretUseDenialReason, SecretUseOperation,
-    SecretUseOutput, SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
+    PairingRemoveError, PairingSas, PairingStatus, RequestError, Secret, SecretListProgress,
+    SecretUploadError, SecretUploadMode, SecretUploadProgress, SecretUseDenialReason,
+    SecretUseOperation, SecretUseOutput, SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
@@ -169,6 +169,13 @@ struct ExecCommand {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum PairingCommand {
+    /// Show the local pairing status.
+    ///
+    /// Reports whether this client has no pairing, has a pairing waiting for confirmation, or has
+    /// an active pairing. This command reads only local state. It doesn't contact the relay or
+    /// device, so an active status doesn't confirm that the device still accepts the pairing.
+    Status,
+
     /// Start pairing with a device.
     ///
     /// Use the pairing address displayed on the device to create a pending pairing. Agentknock
@@ -350,6 +357,7 @@ enum Operation {
         command: Vec<String>,
     },
     StartPairing(String),
+    ShowPairingStatus,
     FinishPairing,
     AbortPairing,
     RemovePairing {
@@ -381,6 +389,7 @@ enum CommandError {
     ExecInterrupted,
     ExecProcess { program: String, source: io::Error },
     StartPairing(RequestError),
+    PairingStatus(ConfigurationError),
     FinishPairing(RequestError),
     AbortPairing(ConfigurationError),
     ForceRemovePairing(ConfigurationError),
@@ -531,6 +540,9 @@ impl Cli {
             Command::Pairing {
                 command: PairingCommand::Start { address },
             } => (Operation::StartPairing(address), OutputMode::Normal),
+            Command::Pairing {
+                command: PairingCommand::Status,
+            } => (Operation::ShowPairingStatus, OutputMode::Normal),
             Command::Pairing {
                 command: PairingCommand::Finish,
             } => (Operation::FinishPairing, OutputMode::Normal),
@@ -692,6 +704,12 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 .await
                 .map_err(CommandError::StartPairing)?;
             print_start_pairing_success(&sas);
+        }
+        Operation::ShowPairingStatus => {
+            let status = client
+                .pairing_status()
+                .map_err(CommandError::PairingStatus)?;
+            print_pairing_status(status);
         }
         Operation::FinishPairing => {
             finish_pairing_for_cli(&client)
@@ -1140,6 +1158,23 @@ fn print_start_pairing_success(sas: &PairingSas) {
     println!("agentknock pairing abort");
 }
 
+fn print_pairing_status(status: PairingStatus) {
+    match status {
+        PairingStatus::NotPaired => {
+            println!("Pairing status: not paired.");
+            println!("Suggested action: Get a pairing address, then run:");
+            println!("agentknock pairing start <PAIRING_ADDRESS>");
+        }
+        PairingStatus::Pending => {
+            println!("Pairing status: waiting for confirmation.");
+            println!("Suggested action: After you approve the pairing on the device, run:");
+            println!("agentknock pairing finish");
+        }
+        PairingStatus::Active => println!("Pairing status: active."),
+        _ => println!("Pairing status: unknown."),
+    }
+}
+
 fn print_command_error(error: &CommandError, output: OutputMode) {
     match error {
         CommandError::ExecRequest(error) if output != OutputMode::Quiet => {
@@ -1205,6 +1240,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         | CommandError::ExecInterrupted
         | CommandError::ExecProcess { .. } => {}
         CommandError::StartPairing(error) => print_start_pairing_error(error),
+        CommandError::PairingStatus(error) => print_pairing_status_error(error),
         CommandError::FinishPairing(error) => print_finish_pairing_error(error),
         CommandError::AbortPairing(error) => print_abort_pairing_error(error),
         CommandError::ForceRemovePairing(error) => print_force_remove_pairing_error(error),
@@ -1217,6 +1253,13 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::UploadSecret(error) => print_upload_error(error),
     }
+}
+
+fn print_pairing_status_error(error: &ConfigurationError) {
+    print_plain_error(format_args!(
+        "Agentknock couldn't read the pairing status: {error}."
+    ));
+    print_plain_configuration_action(error);
 }
 
 fn print_upload_error(error: &SecretUploadError) {
@@ -1987,6 +2030,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_pairing_status_command() {
+        let cli = Cli::try_parse_from(["agentknock", "pairing", "status"]).unwrap();
+
+        assert_eq!(
+            cli.into_operation(),
+            (Operation::ShowPairingStatus, OutputMode::Normal)
+        );
+    }
+
+    #[test]
     fn rejects_invalid_pairing_address() {
         for address in [
             "yup-its-free-",
@@ -2138,6 +2191,14 @@ mod tests {
                     "12-digit verification code",
                     "agentknock pairing finish",
                     "lowercase ASCII words separated by single hyphens",
+                ],
+            ),
+            (
+                &["pairing", "status", "--help"],
+                &[
+                    "local pairing status",
+                    "waiting for confirmation",
+                    "doesn't contact the relay or device",
                 ],
             ),
             (

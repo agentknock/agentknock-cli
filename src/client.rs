@@ -5,7 +5,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::ConfigurationError;
+use crate::config::{ConfigurationError, StoredPairingStatus, read_pairing_status};
 
 /// Identifies the application that embeds Agentknock.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +19,20 @@ pub struct ApplicationInfo {
 pub struct Client {
     application_info: ApplicationInfo,
     state_directory: Option<PathBuf>,
+}
+
+/// The state of the pairing stored on this client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PairingStatus {
+    /// This client has no pairing.
+    NotPaired,
+
+    /// This client has started pairing but hasn't activated it.
+    Pending,
+
+    /// This client has an active local pairing.
+    Active,
 }
 
 impl ApplicationInfo {
@@ -61,6 +75,19 @@ impl Client {
         }
     }
 
+    /// Returns the state of the pairing stored on this client.
+    ///
+    /// This method reads only local state. It doesn't contact the relay or
+    /// device, so [`PairingStatus::Active`] doesn't confirm that the device
+    /// still accepts the pairing.
+    pub fn pairing_status(&self) -> Result<PairingStatus, ConfigurationError> {
+        Ok(match read_pairing_status(&self.pairing_path()?)? {
+            None => PairingStatus::NotPaired,
+            Some(StoredPairingStatus::Pending) => PairingStatus::Pending,
+            Some(StoredPairingStatus::Active) => PairingStatus::Active,
+        })
+    }
+
     pub(crate) fn state_directory(&self) -> Result<&Path, ConfigurationError> {
         self.state_directory
             .as_deref()
@@ -81,7 +108,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationInfo, Client};
+    use super::{ApplicationInfo, Client, PairingStatus};
 
     #[test]
     fn custom_state_directory_contains_pairing_file() {
@@ -94,5 +121,18 @@ mod tests {
             client.pairing_path().unwrap(),
             std::path::Path::new("/tmp/agentknock-test-state/pairing.json")
         );
+    }
+
+    #[test]
+    fn missing_pairing_has_not_paired_status() {
+        let client = Client::new_in(
+            ApplicationInfo::new("test-application", "1.0.0"),
+            std::env::temp_dir().join(format!(
+                "agentknock-missing-test-state-{}",
+                ulid::Ulid::generate()
+            )),
+        );
+
+        assert_eq!(client.pairing_status().unwrap(), PairingStatus::NotPaired);
     }
 }
