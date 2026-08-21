@@ -14,7 +14,9 @@ use crate::{
 };
 
 #[derive(Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Profile {
+    #[non_exhaustive]
     Environment {
         description: Option<String>,
         variables: Vec<String>,
@@ -38,6 +40,7 @@ pub enum ProfileUploadMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ProfileListProgress {
     Preparing,
     WaitingForDelivery,
@@ -47,6 +50,7 @@ pub enum ProfileListProgress {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ProfileUploadProgress {
     Preparing,
     WaitingForDelivery,
@@ -56,6 +60,7 @@ pub enum ProfileUploadProgress {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ProfileUploadError {
     #[error(transparent)]
     Request(#[from] RequestError),

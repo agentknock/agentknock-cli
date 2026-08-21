@@ -37,6 +37,7 @@ pub enum StreamKind {
     Unknown,
 }
 
+#[non_exhaustive]
 pub enum RequestOperation<'a> {
     Exec {
         command: &'a str,
@@ -63,6 +64,7 @@ pub struct Credentials {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CredentialRequestProgress {
     Preparing,
     WaitingForDelivery,
@@ -82,6 +84,7 @@ impl Credentials {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RequestError {
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),

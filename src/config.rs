@@ -202,6 +202,7 @@ impl Serialize for CanonicalUlid {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigurationError {
     #[error("HOME isn't set")]
     HomeNotSet,

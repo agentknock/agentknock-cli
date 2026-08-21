@@ -959,6 +959,7 @@ fn profile_list_progress_message(progress: ProfileListProgress) -> &'static str 
             "Profile list received. Confirming receipt with the device."
         }
         ProfileListProgress::Completed => "Profile list request complete.",
+        _ => "Processing the profile list request.",
     }
 }
 
@@ -973,6 +974,7 @@ fn profile_upload_progress_message(progress: ProfileUploadProgress) -> &'static 
         }
         ProfileUploadProgress::Completing => "Device response received. Confirming receipt.",
         ProfileUploadProgress::Completed => "Profile proposal request complete.",
+        _ => "Processing the profile proposal.",
     }
 }
 
@@ -1018,6 +1020,9 @@ fn pairing_progress_message(
             "Device response received. Processing the pairing removal."
         }
         (PairingOperation::Remove, PairingProgress::Completed) => "Pairing removal complete.",
+        (PairingOperation::Start, _) => "Processing the pairing request.",
+        (PairingOperation::Finish, _) => "Processing the pairing confirmation.",
+        (PairingOperation::Remove, _) => "Processing the pairing removal request.",
     }
 }
 
@@ -1232,6 +1237,11 @@ fn print_upload_error(error: &ProfileUploadError) {
                 "Agentknock couldn't send the profile proposal: {error}."
             ));
         }
+        _ => {
+            print_plain_error(format_args!(
+                "Agentknock couldn't send the profile proposal: {error}."
+            ));
+        }
     }
 }
 
@@ -1347,6 +1357,10 @@ fn print_exec_request_error(error: &RequestError) {
         }
         RequestError::PairingRejected => {
             print_message("The device rejected this client pairing.");
+            print_message("The command didn't run.");
+        }
+        _ => {
+            print_message(format_args!("The profile access request failed: {error}."));
             print_message("The command didn't run.");
         }
     }
@@ -1540,6 +1554,11 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
             ));
             print_plain_configuration_action(error);
         }
+        _ => {
+            print_plain_error(format_args!(
+                "Agentknock couldn't remove the pairing: {error}."
+            ));
+        }
     }
 }
 
@@ -1636,11 +1655,13 @@ fn print_profiles(profiles: &Profiles) {
                 Profile::Environment {
                     description,
                     variables,
+                    ..
                 } => serde_json::json!({
                     "description": description,
                     "type": "environment",
                     "variables": variables,
                 }),
+                _ => serde_json::json!({"type": "unknown"}),
             };
             (name, output)
         })
@@ -1728,6 +1749,7 @@ fn progress_message(progress: CredentialRequestProgress) -> &'static str {
         }
         CredentialRequestProgress::Completing => "Device response received. Confirming receipt.",
         CredentialRequestProgress::Completed => "Profile access request complete.",
+        _ => "Processing the profile access request.",
     }
 }
 

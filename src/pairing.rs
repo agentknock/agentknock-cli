@@ -29,6 +29,7 @@ const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 pub struct PairingSas(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PairingProgress {
     Preparing,
     WaitingForDelivery,
@@ -254,6 +255,7 @@ pub(crate) enum RotationError {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PairingRemoveError {
     #[error(transparent)]
     Configuration(ConfigurationError),
