@@ -3,6 +3,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    path::Path,
     pin::Pin,
 };
 
@@ -12,9 +13,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing},
+    Client,
+    config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing_from},
     crypto::{self, Session},
-    pairing::{RotationError, maybe_rotate_psk},
+    pairing::RotationError,
     protocol::Method,
     secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
     websocket::{self, RelayExchange},
@@ -143,63 +145,69 @@ impl fmt::Display for SecretUseDenialReason {
     }
 }
 
-pub async fn request_secret_use<C, P>(
-    request: SecretUseRequest<'_>,
-    cancellation: C,
-    mut progress: P,
-) -> Result<SecretUseOutput, RequestError>
-where
-    C: Future<Output = ()>,
-    P: FnMut(SecretUseProgress),
-{
-    tokio::pin!(cancellation);
-    progress(SecretUseProgress::Preparing);
-    maybe_rotate_psk().map_err(|error| match error {
-        RotationError::Configuration(error) => RequestError::Configuration(error),
-        RotationError::Other(error) => RequestError::Other(error),
-    })?;
-    let pairing = read_pairing()?;
-    let operation = match request.operation {
-        SecretUseOperation::Exec {
-            command,
-            arguments,
-            working_directory,
-            executable_path,
-            executable_hash,
-            executable_mode,
-            stdin,
-            stdout,
-            stderr,
-        } => SecretUseOperationMessage::Exec {
-            command,
-            arguments,
-            working_directory,
-            executable_path,
-            executable_hash: executable_hash.map(|hash| BASE64_STANDARD.encode(hash)),
-            executable_mode,
-            stdin: stdin.into(),
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-        },
-    };
-    let request_payload = SecretUseRequestPayload {
-        method: Method::SecretUse,
-        secrets: request.secrets,
-        reason: request.reason,
-        operation,
-        launcher_chain: request.launcher_chain,
-    };
+impl Client {
+    pub async fn request_secret_use<C, P>(
+        &self,
+        request: SecretUseRequest<'_>,
+        cancellation: C,
+        mut progress: P,
+    ) -> Result<SecretUseOutput, RequestError>
+    where
+        C: Future<Output = ()>,
+        P: FnMut(SecretUseProgress),
+    {
+        tokio::pin!(cancellation);
+        progress(SecretUseProgress::Preparing);
+        self.maybe_rotate_psk().map_err(|error| match error {
+            RotationError::Configuration(error) => RequestError::Configuration(error),
+            RotationError::Other(error) => RequestError::Other(error),
+        })?;
+        let pairing_path = self.pairing_path()?;
+        let pairing = read_pairing_from(&pairing_path)?;
+        let operation = match request.operation {
+            SecretUseOperation::Exec {
+                command,
+                arguments,
+                working_directory,
+                executable_path,
+                executable_hash,
+                executable_mode,
+                stdin,
+                stdout,
+                stderr,
+            } => SecretUseOperationMessage::Exec {
+                command,
+                arguments,
+                working_directory,
+                executable_path,
+                executable_hash: executable_hash.map(|hash| BASE64_STANDARD.encode(hash)),
+                executable_mode,
+                stdin: stdin.into(),
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+            },
+        };
+        let request_payload = SecretUseRequestPayload {
+            method: Method::SecretUse,
+            secrets: request.secrets,
+            reason: request.reason,
+            operation,
+            launcher_chain: request.launcher_chain,
+        };
 
-    message_exchange(
-        &pairing,
-        &request_payload,
-        cancellation.as_mut(),
-        &mut progress,
-    )
-    .await
+        message_exchange(
+            &pairing_path,
+            &pairing,
+            &request_payload,
+            cancellation.as_mut(),
+            &mut progress,
+        )
+        .await
+    }
 }
 
 async fn message_exchange<C, P>(
+    pairing_path: &Path,
     pairing: &Pairing,
     request_payload: &SecretUseRequestPayload<'_>,
     mut cancellation: Pin<&mut C>,
@@ -253,7 +261,7 @@ where
         .open_response(response)
         .map_err(RequestError::other)?;
     if let Some(rotation_key) = pairing.rotation_key() {
-        clear_rotation_key(rotation_key)?;
+        clear_rotation_key(pairing_path, rotation_key)?;
     }
     let result: SecretUseResult =
         serde_json::from_slice(&plaintext).map_err(RequestError::other)?;

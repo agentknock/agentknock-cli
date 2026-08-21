@@ -5,10 +5,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    RequestError,
-    config::{ConfigurationError, clear_rotation_key, read_pairing},
+    Client, RequestError,
+    config::{ConfigurationError, clear_rotation_key, read_pairing_from},
     crypto::Session,
-    pairing::{RotationError, maybe_rotate_psk},
+    pairing::RotationError,
     protocol::Method,
     websocket::RelayExchange,
 };
@@ -81,109 +81,116 @@ impl From<crate::websocket::Error> for SecretUploadError {
     }
 }
 
-pub async fn list_secrets<P>(mut progress: P) -> Result<Secrets, RequestError>
-where
-    P: FnMut(SecretListProgress),
-{
-    progress(SecretListProgress::Preparing);
-    prepare_request()?;
-    let pairing = read_pairing()?;
-    let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(&ListRequest {
-        method: Method::SecretList,
-    })
-    .map_err(RequestError::other)?;
-    let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
-    let request = session
-        .seal_request(&plaintext)
-        .map_err(RequestError::other)?;
-    let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
-
-    progress(SecretListProgress::WaitingForDelivery);
-    let response = relay
-        .request(&request, || {
-            progress(SecretListProgress::WaitingForResponse);
+impl Client {
+    pub async fn list_secrets<P>(&self, mut progress: P) -> Result<Secrets, RequestError>
+    where
+        P: FnMut(SecretListProgress),
+    {
+        progress(SecretListProgress::Preparing);
+        self.prepare_request()?;
+        let pairing_path = self.pairing_path()?;
+        let pairing = read_pairing_from(&pairing_path)?;
+        let request_id = Ulid::generate();
+        let plaintext = crate::protocol::encode(&ListRequest {
+            method: Method::SecretList,
         })
-        .await?;
-    progress(SecretListProgress::Completing);
-    let plaintext = session
-        .open_response(response)
         .map_err(RequestError::other)?;
-    if let Some(rotation_key) = pairing.rotation_key() {
-        clear_rotation_key(rotation_key)?;
+        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
+        let request = session
+            .seal_request(&plaintext)
+            .map_err(RequestError::other)?;
+        let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
+
+        progress(SecretListProgress::WaitingForDelivery);
+        let response = relay
+            .request(&request, || {
+                progress(SecretListProgress::WaitingForResponse);
+            })
+            .await?;
+        progress(SecretListProgress::Completing);
+        let plaintext = session
+            .open_response(response)
+            .map_err(RequestError::other)?;
+        if let Some(rotation_key) = pairing.rotation_key() {
+            clear_rotation_key(&pairing_path, rotation_key)?;
+        }
+        let response: ListResponse =
+            serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+        let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(RequestError::other)?;
+        let completion = session
+            .seal_completion(&plaintext)
+            .map_err(RequestError::other)?;
+        relay.complete(&completion).await?;
+        progress(SecretListProgress::Completed);
+
+        Ok(response
+            .secrets
+            .into_iter()
+            .map(|(name, secret)| (name, secret.into()))
+            .collect())
     }
-    let response: ListResponse = serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
-    let plaintext = crate::protocol::encode(&EmptyMessage {}).map_err(RequestError::other)?;
-    let completion = session
-        .seal_completion(&plaintext)
-        .map_err(RequestError::other)?;
-    relay.complete(&completion).await?;
-    progress(SecretListProgress::Completed);
 
-    Ok(response
-        .secrets
-        .into_iter()
-        .map(|(name, secret)| (name, secret.into()))
-        .collect())
-}
+    pub async fn upload_secret<P>(
+        &self,
+        secret: &EnvironmentSecret,
+        mode: SecretUploadMode,
+        mut progress: P,
+    ) -> Result<(), SecretUploadError>
+    where
+        P: FnMut(SecretUploadProgress),
+    {
+        progress(SecretUploadProgress::Preparing);
+        self.prepare_request()?;
+        let pairing_path = self.pairing_path()?;
+        let pairing = read_pairing_from(&pairing_path)?;
+        let request_id = Ulid::generate();
+        let request_payload = UploadRequest {
+            method: Method::SecretUpload,
+            mode: mode.into(),
+            secret: NamedSecretMessage::from(secret),
+        };
+        let plaintext = crate::protocol::encode(&request_payload).map_err(RequestError::other)?;
+        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
+        let request = session
+            .seal_request(&plaintext)
+            .map_err(RequestError::other)?;
+        let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
 
-pub async fn upload_secret<P>(
-    secret: &EnvironmentSecret,
-    mode: SecretUploadMode,
-    mut progress: P,
-) -> Result<(), SecretUploadError>
-where
-    P: FnMut(SecretUploadProgress),
-{
-    progress(SecretUploadProgress::Preparing);
-    prepare_request()?;
-    let pairing = read_pairing()?;
-    let request_id = Ulid::generate();
-    let request_payload = UploadRequest {
-        method: Method::SecretUpload,
-        mode: mode.into(),
-        secret: NamedSecretMessage::from(secret),
-    };
-    let plaintext = crate::protocol::encode(&request_payload).map_err(RequestError::other)?;
-    let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
-    let request = session
-        .seal_request(&plaintext)
-        .map_err(RequestError::other)?;
-    let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
+        progress(SecretUploadProgress::WaitingForDelivery);
+        let response = relay
+            .request(&request, || {
+                progress(SecretUploadProgress::WaitingForResponse);
+            })
+            .await?;
+        progress(SecretUploadProgress::Completing);
+        let plaintext = session
+            .open_response(response)
+            .map_err(RequestError::other)?;
+        if let Some(rotation_key) = pairing.rotation_key() {
+            clear_rotation_key(&pairing_path, rotation_key)?;
+        }
+        let response: UploadResult =
+            serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+        let completion = crate::protocol::encode(&response).map_err(RequestError::other)?;
+        let completion = session
+            .seal_completion(&completion)
+            .map_err(RequestError::other)?;
+        let _ = relay.complete_briefly(&completion).await;
+        progress(SecretUploadProgress::Completed);
 
-    progress(SecretUploadProgress::WaitingForDelivery);
-    let response = relay
-        .request(&request, || {
-            progress(SecretUploadProgress::WaitingForResponse);
-        })
-        .await?;
-    progress(SecretUploadProgress::Completing);
-    let plaintext = session
-        .open_response(response)
-        .map_err(RequestError::other)?;
-    if let Some(rotation_key) = pairing.rotation_key() {
-        clear_rotation_key(rotation_key)?;
+        match response {
+            UploadResult::Received => Ok(()),
+            UploadResult::Rejected { message } => Err(SecretUploadError::Rejected { message }),
+        }
     }
-    let response: UploadResult = serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
-    let completion = crate::protocol::encode(&response).map_err(RequestError::other)?;
-    let completion = session
-        .seal_completion(&completion)
-        .map_err(RequestError::other)?;
-    let _ = relay.complete_briefly(&completion).await;
-    progress(SecretUploadProgress::Completed);
 
-    match response {
-        UploadResult::Received => Ok(()),
-        UploadResult::Rejected { message } => Err(SecretUploadError::Rejected { message }),
+    fn prepare_request(&self) -> Result<(), RequestError> {
+        self.maybe_rotate_psk().map_err(|error| match error {
+            RotationError::Configuration(error) => RequestError::Configuration(error),
+            RotationError::Other(error) => RequestError::Other(error),
+        })?;
+        Ok(())
     }
-}
-
-fn prepare_request() -> Result<(), RequestError> {
-    maybe_rotate_psk().map_err(|error| match error {
-        RotationError::Configuration(error) => RequestError::Configuration(error),
-        RotationError::Other(error) => RequestError::Other(error),
-    })?;
-    Ok(())
 }
 
 #[derive(Serialize)]

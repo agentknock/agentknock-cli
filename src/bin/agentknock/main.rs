@@ -19,18 +19,16 @@ use std::{
 };
 
 use agentknock::{
-    ConfigurationError, EnvironmentSecret, PairingProgress, PairingRemoveError, PairingSas,
+    Client, ConfigurationError, EnvironmentSecret, PairingProgress, PairingRemoveError, PairingSas,
     RequestError, Secret, SecretListProgress, SecretUploadError, SecretUploadMode,
     SecretUploadProgress, SecretUseDenialReason, SecretUseOperation, SecretUseOutput,
-    SecretUseProgress, SecretUseRequest, Secrets, StreamKind, abort_pairing, finish_pairing,
-    force_remove_pairing, list_secrets, remove_pairing, start_pairing, upload_secret,
+    SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
 use thiserror::Error;
 
-use agentknock::request_secret_use;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -626,6 +624,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandError> {
+    let client = Client::new();
     match operation {
         Operation::Exec {
             secrets,
@@ -658,7 +657,8 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 launcher_chain: &launcher_chain,
             };
             let mut signals = ExecSignals::new().map_err(CommandError::ExecSignal)?;
-            let secret_use_output = request_exec_secrets(request, output, &mut signals).await?;
+            let secret_use_output =
+                request_exec_secrets(&client, request, output, &mut signals).await?;
             let blocked_signals = signal_state
                 .block_interrupts()
                 .map_err(CommandError::ExecSignal)?;
@@ -685,41 +685,43 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 })?;
         }
         Operation::StartPairing(address) => {
-            let sas = start_pairing_for_cli(&address)
+            let sas = start_pairing_for_cli(&client, &address)
                 .await
                 .map_err(CommandError::StartPairing)?;
             print_start_pairing_success(&sas);
         }
         Operation::FinishPairing => {
-            finish_pairing_for_cli()
+            finish_pairing_for_cli(&client)
                 .await
                 .map_err(CommandError::FinishPairing)?;
             println!("Pairing complete. Agentknock is ready to request secret use.");
         }
         Operation::AbortPairing => {
-            abort_pairing().map_err(CommandError::AbortPairing)?;
+            client.abort_pairing().map_err(CommandError::AbortPairing)?;
             println!("Pending pairing discarded.");
         }
         Operation::RemovePairing { force } => {
             if force {
-                force_remove_pairing().map_err(CommandError::ForceRemovePairing)?;
+                client
+                    .force_remove_pairing()
+                    .map_err(CommandError::ForceRemovePairing)?;
                 println!("Local pairing removed. The pairing on the device is unchanged.");
             } else {
-                remove_pairing_for_cli()
+                remove_pairing_for_cli(&client)
                     .await
                     .map_err(CommandError::RemovePairing)?;
                 println!("Pairing removed from this client and the device.");
             }
         }
         Operation::ListSecrets => {
-            let secrets = list_secrets_for_cli()
+            let secrets = list_secrets_for_cli(&client)
                 .await
                 .map_err(CommandError::ListSecrets)?;
             print_secrets(&secrets);
         }
         Operation::UploadSecret(command) => {
             let (secret, mode) = read_secret(command).map_err(CommandError::SecretInput)?;
-            upload_secret_for_cli(&secret, mode)
+            upload_secret_for_cli(&client, &secret, mode)
                 .await
                 .map_err(CommandError::UploadSecret)?;
             println!("Secret upload {:?} delivered to the device.", secret.name);
@@ -731,10 +733,10 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
     Ok(())
 }
 
-async fn start_pairing_for_cli(address: &str) -> Result<PairingSas, RequestError> {
+async fn start_pairing_for_cli(client: &Client, address: &str) -> Result<PairingSas, RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = start_pairing(address, move |current| {
+    let request = client.start_pairing(address, move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -743,10 +745,10 @@ async fn start_pairing_for_cli(address: &str) -> Result<PairingSas, RequestError
     .await
 }
 
-async fn finish_pairing_for_cli() -> Result<(), RequestError> {
+async fn finish_pairing_for_cli(client: &Client) -> Result<(), RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = finish_pairing(move |current| {
+    let request = client.finish_pairing(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -755,10 +757,10 @@ async fn finish_pairing_for_cli() -> Result<(), RequestError> {
     .await
 }
 
-async fn remove_pairing_for_cli() -> Result<(), PairingRemoveError> {
+async fn remove_pairing_for_cli(client: &Client) -> Result<(), PairingRemoveError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = remove_pairing(move |current| {
+    let request = client.remove_pairing(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, move |progress| {
@@ -767,22 +769,23 @@ async fn remove_pairing_for_cli() -> Result<(), PairingRemoveError> {
     .await
 }
 
-async fn list_secrets_for_cli() -> Result<Secrets, RequestError> {
+async fn list_secrets_for_cli(client: &Client) -> Result<Secrets, RequestError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = list_secrets(move |current| {
+    let request = client.list_secrets(move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, secret_list_progress_message).await
 }
 
 async fn upload_secret_for_cli(
+    client: &Client,
     secret: &EnvironmentSecret,
     mode: SecretUploadMode,
 ) -> Result<(), SecretUploadError> {
     let progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&progress);
-    let request = upload_secret(secret, mode, move |current| {
+    let request = client.upload_secret(secret, mode, move |current| {
         observed_progress.set(Some(current));
     });
     monitor_operation(request, progress, secret_upload_progress_message).await
@@ -1073,6 +1076,7 @@ impl ExecSignals {
 }
 
 async fn request_exec_secrets(
+    client: &Client,
     request: SecretUseRequest<'_>,
     output: OutputMode,
     signals: &mut ExecSignals,
@@ -1083,7 +1087,7 @@ async fn request_exec_secrets(
     let observed_progress = Rc::clone(&current_progress);
     let interrupt = &mut signals.interrupt;
     let terminate = &mut signals.terminate;
-    let request = request_secret_use(
+    let request = client.request_secret_use(
         request,
         async {
             tokio::select! {

@@ -9,11 +9,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    ConfigurationError, RequestError,
+    Client, ConfigurationError, RequestError,
     config::{
         CanonicalUlid, LockedPairing, abort_pending_pairing, current_timestamp,
         ensure_pairing_absent, finish_pending_pairing, lock_pairing_if_rotated_before,
-        pairing_path, read_pairing, read_pairing_from, read_pending_pairing, remove_active_pairing,
+        read_pairing_from, read_pending_pairing, remove_active_pairing,
         remove_pairing as remove_pairing_file, write_pending_pairing,
     },
     crypto::{
@@ -51,63 +51,71 @@ impl fmt::Display for PairingSas {
     }
 }
 
-pub async fn start_pairing<P>(address: &str, mut progress: P) -> Result<PairingSas, RequestError>
-where
-    P: FnMut(PairingProgress),
-{
-    if !is_valid_pairing_address(address) {
-        return Err(RequestError::other(
-            "pairing address must contain lowercase ASCII words separated by single hyphens",
-        ));
-    }
-    progress(PairingProgress::Preparing);
-    ensure_pairing_absent()?;
-    let client_secret = generate_client_secret().map_err(RequestError::other)?;
-    let commitment = derive_pairing_commitment(&client_secret).map_err(RequestError::other)?;
-    let request_id = Ulid::generate();
-    let client_id = CanonicalUlid::new(request_id);
-    let client_token = generate_client_token()?;
-    let address_id = derive_address_id(address).map_err(RequestError::other)?;
-    let mut relay = RelayExchange::pairing(
-        &address_id.to_string(),
-        &request_id.to_string(),
-        &client_token,
-    )?;
-    let request = PairingRequest {
-        version: PROTOCOL_VERSION,
-        commitment: BASE64_STANDARD.encode(commitment),
-    };
-    progress(PairingProgress::WaitingForDelivery);
-    let response: PairingResponse = relay
-        .request(&request, || {
-            progress(PairingProgress::WaitingForResponse);
-        })
-        .await?;
-    progress(PairingProgress::Completing);
-    let contents = PairingMetadata {
-        platform: std::env::consts::OS,
-        architecture: std::env::consts::ARCH,
-        hostname: read_trimmed("/etc/hostname"),
-        machine_id: read_trimmed("/etc/machine-id"),
-        os_version: os_version(),
-    };
-    let application_plaintext = crate::protocol::encode(&contents).map_err(RequestError::other)?;
-    let (completion, pairing, sas) = seal_pairing(
-        client_id,
-        client_token,
-        response,
-        &client_secret,
-        &application_plaintext,
-    )
-    .map_err(RequestError::other)?;
-    write_pending_pairing(&pairing)?;
+impl Client {
+    pub async fn start_pairing<P>(
+        &self,
+        address: &str,
+        mut progress: P,
+    ) -> Result<PairingSas, RequestError>
+    where
+        P: FnMut(PairingProgress),
+    {
+        if !is_valid_pairing_address(address) {
+            return Err(RequestError::other(
+                "pairing address must contain lowercase ASCII words separated by single hyphens",
+            ));
+        }
+        progress(PairingProgress::Preparing);
+        let pairing_path = self.pairing_path()?;
+        ensure_pairing_absent(&pairing_path)?;
+        let client_secret = generate_client_secret().map_err(RequestError::other)?;
+        let commitment = derive_pairing_commitment(&client_secret).map_err(RequestError::other)?;
+        let request_id = Ulid::generate();
+        let client_id = CanonicalUlid::new(request_id);
+        let client_token = generate_client_token()?;
+        let address_id = derive_address_id(address).map_err(RequestError::other)?;
+        let mut relay = RelayExchange::pairing(
+            &address_id.to_string(),
+            &request_id.to_string(),
+            &client_token,
+        )?;
+        let request = PairingRequest {
+            version: PROTOCOL_VERSION,
+            commitment: BASE64_STANDARD.encode(commitment),
+        };
+        progress(PairingProgress::WaitingForDelivery);
+        let response: PairingResponse = relay
+            .request(&request, || {
+                progress(PairingProgress::WaitingForResponse);
+            })
+            .await?;
+        progress(PairingProgress::Completing);
+        let contents = PairingMetadata {
+            platform: std::env::consts::OS,
+            architecture: std::env::consts::ARCH,
+            hostname: read_trimmed("/etc/hostname"),
+            machine_id: read_trimmed("/etc/machine-id"),
+            os_version: os_version(),
+        };
+        let application_plaintext =
+            crate::protocol::encode(&contents).map_err(RequestError::other)?;
+        let (completion, pairing, sas) = seal_pairing(
+            client_id,
+            client_token,
+            response,
+            &client_secret,
+            &application_plaintext,
+        )
+        .map_err(RequestError::other)?;
+        write_pending_pairing(&pairing_path, &pairing)?;
 
-    if let Err(error) = relay.complete(&completion).await {
-        let _ = abort_pending_pairing();
-        return Err(error.into());
+        if let Err(error) = relay.complete(&completion).await {
+            let _ = abort_pending_pairing(&pairing_path);
+            return Err(error.into());
+        }
+        progress(PairingProgress::Completed);
+        Ok(PairingSas(sas))
     }
-    progress(PairingProgress::Completed);
-    Ok(PairingSas(sas))
 }
 
 fn is_valid_pairing_address(address: &str) -> bool {
@@ -116,73 +124,81 @@ fn is_valid_pairing_address(address: &str) -> bool {
         .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
-pub async fn finish_pairing<P>(mut progress: P) -> Result<(), RequestError>
-where
-    P: FnMut(PairingProgress),
-{
-    progress(PairingProgress::Preparing);
-    let pairing = read_pending_pairing()?;
-    let request_id = Ulid::generate();
-    let plaintext = crate::protocol::encode(&MethodRequest {
-        method: Method::PairingFinish,
-    })
-    .map_err(RequestError::other)?;
-    let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
-    let request = session
-        .seal_request(&plaintext)
-        .map_err(RequestError::other)?;
-    let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
-    progress(PairingProgress::WaitingForDelivery);
-    let response = relay
-        .request(&request, || {
-            progress(PairingProgress::WaitingForResponse);
+impl Client {
+    pub async fn finish_pairing<P>(&self, mut progress: P) -> Result<(), RequestError>
+    where
+        P: FnMut(PairingProgress),
+    {
+        progress(PairingProgress::Preparing);
+        let pairing_path = self.pairing_path()?;
+        let pairing = read_pending_pairing(&pairing_path)?;
+        let request_id = Ulid::generate();
+        let plaintext = crate::protocol::encode(&MethodRequest {
+            method: Method::PairingFinish,
         })
-        .await?;
-    progress(PairingProgress::Completing);
-    let plaintext = session
-        .open_response(response)
         .map_err(RequestError::other)?;
-    let result: FinishPairingResult =
-        serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
-    if result == FinishPairingResult::Rejected {
-        return Err(RequestError::PairingRejected);
+        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
+        let request = session
+            .seal_request(&plaintext)
+            .map_err(RequestError::other)?;
+        let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
+        progress(PairingProgress::WaitingForDelivery);
+        let response = relay
+            .request(&request, || {
+                progress(PairingProgress::WaitingForResponse);
+            })
+            .await?;
+        progress(PairingProgress::Completing);
+        let plaintext = session
+            .open_response(response)
+            .map_err(RequestError::other)?;
+        let result: FinishPairingResult =
+            serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+        if result == FinishPairingResult::Rejected {
+            return Err(RequestError::PairingRejected);
+        }
+
+        let plaintext =
+            crate::protocol::encode(&FinishPairingResult::Accepted).map_err(RequestError::other)?;
+        let completion = session
+            .seal_completion(&plaintext)
+            .map_err(RequestError::other)?;
+        finish_pending_pairing(&pairing_path)?;
+        relay.complete(&completion).await?;
+        progress(PairingProgress::Completed);
+
+        Ok(())
     }
 
-    let plaintext =
-        crate::protocol::encode(&FinishPairingResult::Accepted).map_err(RequestError::other)?;
-    let completion = session
-        .seal_completion(&plaintext)
-        .map_err(RequestError::other)?;
-    finish_pending_pairing()?;
-    relay.complete(&completion).await?;
-    progress(PairingProgress::Completed);
+    pub fn abort_pairing(&self) -> Result<(), ConfigurationError> {
+        abort_pending_pairing(&self.pairing_path()?)
+    }
 
-    Ok(())
-}
+    pub fn force_remove_pairing(&self) -> Result<(), ConfigurationError> {
+        remove_pairing_file(&self.pairing_path()?)
+    }
 
-pub fn abort_pairing() -> Result<(), ConfigurationError> {
-    abort_pending_pairing()
-}
-
-pub fn force_remove_pairing() -> Result<(), ConfigurationError> {
-    remove_pairing_file()
-}
-
-pub async fn remove_pairing<P>(mut progress: P) -> Result<(), PairingRemoveError>
-where
-    P: FnMut(PairingProgress),
-{
-    progress(PairingProgress::Preparing);
-    let pairing = read_pairing().map_err(PairingRemoveError::Configuration)?;
-    let device_id = pairing.device_id_bytes();
-    let client_id = pairing.client_id_bytes();
-    let (mut relay, completion) = prepare_pairing_removal(&pairing, &mut progress)
-        .await
-        .map_err(PairingRemoveError::Request)?;
-    remove_active_pairing(device_id, client_id).map_err(PairingRemoveError::LocalState)?;
-    let _ = relay.complete_briefly(&completion).await;
-    progress(PairingProgress::Completed);
-    Ok(())
+    pub async fn remove_pairing<P>(&self, mut progress: P) -> Result<(), PairingRemoveError>
+    where
+        P: FnMut(PairingProgress),
+    {
+        progress(PairingProgress::Preparing);
+        let pairing_path = self
+            .pairing_path()
+            .map_err(PairingRemoveError::Configuration)?;
+        let pairing =
+            read_pairing_from(&pairing_path).map_err(PairingRemoveError::Configuration)?;
+        let device_id = pairing.device_id_bytes();
+        let client_id = pairing.client_id_bytes();
+        let (mut relay, completion) = prepare_pairing_removal(&pairing, &mut progress)
+            .await
+            .map_err(PairingRemoveError::Request)?;
+        remove_active_pairing(&pairing_path, device_id, client_id)
+            .map_err(PairingRemoveError::LocalState)?;
+        let _ = relay.complete_briefly(&completion).await;
+        progress(PairingProgress::Completed);
+        Ok(())
+    }
 }
 
 async fn prepare_pairing_removal<P>(
@@ -221,8 +237,10 @@ where
     Ok((relay, completion))
 }
 
-pub(crate) fn maybe_rotate_psk() -> Result<bool, RotationError> {
-    maybe_rotate_psk_at(&pairing_path()?, current_timestamp()?)
+impl Client {
+    pub(crate) fn maybe_rotate_psk(&self) -> Result<bool, RotationError> {
+        maybe_rotate_psk_at(&self.pairing_path()?, current_timestamp()?)
+    }
 }
 
 fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RotationError> {
