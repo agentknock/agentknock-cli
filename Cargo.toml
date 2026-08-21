@@ -2,6 +2,14 @@
 name = "agentknock"
 version = "0.1.0"
 edition = "2024"
+include = [
+    "/src/**",
+    "/tests/**",
+    "/docs/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE*",
+]
 
 [features]
 integration-tests = []
