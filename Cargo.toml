@@ -1,9 +1,10 @@
 [package]
 name = "agentknock"
 version = "0.1.0"
+categories = ["authentication", "command-line-utilities", "cryptography"]
+documentation = "https://docs.rs/agentknock"
 edition = "2024"
-rust-version = "1.89"
-license = "MIT OR Apache-2.0"
+homepage = "https://agentknock.dev/"
 include = [
     "/src/**",
     "/tests/**",
@@ -12,6 +13,11 @@ include = [
     "/CHANGELOG.md",
     "/LICENSE*",
 ]
+keywords = ["agents", "approval", "authorization", "mobile", "secrets"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nakedible/agentknock-cli"
+rust-version = "1.89"
+description = "Mobile-approved secret delivery for command-line tools and applications."
 
 [features]
 integration-tests = []
