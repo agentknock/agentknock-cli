@@ -1,4 +1,8 @@
-.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test release-build docs package-check dependency-check
+DIST_DIR := target/dist
+DIST_LINK := target/nix-dist
+DIST_TARGET := x86_64-unknown-linux-musl
+
+.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test release-build docs package-check dependency-check dist dist-check
 
 check: fmt-check clippy-check test release-build docs
 
@@ -31,3 +35,15 @@ package-check:
 
 dependency-check:
 	cargo deny check
+
+dist:
+	nix --extra-experimental-features 'nix-command flakes' build \
+		--no-update-lock-file --print-build-logs --out-link "$(DIST_LINK)" .#dist
+	install -d "$(DIST_DIR)"
+	install -m 0644 \
+		"$(DIST_LINK)/agentknock-$(DIST_TARGET).tar.gz" \
+		"$(DIST_LINK)/agentknock-$(DIST_TARGET).tar.gz.sha256" \
+		"$(DIST_DIR)"
+
+dist-check: dist
+	./scripts/check-dist "$(DIST_TARGET)" "$(DIST_DIR)"

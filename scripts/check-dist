@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -eu
+
+target=${1:?target is required}
+dist_dir=${2:?distribution directory is required}
+archive="agentknock-$target.tar.gz"
+unpack_dir=$(mktemp -d)
+
+cleanup() {
+	rm -rf -- "$unpack_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+(
+	cd "$dist_dir"
+	sha256sum --check "$archive.sha256"
+)
+
+tar --extract --gzip --file="$dist_dir/$archive" --directory="$unpack_dir"
+"$unpack_dir/agentknock" --version

@@ -45,31 +45,46 @@ jobs:
         run: cargo check --locked --all-targets --all-features
 
   musl:
-    name: Build (x86-64 musl)
+    name: Distribution (x86-64 Linux)
     runs-on: ubuntu-24.04
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install musl tools
+      - name: Install Nix
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://releases.nixos.org/nix/nix-2.35.1/install \
+            --output nix-install
+          echo "34e0ef63ec1f3e552e15069660afd9a0a23f69009e340c33067595252888286c  nix-install" \
+            | sha256sum --check
+          sh nix-install --daemon --no-channel-add --yes
+          echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
-          rustup default stable
+      - name: Build and verify distribution
+        run: make dist-check
 
-      - name: Build release binary
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Attest distribution
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: target/dist/agentknock-x86_64-unknown-linux-musl.tar.gz.sha256
 
-      - name: Run release binary
-        run: target/x86_64-unknown-linux-musl/release/agentknock --version
+      - name: Upload distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentknock-x86_64-unknown-linux-musl
+          path: target/dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
   package:
     name: Package
@@ -115,3 +130,30 @@ jobs:
 
       - name: Check dependencies
         run: make dependency-check
+
+  release-readiness:
+    name: Check release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Check release plan
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+          dry_run: true
+          version: 0.3.160
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
