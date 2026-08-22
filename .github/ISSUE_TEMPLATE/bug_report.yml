@@ -1,0 +1,75 @@
+name: Report a bug
+description: Report reproducible incorrect behavior in Agentknock.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Search existing issues before you submit this report. Don't include secret values, pairing data, authentication tokens, or other sensitive information.
+
+        For security vulnerabilities, follow the instructions in `SECURITY.md` instead of opening a public issue.
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe the incorrect behavior and its effect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: Describe the behavior that you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce the problem?
+      description: Provide the smallest reliable sequence of commands or API calls. Replace sensitive values with clear placeholders.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Agentknock version
+      description: Run `agentknock --version` and enter the complete output.
+      placeholder: agentknock 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Include the operating system, release, architecture, and whether you use WSL.
+      placeholder: NixOS 26.05, x86_64
+    validations:
+      required: true
+
+  - type: input
+    id: mobile_version
+    attributes:
+      label: Agentknock mobile version
+      description: If the problem involves the mobile application, enter its version and platform.
+      placeholder: Android application version and Android release
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Include relevant output or logs after you remove all sensitive information.
+      render: text
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I removed secrets and other sensitive information from this report.
+          required: true

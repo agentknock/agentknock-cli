@@ -1,0 +1,47 @@
+name: Propose a feature
+description: Propose a change or addition to Agentknock.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for sharing an idea. Search existing issues before you submit this proposal. Don't include secret values, pairing data, authentication tokens, or other sensitive information.
+
+        Use this issue for the feature discussion. If a prototype helps explain the proposal, you're welcome to provide it in a pull request linked to this issue.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this feature solve?
+      description: Describe the use case and why the existing behavior doesn't meet it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What outcome do you want?
+      description: Describe the behavior or capability that would solve the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Preliminary design
+      description: If you have a design in mind, describe it here. A design isn't required.
+
+  - type: textarea
+    id: considerations
+    attributes:
+      label: Security and compatibility considerations
+      description: Describe any effect on trust boundaries, stored state, protocols, command behavior, or compatibility.
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I removed secrets and other sensitive information from this proposal.
+          required: true
