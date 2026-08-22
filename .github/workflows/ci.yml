@@ -11,8 +11,16 @@ permissions:
 
 jobs:
   check:
-    name: Check (stable)
-    runs-on: ubuntu-24.04
+    name: Check (${{ matrix.architecture }}, stable)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86-64
+            runner: ubuntu-24.04
+          - architecture: ARM64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,7 +32,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
 
-      - name: Run checks
+      - name: Run checks and integration tests
         run: make check
 
   msrv:
@@ -45,8 +53,18 @@ jobs:
         run: cargo check --locked --all-targets --all-features
 
   musl:
-    name: Distribution (x86-64 Linux)
-    runs-on: ubuntu-24.04
+    name: Distribution (${{ matrix.architecture }} Linux)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86-64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - architecture: ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     permissions:
       artifact-metadata: write
       attestations: write
@@ -69,18 +87,18 @@ jobs:
           echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
 
       - name: Build and verify distribution
-        run: make dist-check
+        run: make dist-check DIST_TARGET=${{ matrix.target }}
 
       - name: Attest distribution
         if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
-          subject-checksums: target/dist/agentknock-x86_64-unknown-linux-musl.tar.gz.sha256
+          subject-checksums: target/dist/agentknock-${{ matrix.target }}.tar.gz.sha256
 
       - name: Upload distribution
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: agentknock-x86_64-unknown-linux-musl
+          name: agentknock-${{ matrix.target }}
           path: target/dist/
           if-no-files-found: error
           compression-level: 0

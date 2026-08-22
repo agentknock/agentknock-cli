@@ -6,99 +6,108 @@
   outputs =
     { nixpkgs, ... }:
     let
-      system = "x86_64-linux";
-      target = "x86_64-unknown-linux-musl";
-      pkgs = import nixpkgs { inherit system; };
-      staticPkgs = pkgs.pkgsStatic;
+      targets = {
+        aarch64-linux = "aarch64-unknown-linux-musl";
+        x86_64-linux = "x86_64-unknown-linux-musl";
+      };
       manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-      source = pkgs.lib.fileset.toSource {
+      source = nixpkgs.lib.fileset.toSource {
         root = ./.;
-        fileset = pkgs.lib.fileset.unions [
+        fileset = nixpkgs.lib.fileset.unions [
           ./Cargo.lock
           ./Cargo.toml
           ./src
         ];
       };
 
-      agentknock = staticPkgs.rustPlatform.buildRustPackage {
-        pname = "agentknock";
-        inherit (manifest.package) version;
-        src = source;
+      packages = nixpkgs.lib.mapAttrs (
+        system: target:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          staticPkgs = pkgs.pkgsStatic;
 
-        cargoLock.lockFile = ./Cargo.lock;
-        cargoBuildFlags = [
-          "--bin"
-          "agentknock"
-        ];
-        doCheck = false;
+          agentknock = staticPkgs.rustPlatform.buildRustPackage {
+            pname = "agentknock";
+            inherit (manifest.package) version;
+            src = source;
 
-        nativeBuildInputs = [
-          pkgs.binutils
-          pkgs.cmake
-          pkgs.perl
-        ];
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "--bin"
+              "agentknock"
+            ];
+            doCheck = false;
 
-        LC_ALL = "C";
-        SOURCE_DATE_EPOCH = "1";
-        TZ = "UTC";
+            nativeBuildInputs = [
+              pkgs.binutils
+              pkgs.cmake
+              pkgs.perl
+            ];
 
-        postFixup = ''
-          if ${pkgs.binutils}/bin/readelf --program-headers "$out/bin/agentknock" \
-            | grep --quiet INTERP; then
-            echo "agentknock contains a dynamic interpreter" >&2
-            exit 1
-          fi
-
-          if ${pkgs.binutils}/bin/readelf --dynamic "$out/bin/agentknock" 2>/dev/null \
-            | grep --quiet NEEDED; then
-            echo "agentknock has a dynamic library dependency" >&2
-            exit 1
-          fi
-        '';
-      };
-
-      dist =
-        pkgs.runCommand "agentknock-${manifest.package.version}-${target}-dist"
-          {
             LC_ALL = "C";
             SOURCE_DATE_EPOCH = "1";
             TZ = "UTC";
-            nativeBuildInputs = [
-              pkgs.coreutils
-              pkgs.gnutar
-              pkgs.gzip
-            ];
-          }
-          ''
-            archive="agentknock-${target}.tar.gz"
-            staging_dir=$(mktemp --directory)
 
-            install -D --mode=0755 ${agentknock}/bin/agentknock "$staging_dir/agentknock"
-            install -D --mode=0644 ${./LICENSE-APACHE} "$staging_dir/LICENSE-APACHE"
-            install -D --mode=0644 ${./LICENSE-MIT} "$staging_dir/LICENSE-MIT"
-            mkdir -p "$out"
+            postFixup = ''
+              if ${pkgs.binutils}/bin/readelf --program-headers "$out/bin/agentknock" \
+                | grep --quiet INTERP; then
+                echo "agentknock contains a dynamic interpreter" >&2
+                exit 1
+              fi
 
-            tar \
-              --sort=name \
-              --mtime='@1' \
-              --owner=0 \
-              --group=0 \
-              --numeric-owner \
-              --create \
-              --file=- \
-              --directory="$staging_dir" \
-              agentknock LICENSE-APACHE LICENSE-MIT \
-              | gzip --no-name > "$out/$archive"
+              if ${pkgs.binutils}/bin/readelf --dynamic "$out/bin/agentknock" 2>/dev/null \
+                | grep --quiet NEEDED; then
+                echo "agentknock has a dynamic library dependency" >&2
+                exit 1
+              fi
+            '';
+          };
 
-            (cd "$out" && sha256sum "$archive" > "$archive.sha256")
-          '';
+          dist =
+            pkgs.runCommand "agentknock-${manifest.package.version}-${target}-dist"
+              {
+                LC_ALL = "C";
+                SOURCE_DATE_EPOCH = "1";
+                TZ = "UTC";
+                nativeBuildInputs = [
+                  pkgs.coreutils
+                  pkgs.gnutar
+                  pkgs.gzip
+                ];
+              }
+              ''
+                archive="agentknock-${target}.tar.gz"
+                staging_dir=$(mktemp --directory)
+
+                install -D --mode=0755 ${agentknock}/bin/agentknock "$staging_dir/agentknock"
+                install -D --mode=0644 ${./LICENSE-APACHE} "$staging_dir/LICENSE-APACHE"
+                install -D --mode=0644 ${./LICENSE-MIT} "$staging_dir/LICENSE-MIT"
+                mkdir -p "$out"
+
+                tar \
+                  --sort=name \
+                  --mtime='@1' \
+                  --owner=0 \
+                  --group=0 \
+                  --numeric-owner \
+                  --create \
+                  --file=- \
+                  --directory="$staging_dir" \
+                  agentknock LICENSE-APACHE LICENSE-MIT \
+                  | gzip --no-name > "$out/$archive"
+
+                (cd "$out" && sha256sum "$archive" > "$archive.sha256")
+              '';
+        in
+        {
+          inherit agentknock dist;
+          default = dist;
+        }
+      ) targets;
     in
     {
-      packages.${system} = {
-        inherit agentknock dist;
-        default = dist;
-      };
+      inherit packages;
 
-      checks.${system}.dist = dist;
+      checks = nixpkgs.lib.mapAttrs (system: _: { dist = packages.${system}.dist; }) targets;
     };
 }
