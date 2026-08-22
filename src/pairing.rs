@@ -20,7 +20,7 @@ use crate::{
         self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
         derive_pairing_commitment, derive_psk_rotation, generate_client_secret, seal_pairing,
     },
-    protocol::Method,
+    protocol::{self, Method, Response},
     websocket::RelayExchange,
 };
 
@@ -229,7 +229,20 @@ impl Client {
             .open_response(response)
             .map_err(RequestError::other)?;
         let result: FinishPairingResult =
-            serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+            match protocol::decode_response(&plaintext).map_err(RequestError::other)? {
+                Response::Message(result) => result,
+                Response::Error(error) => {
+                    if let Some(completion) =
+                        protocol::seal_error_completion(self, &mut session, &error)
+                    {
+                        let _ = relay.complete_briefly(&completion).await;
+                    }
+                    return Err(RequestError::DeviceRejected {
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+            };
         if result == FinishPairingResult::Rejected {
             return Err(RequestError::PairingRejected);
         }
@@ -366,7 +379,19 @@ where
     let plaintext = session
         .open_response(response)
         .map_err(RequestError::other)?;
-    serde_json::from_slice::<EmptyMessage>(&plaintext).map_err(RequestError::other)?;
+    match protocol::decode_response::<EmptyMessage>(&plaintext).map_err(RequestError::other)? {
+        Response::Message(_) => {}
+        Response::Error(error) => {
+            if let Some(completion) = protocol::seal_error_completion(client, &mut session, &error)
+            {
+                let _ = relay.complete_briefly(&completion).await;
+            }
+            return Err(RequestError::DeviceRejected {
+                code: error.code,
+                message: error.message,
+            });
+        }
+    }
     let plaintext = client
         .encode(&EmptyMessage {})
         .map_err(RequestError::other)?;

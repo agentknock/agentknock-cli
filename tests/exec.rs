@@ -760,6 +760,77 @@ async fn signal_before_response_sends_an_aborted_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_device_error_sends_an_aborted_completion() {
+    let home = TestHome::active();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap().to_owned();
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, _) =
+            open_request(&device_private_key, &request_id, &request["payload"]);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({
+                        "error": "UNSUPPORTED_METHOD",
+                        "message": "The requested operation is not supported.",
+                    }),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        let plaintext = open_completion(&mut context, &completion["payload"]);
+        assert_eq!(plaintext["result"], "ABORTED");
+        assert_eq!(plaintext["reason"], "CLIENT_ERROR");
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["exec", "-s", "github", "--", "env"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("UNSUPPORTED_METHOD"));
+    assert!(stderr.contains("The command didn't run."));
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();

@@ -1312,6 +1312,11 @@ fn print_upload_error(error: &SecretUploadError) {
             ));
             print_plain_error("The secret upload wasn't delivered.");
         }
+        SecretUploadError::Request(RequestError::DeviceRejected { code, message }) => {
+            print_plain_error(format_args!(
+                "The device couldn't process the secret upload ({code}): {message}"
+            ));
+        }
         SecretUploadError::Request(RequestError::Interrupted) => {
             print_plain_error("Agentknock received a signal and canceled the secret upload.");
             print_plain_error("The device might still have received the upload.");
@@ -1363,6 +1368,11 @@ fn print_list_error(error: &RequestError) {
                 "The relay reports that this paired client is inactive: {message}"
             ));
             print_plain_error("Agentknock didn't receive a secret list.");
+        }
+        RequestError::DeviceRejected { code, message } => {
+            print_plain_error(format_args!(
+                "The device couldn't process the secret list request ({code}): {message}"
+            ));
         }
         RequestError::Interrupted => {
             print_plain_error("Agentknock received a signal and canceled the secret list request.");
@@ -1433,6 +1443,12 @@ fn print_exec_request_error(error: &RequestError) {
         RequestError::ClientInactive { message } => {
             print_message(format_args!(
                 "The relay reports that this paired client is inactive: {message}"
+            ));
+            print_message("The command didn't run.");
+        }
+        RequestError::DeviceRejected { code, message } => {
+            print_message(format_args!(
+                "The device couldn't process the secret use request ({code}): {message}"
             ));
             print_message("The command didn't run.");
         }
@@ -1568,6 +1584,12 @@ fn print_finish_pairing_error(error: &RequestError) {
             ));
             print_plain_error("The pending pairing remains saved.");
         }
+        RequestError::DeviceRejected { code, message } => {
+            print_plain_error(format_args!(
+                "The device couldn't process the pairing confirmation ({code}): {message}"
+            ));
+            print_plain_error("The pairing remains pending.");
+        }
         RequestError::Interrupted => {
             print_plain_error("Agentknock received a signal and canceled pairing confirmation.");
             print_plain_error("The pairing remains pending.");
@@ -1629,6 +1651,11 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
                 RequestError::ClientInactive { message } => {
                     print_plain_error(format_args!(
                         "The relay reports that this paired client is inactive: {message}"
+                    ));
+                }
+                RequestError::DeviceRejected { code, message } => {
+                    print_plain_error(format_args!(
+                        "The device couldn't process the pairing removal request ({code}): {message}"
                     ));
                 }
                 _ => {

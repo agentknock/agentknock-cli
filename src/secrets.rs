@@ -9,7 +9,7 @@ use crate::{
     config::{ConfigurationError, clear_rotation_key, read_pairing_from},
     crypto::Session,
     pairing::RotationError,
-    protocol::Method,
+    protocol::{self, Method, Response},
     websocket::RelayExchange,
 };
 
@@ -206,7 +206,20 @@ impl Client {
             clear_rotation_key(&pairing_path, rotation_key)?;
         }
         let response: ListResponse =
-            serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+            match protocol::decode_response(&plaintext).map_err(RequestError::other)? {
+                Response::Message(response) => response,
+                Response::Error(error) => {
+                    if let Some(completion) =
+                        protocol::seal_error_completion(self, &mut session, &error)
+                    {
+                        let _ = relay.complete_briefly(&completion).await;
+                    }
+                    return Err(RequestError::DeviceRejected {
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+            };
         let plaintext = self.encode(&EmptyMessage {}).map_err(RequestError::other)?;
         let completion = session
             .seal_completion(&plaintext)
@@ -298,7 +311,21 @@ impl Client {
             clear_rotation_key(&pairing_path, rotation_key)?;
         }
         let response: UploadResult =
-            serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+            match protocol::decode_response(&plaintext).map_err(RequestError::other)? {
+                Response::Message(response) => response,
+                Response::Error(error) => {
+                    if let Some(completion) =
+                        protocol::seal_error_completion(self, &mut session, &error)
+                    {
+                        let _ = relay.complete_briefly(&completion).await;
+                    }
+                    return Err(RequestError::DeviceRejected {
+                        code: error.code,
+                        message: error.message,
+                    }
+                    .into());
+                }
+            };
         let completion = self.encode(&response).map_err(RequestError::other)?;
         let completion = session
             .seal_completion(&completion)

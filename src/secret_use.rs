@@ -17,7 +17,7 @@ use crate::{
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing_from},
     crypto::{self, Session},
     pairing::RotationError,
-    protocol::Method,
+    protocol::{self, Method, Response},
     secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
     websocket::{self, RelayExchange},
 };
@@ -198,6 +198,15 @@ pub enum RequestError {
     #[error("paired client is inactive: {message}")]
     ClientInactive {
         /// Human-readable context supplied by the relay.
+        message: String,
+    },
+
+    /// The device returned an authenticated protocol error.
+    #[error("device rejected the request with {code}: {message}")]
+    DeviceRejected {
+        /// A machine-readable error code supplied by the device.
+        code: String,
+        /// Human-readable diagnostic text supplied by the device.
         message: String,
     },
 
@@ -440,8 +449,21 @@ where
     if let Some(rotation_key) = pairing.rotation_key() {
         clear_rotation_key(pairing_path, rotation_key)?;
     }
-    let result: SecretUseResult =
-        serde_json::from_slice(&plaintext).map_err(RequestError::other)?;
+    let result: SecretUseResult = match protocol::decode_response(&plaintext)
+        .map_err(RequestError::other)?
+    {
+        Response::Message(result) => result,
+        Response::Error(error) => {
+            if let Some(completion) = protocol::seal_error_completion(client, &mut session, &error)
+            {
+                let _ = relay.complete_briefly(&completion).await;
+            }
+            return Err(RequestError::DeviceRejected {
+                code: error.code,
+                message: error.message,
+            });
+        }
+    };
     let (completion_result, exchange_result) = match result {
         SecretUseResult::Approved {
             secrets: Some(secrets),
