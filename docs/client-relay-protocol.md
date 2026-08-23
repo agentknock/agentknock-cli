@@ -27,9 +27,9 @@ frame means that a user saw the request or that application processing
 succeeded.
 
 The relay provides at-least-once transfer while an exchange is active.
-Duplicate frames and messages are normal. Stable message identities and
-first-value retention make retries idempotent; endpoint application logic
-remains responsible for processing each message once.
+Duplicate frames and messages are normal. Stable message identities and the
+first-accepted-payload rule make retries idempotent; endpoint application
+logic remains responsible for processing each message once.
 
 The relay treats every application `payload` as an opaque JSON value. It does
 not interpret cryptographic envelope members, protected methods, results,
@@ -58,11 +58,10 @@ After pairing, the client retains that `client_id` and generates a fresh
 sequence numbers. A client must not intentionally reuse one for another
 exchange.
 
-The relay validates a previously unseen request ID's embedded timestamp. The
-hosted v1 relay accepts an ID at most five minutes old and at most one minute
-in the future. It applies this check only when the identifier first creates
-state. Retries continue to use retained state after the timestamp leaves the
-admission window.
+The client generates each request ID immediately before it starts the
+corresponding exchange. If the relay rejects a previously unseen request ID as
+inadmissible, the client does not retry that operation with the rejected ID.
+Retries of an admitted exchange continue to use its original ID.
 
 ## Client token
 
@@ -76,9 +75,7 @@ Authorization: Bearer CLIENT_TOKEN
 
 The token authenticates the client to the relay. It is independent of the
 end-to-end client PSK and is never included in an application payload. The
-relay can store a one-way hash instead of the raw token.
-
-The client uses the same token for every reconnect of the pairing attempt and,
+client uses the same token for every reconnect of the pairing attempt and,
 after enrollment, for every authenticated connection belonging to that
 `client_id`. A client token does not authorize another client ID.
 
@@ -104,10 +101,9 @@ and resolved device for the pairing attempt. Reconnecting with the same
 address ID, request ID, and token resumes that attempt. Another address or
 token cannot replace the admitted values.
 
-The relay can reject a fresh pairing attempt when the address is unavailable,
-new-pairing admission is disabled, the request ID is inadmissible, or pending
-pairing capacity is exhausted. An already admitted attempt remains resumable
-until it expires or becomes active.
+An unsuccessful upgrade does not admit the attempt. An admitted attempt
+is resumed with the same identifiers and token. If the relay no longer has
+the attempt, the upgrade fails or a subsequent `resume` returns `inactive`.
 
 ### Authenticated client connection
 
@@ -226,9 +222,9 @@ The relay acknowledges an accepted client message with:
 }
 ```
 
-An `ack` means that the relay accepted responsibility and durably applied any
-related relay state transition. After receiving it, the client no longer
-needs to retain the payload for relay retransmission.
+An `ack` means that the relay accepted responsibility for the message. After
+receiving it, the client no longer needs to retain the payload for relay
+retransmission, including if the connection then closes.
 
 The client sends the same frame with `kind: "response"` after it accepts a
 response into its live exchange state. Application rejection does not delay
@@ -316,9 +312,9 @@ Each message state has one of the following values:
 | State | Meaning |
 | --- | --- |
 | `absent` | The relay has not accepted the message. |
-| `accepted` | The relay retains the payload for delivery. |
-| `delivered` | The recipient accepted it and the relay deleted the payload. |
-| `discarded` | A terminal event stopped delivery and the relay deleted the payload. |
+| `accepted` | The relay accepted the message, but the recipient has not accepted it. |
+| `delivered` | The recipient accepted the message. |
+| `discarded` | The relay will not deliver the message. |
 
 The valid state combinations are:
 
@@ -406,22 +402,18 @@ following recovery rules after a connection failure:
 | Receipt | No | Continue to wait for the next application message, or finish. |
 | Inactive | No | Stop the affected operation. |
 
-A healthy WebSocket does not need application-level polling. The client waits
-for relay frames and uses WebSocket Ping and Pong control frames to detect a
-dead connection. The reference client sends a Ping after 30 seconds without a
-frame and requires a Pong within 10 seconds.
+A healthy WebSocket does not need application-level polling. The protocol
+does not impose a response deadline while the connection remains healthy. The
+client waits for a response or terminal relay frame unless the user or
+embedding application cancels the operation. A client can use standard
+WebSocket Ping and Pong control frames to detect a dead connection.
 
-Connection, I/O, and retryable relay failures are consecutive failures. A
-valid relay frame resets the client's failure budget. Pending application work
-does not expire merely because no response arrives on a healthy connection.
-The user or embedding application can cancel the operation explicitly.
+## Observable exchange behavior
 
-## Exchange transitions
+The client can rely on the following behavior:
 
-The relay applies these client-visible rules atomically:
-
-- The first admissible request creates an open exchange and receives an
-  acknowledgement.
+- The first accepted request receives an acknowledgement and opens the
+  exchange.
 - A duplicate request receives an acknowledgement. If the device already
   accepted it, the client also observes a receipt or delivered state.
 - A device response implies request delivery. The client accepts at most one
@@ -429,32 +421,20 @@ The relay applies these client-visible rules atomically:
 - An accepted completion moves an open exchange to closing and discards an
   undelivered response.
 - A completion for an unknown or inactive exchange is acknowledged and
-  discarded. The relay retains enough state to stop a reordered request from
-  recreating the operation while its request ID remains admissible.
-- Completion delivery settles the exchange. The client can stop after the
-  relay acknowledges completion.
+  discarded. A reordered request for that exchange does not create a new
+  operation.
+- The client can stop after the relay acknowledges its completion. It does not
+  need to wait for device delivery.
 
 If request and completion are both pending for device delivery, the relay
 preserves request-before-completion order.
 
-## Client-visible lifetime
+## Expiration
 
-The hosted v1 relay uses these retention periods:
-
-| State | Lifetime |
-| --- | --- |
-| Pending pairing | 24 hours after admission unless activated first. |
-| Active exchange with an associated client socket | No fixed protocol deadline. |
-| Active exchange after its last associated client socket closes | Five minutes to reconnect and resume. |
-| Accepted completion awaiting delivery | Up to 24 hours after relay acceptance. |
-| Settled or expired exchange | Five-minute recovery grace and at least through the request ID admission cutoff. |
-
-After recovery state is removed, `resume` returns `inactive`. These periods do
-not change the end-to-end cryptographic freshness requirements.
-
-Rate and capacity limits can change independently of the wire format. A relay
-rejects work before acknowledgement when a temporary limit applies and returns
-a retryable error with an appropriate delay.
+This protocol does not define retention periods. When retained recovery state
+is available, `resume` returns a `state` frame. When the exchange is no longer
+available, it returns `inactive`. A client does not infer either condition from
+elapsed time.
 
 ## WebSocket closure
 
