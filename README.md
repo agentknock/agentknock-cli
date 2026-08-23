@@ -297,6 +297,13 @@ supported.
 
 ## Use the Rust library
 
+The `agentknock` crate is intended to let applications request Agentknock
+secrets directly without invoking the CLI. Its public API is unstable, so
+direct library use is not currently recommended.
+
+See the [`agentknock` API documentation](https://docs.rs/agentknock) for the
+available operations.
+
 ## Documentation
 
 - [Client-device protocol](docs/client-device-protocol.md) defines the
