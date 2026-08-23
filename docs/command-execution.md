@@ -1,253 +1,310 @@
-# Agentknock command execution
+# Agentknock command execution semantics
 
-This document defines how the Agentknock CLI selects and starts a command on
-Linux after the paired device approves secret use. It describes the security
-properties that the executable metadata supports and the limits of environment
-variable delivery.
+This document explains how the Agentknock CLI selects and starts a command
+after the paired device approves secret use. It describes the operating-system
+mechanisms, the consistency properties they provide, and the limits of those
+properties.
 
 The [Agentknock v1 client-device protocol](client-device-protocol.md) defines
 the command metadata sent to the device. The [Agentknock v1
-cryptosystem](cryptosystem.md) defines how Agentknock protects that request and
+cryptosystem](cryptosystem.md) defines how Agentknock protects the request and
 the returned secret values.
 
-## Execution model
+## Security model and scope
 
-`agentknock exec` is a transparent, same-user launcher. It performs the
-following sequence:
+Agentknock is a same-user command launcher, not a local security boundary. It
+runs with the same identity, privileges, and operating-system context as the
+command it starts. It does not try to protect command selection or secret
+values when the host, the current user account, or another process with
+equivalent access is compromised.
 
-1. Resolve, open, inspect, and retain the selected top-level executable.
-2. Send the selected executable and invocation metadata to the device.
-3. Wait for an authenticated response and complete the protocol exchange.
-4. Overlay the returned environment variables on the inherited environment.
-5. Replace the Agentknock process with the approved command.
+For example, a capable same-user process might be able to modify Agentknock or
+a user-owned executable, inspect process memory or environment data, influence
+an interpreter or dynamic loader, or replace configuration and plugins. A
+command that receives secrets can disclose them deliberately or accidentally.
+The command can print them, write them to disk, transmit them, pass them to a
+descendant, or expose them in a crash dump.
+
+The measures in this document are best-effort host hygiene. They make approval
+metadata correspond more closely to the command that Agentknock starts, avoid
+some ordinary pathname races, and provide useful executable identity fields
+for approval decisions. They do not provide remote attestation, endpoint
+protection, or strong guarantees against active local compromise. A normal
+path lookup followed by `execve` would often have similar practical security
+on a compromised host.
+
+Agentknock uses the Linux facilities described here because they are available
+at modest complexity. Failure instead of an implicit fallback keeps the
+behavior and reported metadata predictable; it does not turn the launcher into
+a sandbox or privilege boundary.
+
+## Common execution semantics
+
+`agentknock exec` follows this sequence:
+
+1. Capture the working directory and executable search path.
+2. Select, open, inspect, and retain the top-level executable.
+3. Send the invocation and executable metadata for approval.
+4. Wait for an authenticated response and complete the protocol exchange.
+5. Revalidate the executable when a hash is available.
+6. Overlay the returned environment variables on the inherited environment.
+7. Check for a pending termination signal.
+8. Replace the Agentknock process with the command.
+
+Agentknock selects the executable before requesting secret use. Returned
+environment variables therefore cannot affect Agentknock's initial `PATH`
+search.
 
 Agentknock does not invoke an implicit shell. It keeps the command and each
 argument as separate strings and passes them directly to the operating system.
-The `--` separator in the CLI prevents Agentknock from interpreting command
+The mandatory `--` separator prevents Agentknock from interpreting command
 arguments as its own options.
 
-Agentknock does not remain as a supervisor after a successful process
-replacement. The command retains the process ID and ordinary process
+After a successful process replacement, Agentknock does not remain as a
+supervisor. The command retains the process ID and ordinary process
 relationships of the Agentknock invocation.
 
-## Platform requirements
+## Atomicity boundaries
 
-The CLI command-execution implementation supports Linux. It requires:
+The sequence is not one atomic transaction. The remote protocol exchange and
+operating-system process replacement cannot be committed together. Agentknock
+completes the protocol exchange before it attempts process replacement. The
+client can therefore exit, receive a signal, or encounter an execution error
+after the device has returned a result. A protocol completion confirms the
+client result; it does not prove that the command started.
 
-- Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
-- The `execveat` system call.
-- A mounted `/proc` file system with a usable `/proc/self/fd` view.
-- UTF-8 command arguments, working-directory paths, and resolved executable
-  paths at the protocol boundary.
+The Linux implementation uses individual kernel operations to narrow specific
+races:
 
-Agentknock fails before requesting secret use when the host cannot provide a
-required facility. It does not silently fall back to a second path lookup or a
-weaker mode-bit access check.
+| Boundary | Mechanism | Remaining limitation |
+| --- | --- | --- |
+| Path lookup to selected object | Open the candidate and retain its file descriptor. | The opened file's contents can still change. |
+| Approval wait to native execution | Execute the retained descriptor with `execveat`. | Loaders, libraries, plugins, and other dependencies are not retained. |
+| Approval metadata to executable contents | Hash before the request and again before execution. | The file can change after the second hash observation. |
+| Approval wait to script execution | Rehash the captured script path immediately before `execve`. | The pathname or file can change after revalidation. |
+| Signal handling to process replacement | Block termination signals, check pending signals, then restore the caller's state. | A later signal follows the restored disposition as normal. |
 
-## Command selection
+An executable hash is an observation, not an execution handle. Revalidating a
+hash can detect a change, but it cannot make mutable bytes immutable or make
+the check and execution one operation.
 
-Agentknock selects the executable before it contacts the relay. This ordering
-binds the approval metadata to the object selected without any returned secret
-values in the environment.
+## Approval context
 
-### Working directory and search path
-
-Agentknock opens the current directory with
-`O_PATH | O_DIRECTORY | O_CLOEXEC`. The directory descriptor remains the base
-for relative executable paths and relative `PATH` entries, even if a path name
-leading to that directory changes later.
-
-Agentknock captures `PATH` before the request. If `PATH` is absent, it uses the
-system `_CS_PATH` value. Returned environment variables cannot change this
-selection.
-
-If the command contains `/`, Agentknock opens that path directly. An absolute
-path is relative to the file-system root. A relative path is relative to the
-opened working directory.
-
-If the command contains no `/`, Agentknock searches the captured `PATH` in
-order. Empty and relative path components remain relative to the opened
-working directory. The search continues after errors that ordinary executable
-lookup treats as a missing candidate, including a candidate that exists but is
-not executable. Other errors stop the search.
-
-### Opened executable
-
-Agentknock opens each candidate with `O_PATH | O_CLOEXEC`, then checks the
-opened object. The object must be a regular file and pass an effective-ID
-execute-access check through:
-
-```text
-faccessat2(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)
-```
-
-The later execution system call remains the authoritative permission check.
-Mount options, Linux security modules, file capabilities, interpreter rules,
-and other kernel policy can still reject execution.
-
-Agentknock derives the displayed `executable_path` by reading
-`/proc/self/fd/<fd>` for the opened object. It does not canonicalize one path
-and reopen it after approval. If the resulting path is not valid UTF-8,
-Agentknock stops before sending a request.
-
-The selected descriptor remains open throughout request delivery, device
-approval, response authentication, and completion handoff.
-
-## Executable inspection
-
-Agentknock tries to read the selected object through its retained descriptor.
-When the object is readable, it performs both of these operations in one pass:
-
-- Calculate the SHA-256 digest of the complete file.
-- Check whether the first two bytes are `#!`.
-
-The request contains `executable_mode: "SCRIPT"` for a detected shebang
-script and `executable_mode: "BINARY"` otherwise. It contains
-`executable_hash` when Agentknock could read and hash the file. The field is the
-standard Base64 encoding of the 32-byte SHA-256 digest.
-
-If an execute-only file cannot be read, Agentknock omits the hash and treats
-the target as a binary. A descriptor execution that the kernel cannot complete
-then fails without a path or shell fallback.
-
-Agentknock does not parse a shebang or recursively resolve its interpreter. It
-also does not inspect ELF interpreters, shared libraries, plugins,
-configuration files, or descendant executables.
-
-## Approval metadata
-
-The secret use request reports the following command context:
+The secret use request reports:
 
 - The original command string and structured arguments.
 - The captured working directory.
-- The resolved executable path.
-- The executable mode.
-- The optional SHA-256 executable hash.
+- The selected executable path.
+- Whether the executable is a binary or shebang script.
+- The SHA-256 executable hash, when the file is readable.
 - The connection type of standard input, output, and error.
 - A bounded chain of launcher executable paths.
 - The requested secret names and optional reason.
 
 Agentknock reports a standard stream as a terminal, null device, pipe, socket,
-regular file, or unknown connection. It reads launcher paths from Linux
+regular file, or unknown connection. On Linux, it reads launcher paths from
 `/proc`, up to four ancestors, and orders them from the oldest reported
 ancestor to the direct launcher. Missing, inaccessible, or non-UTF-8 process
 information shortens the chain.
 
-All metadata is client-reported approval context. It is not remote
-attestation. A compromised client can lie about any field.
+This information helps a person or automated policy evaluate a request, but it
+is entirely client-reported. It is not attestation, and a modified client can
+send different values.
 
-## Executable hash and reusable approval
-
-The raw executable hash is not useful as a standalone prompt for a person or
-language model. Its purpose is exact comparison when the device offers a
-time-bounded approval rule such as allowing the same executable version to use
-the same secrets for four hours.
-
-A conservative reusable approval condition includes at least:
-
-- The client ID.
-- The requested secret set.
-- The operation type.
-- The original command string.
-- The resolved executable path.
-- The executable hash.
-- The rule expiry.
-
-The path remains relevant when the hash matches. Identical bytes at different
-paths can behave differently because of argument zero, adjacent files,
-configuration, plugins, loader behavior, or program self-inspection.
-
-Arguments require an explicit rule scope. A match on executable path and hash
-alone must not imply that every argument vector is approved. The device can
-offer an exact command, a defined argument pattern, or an explicitly broad
-executable-wide rule.
-
-The launcher chain is useful for display but is not part of the default
-reusable condition. It is same-user-controlled and can change across shells,
-wrappers, terminals, and agent versions without changing the requested
-authority.
-
-Agentknock verifies a supplied hash again after the protocol exchange and
-before execution. For a native executable, it reads the retained object. For a
-script, it reads the captured path that the kernel will execute. A mismatch or
-read failure stops execution.
+The hash supports exact comparison in a reusable approval rule. It is not
+intended for a person to recognize. A useful rule might also consider the
+client, requested secrets, executable path, arguments, and expiry. The device
+defines that policy; this document does not prescribe it.
+The path can remain meaningful when a hash matches because identical bytes can
+behave differently based on their location, adjacent files, configuration, or
+program self-inspection.
 
 ## Environment construction
 
-After an authenticated approval, Agentknock builds one environment for the
-command:
+After an authenticated approval, Agentknock builds the command environment:
 
-1. Start with the complete environment inherited by Agentknock. Unrelated
-   non-UTF-8 names and values remain byte-preserving operating-system strings.
-2. Overlay every environment variable returned by the device. A returned value
+1. Start with the complete inherited environment. Unrelated non-UTF-8 names
+   and values remain byte-preserving operating-system strings.
+2. Overlay each environment variable returned by the device. A returned value
    replaces an inherited value with the same name.
 3. Reject an empty returned name, a name containing `=` or NUL, or a value
    containing NUL.
 4. Produce at most one entry for each environment variable name.
 
-When several requested secrets provide the same environment variable, their
-values must match exactly. Agentknock rejects the response if they differ.
+When multiple requested secrets provide the same environment variable, their
+values must match exactly. Agentknock rejects conflicting values. It never
+prints or writes a returned value, although verbose output can list variable
+names.
 
-Agentknock never prints or writes a returned value. Verbose output can list
-the environment variable names.
+Agentknock does not remove control variables such as `PATH`, `LD_PRELOAD`,
+`BASH_ENV`, `NODE_OPTIONS`, `PYTHONPATH`, or Git configuration. Unlike `sudo`,
+Agentknock does not cross an identity or privilege boundary. The set of
+influential variables is open-ended, and commands can legitimately require
+them. Sanitizing a small known set would provide incomplete protection while
+breaking valid uses.
 
-Agentknock does not remove environment-control values such as `PATH`,
-`LD_PRELOAD`, `BASH_ENV`, `NODE_OPTIONS`, `PYTHONPATH`, or Git configuration.
-The set of influential environment variables is open-ended, and many commands
-legitimately depend on them. The approved command and its descendants receive
-the resulting environment and can interpret it in any way.
+The approved command and its descendants control every value they receive.
+Users must approve secret use only for commands they trust to handle those
+values.
 
-## Native executable replacement
+## Linux implementation
 
-For a target classified as a binary, Agentknock calls the Linux system call
+The current command-execution implementation supports Linux. It requires:
+
+- Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
+- The `execveat` system call.
+- A mounted `/proc` file system with a usable `/proc/self/fd` view.
+- UTF-8 command arguments, working-directory paths, and selected executable
+  paths at the protocol boundary.
+
+Agentknock stops before requesting secret use when the host cannot provide a
+required facility.
+
+### Working directory and search path
+
+Agentknock opens the current directory with
+`O_PATH | O_DIRECTORY | O_CLOEXEC`. The directory descriptor remains the base
+for relative executable paths and relative `PATH` entries, even if a pathname
+leading to that directory changes later.
+
+Agentknock captures `PATH` before the request. If `PATH` is absent, it uses the
+system `_CS_PATH` value.
+
+If the command contains `/`, Agentknock opens that path directly. An absolute
+path starts at the file-system root. A relative path starts at the retained
+working-directory descriptor.
+
+If the command contains no `/`, Agentknock searches the captured `PATH` in
+order. Empty and relative components start at the retained working directory.
+The search continues after errors that ordinary executable lookup treats as a
+missing candidate, including a candidate that is not executable. Other errors
+stop the search.
+
+Agentknock does not canonicalize a pathname and later reopen it. A canonical
+path is still a mutable name, not a stable reference to a file-system object.
+It also does not repeat the `PATH` search after approval because the directory
+contents and final environment might then select a different command.
+
+### Selected executable
+
+Agentknock opens each candidate with `O_PATH | O_CLOEXEC`. It requires a
+regular file and checks effective-ID execute access with:
+
+```text
+faccessat2(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)
+```
+
+This access check provides normal command-selection behavior. It is not a
+security authorization decision. The execution system call remains
+authoritative, and mount options, Linux security modules, file capabilities,
+interpreter rules, and other kernel policy can still reject execution.
+
+Agentknock does not require a particular owner or writable-mode policy. Many
+intended commands are installed and controlled by the current user, and
+Agentknock does not claim that a user-controlled executable is trusted merely
+because it passed selection.
+
+Normal path resolution follows symbolic links. Agentknock retains the object
+to which a link resolved during selection instead of rejecting links or
+retaining the link itself.
+
+Agentknock obtains the displayed `executable_path` by reading
+`/proc/self/fd/<fd>` for the opened object. If the resulting path is not valid
+UTF-8, Agentknock stops before sending a request. The selected descriptor
+remains open during request delivery, approval, response authentication, and
+completion handoff.
+
+### Executable inspection and revalidation
+
+Agentknock tries to read the selected object through its retained descriptor.
+When the object is readable, one pass calculates the SHA-256 digest of the
+complete file and checks whether the first two bytes are `#!`.
+
+The request identifies a detected shebang file as a script and another file as
+a binary. It includes the standard Base64 encoding of the 32-byte digest when
+hashing succeeds.
+
+An execute-only file might not be readable. In that case, Agentknock omits the
+hash and treats the target as a binary. If the kernel cannot execute it through
+the retained descriptor, execution fails without a pathname or shell fallback.
+
+After approval and before execution, Agentknock recalculates an available
+hash. It reads a binary through the retained descriptor and a script through
+the pathname that the kernel will use. A read failure or mismatch stops
+execution.
+
+Each hash calculation is a streaming read, not an atomic file snapshot.
+Concurrent writes can affect the bytes observed during a hash calculation, and
+the file can change again after the calculation finishes.
+
+Agentknock does not copy the executable into a sealed memory file. A copy would
+be a different execution object and could change path behavior, file
+attributes, capabilities, signatures, or security-policy treatment. It would
+also leave interpreters and runtime dependencies unpinned.
+
+### Native executable replacement
+
+For a target classified as a binary, Agentknock makes the system call
 equivalent of:
 
 ```text
 execveat(fd, "", argv, envp, AT_EMPTY_PATH)
 ```
 
-The descriptor identifies the object opened before approval. Replacing or
-redirecting its original path does not select another top-level object.
+The descriptor identifies the file-system object selected before approval.
+Replacing or redirecting the original pathname does not select another
+top-level object. The file itself remains mutable, so descriptor execution does
+not promise that its bytes stayed unchanged after the final hash observation.
 
 Agentknock uses the original command string as `argv[0]`, followed by the
-original argument strings. It does not repeat a `PATH` search. Every execution
-error is terminal, including `ENOENT` caused by a missing loader or unsupported
-interpreter mechanism.
+original arguments. It does not perform another path lookup. Every execution
+error is terminal, including an error caused by a missing loader.
 
-Descriptor execution can be visible through `AT_EXECFN`, auditing,
-path-oriented policy, or program self-inspection. `/proc/self/exe` still refers
-to the executed object, but software that depends on its exact execution path
-can behave differently.
+Descriptor execution can appear through `AT_EXECFN`, auditing, path-oriented
+policy, or program self-inspection. `/proc/self/exe` refers to the executed
+object, but software that depends on its exact execution path can behave
+differently.
 
-## Script execution
+A hash-only design would not provide the same selection consistency. A hash
+can compare observed contents, but it does not identify the object that the
+kernel must execute. Agentknock therefore retains the descriptor even when it
+also reports a hash.
 
-Linux cannot safely execute a shebang script through a close-on-exec descriptor
-without changing the path presented to its interpreter or leaking the
-descriptor. Agentknock instead calls `execve` once on the exact candidate path
-captured during selection.
+### Script execution
 
-This preserves normal shebang behavior, including the kernel's argument
-transformation and interpreters such as `/usr/bin/env`. It also means scripts
-have weaker pathname protection than native executables. Agentknock rehashes
-the path immediately before execution, but another process can replace or
-modify the script after that check.
+Linux cannot execute a shebang script through a close-on-exec descriptor
+without preventing the interpreter from reopening the script. Removing
+close-on-exec would leak the descriptor into the command. Agentknock instead
+calls `execve` once on the exact candidate pathname captured during selection.
 
-The executable hash covers the script file only. It does not cover the
-interpreter selected by the shebang or anything that the interpreter later
-loads.
+This choice preserves normal shebang behavior, including the kernel's argument
+transformation. It has weaker consistency than native descriptor execution:
+another process can replace or modify the script after the final path-based
+hash check.
 
-## Signals and process state
+Agentknock does not parse or retain the shebang interpreter. In particular, a
+script that uses `/usr/bin/env` causes that program to select an interpreter
+from the final command environment. Agentknock reports and hashes the script,
+not the selected interpreter.
 
-SIGINT and SIGTERM cancel the operation while Agentknock waits for the device.
-If the request reached the relay, Agentknock attempts to send an aborted
+Agentknock also does not inspect ELF interpreters, shared libraries, plugins,
+configuration files, or executables started by the command. Recursively
+pinning a complete runtime is not feasible for a transparent general-purpose
+launcher.
+
+### Signals and process state
+
+SIGINT and SIGTERM cancel the operation while Agentknock waits for approval. If
+the request reached the relay, Agentknock attempts to send an aborted
 completion. A signal after response authentication prevents execution but does
-not rewrite the authenticated device result.
+not change the authenticated result.
 
 Immediately before process replacement, Agentknock blocks SIGINT and SIGTERM,
-checks for a pending signal, restores their dispositions, restores the
-caller's signal mask, and sets SIGPIPE to its default disposition. This closes
-the narrow interval in which a termination signal could otherwise be consumed
-by the no-longer-needed asynchronous signal handler.
+checks for a pending signal, restores their original dispositions, restores
+the caller's signal mask, and sets SIGPIPE to its default disposition. This
+prevents the asynchronous waiting handler from consuming a termination signal
+during the transition. A signal received after restoration follows the
+caller's normal disposition.
 
 Agentknock does not deliberately change:
 
@@ -258,46 +315,43 @@ Agentknock does not deliberately change:
 - Caller-owned inherited file descriptors.
 - The inherited `no_new_privs` state.
 
-Agentknock-owned descriptors use close-on-exec or are closed before
-replacement. It does not sweep all inherited descriptors because an
-application can intentionally use descriptor inheritance as an interface.
+Agentknock-owned descriptors use close-on-exec or are closed before process
+replacement. Agentknock does not close every inherited descriptor because
+applications can intentionally use descriptor inheritance as an interface.
 
-## Guarantees
+Keeping a supervisor would change process IDs, signals, job control, and exit
+status handling. Process replacement avoids those differences and is
+sufficient for environment-variable delivery.
 
-For a native top-level executable on a supported Linux host, Agentknock
-provides these properties:
+## macOS status
 
-- It resolves and opens the command before requesting secret use.
-- It executes the same opened file-system object after approval.
-- Returned environment variables cannot change the selected top-level native
-  executable.
-- It passes the original argument vector without an implicit shell.
-- It replaces itself after completing the protocol exchange.
-- It detects a readable executable whose contents changed between the two hash
-  observations.
+Agentknock does not currently implement command execution on macOS. A future
+implementation belongs in this document because the execution model, approval
+context, environment behavior, and security scope should remain common across
+platforms.
 
-The strongest ordinary case is a native system executable that the invoking
-user cannot modify. A user-owned executable still benefits from pathname
-pinning, but another same-user process can modify its opened file contents.
+The macOS section must document the mechanisms it actually uses and the races
+that remain. It does not need to reproduce Linux system calls or claim stronger
+consistency than macOS can provide. Keeping both implementations here makes
+platform differences visible instead of hiding them behind a general claim.
 
 ## Limits
 
-Agentknock does not provide any of the following properties:
+Agentknock does not provide:
 
 - Immutable executable bytes.
 - Remote attestation of a path, owner, hash, or file contents.
-- Path pinning for shebang scripts.
-- Pinning for interpreters, libraries, plugins, configuration, or descendants.
-- Isolation from the inherited or returned environment.
-- A sandbox, privilege boundary, or sudo-like authorization boundary.
+- Stable pathname execution for shebang scripts.
+- Pinning of interpreters, libraries, plugins, configuration, or descendants.
+- Isolation from inherited or returned environment data.
+- A sandbox, privilege boundary, or `sudo`-like authorization boundary.
 - Protection of secret values from the approved process tree.
-- Protection from another process with sufficient same-user inspection or
-  modification access.
+- Protection from a modified Agentknock client or a compromised host.
 
-The approved command controls every value that it receives. It can print the
-values, write them to disk, transmit them, pass them to descendants, or expose
-them through a crash dump. The user must approve only commands that are trusted
-to handle the requested secrets.
+These limits are fundamental to the same-user execution model. The selected
+mechanisms improve consistency where doing so is straightforward, but they do
+not change which local components ultimately have access to the command or its
+secrets.
 
 ## References
 
