@@ -1,59 +1,53 @@
-name: CI
+name: Release
 
 on:
   push:
     branches:
       - master
-  pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  check:
-    name: Check (${{ matrix.architecture }}, stable)
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - architecture: x86-64
-            runner: ubuntu-24.04
-          - architecture: ARM64
-            runner: ubuntu-24.04-arm
+  prepare:
+    name: Prepare release
+    if: github.repository == 'nakedible/agentknock-cli'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Run checks and integration tests
-        run: make check
-
-  msrv:
-    name: Check (Rust 1.89)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare release and check release plan
+        id: release-plz
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
-          persist-credentials: false
+          dry_run: true
+          version: 0.3.160
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          rustup default 1.89.0
-
-      - name: Check all targets
-        run: cargo check --locked --all-targets --all-features
-
-  musl:
-    name: Distribution (${{ matrix.architecture }} Linux)
+  distribution:
+    name: Release distribution (${{ matrix.architecture }} Linux)
+    needs: prepare
+    if: needs.prepare.outputs.releases_created == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -90,22 +84,23 @@ jobs:
         run: make dist-check DIST_TARGET=${{ matrix.target }}
 
       - name: Attest distribution
-        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: target/dist/agentknock-${{ matrix.target }}.tar.gz.sha256
 
-      - name: Upload distribution
+      - name: Stage distribution
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: agentknock-${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: target/dist/
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 1
 
   installer:
-    name: Installer
+    name: Release installer
+    needs: prepare
+    if: needs.prepare.outputs.releases_created == 'true'
     runs-on: ubuntu-24.04
     permissions:
       artifact-metadata: write
@@ -125,53 +120,30 @@ jobs:
         run: make installer-dist
 
       - name: Attest installer
-        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: target/installer/install.sh.sha256
 
-      - name: Upload installer
+      - name: Stage installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: agentknock-installer
+          name: release-installer
           path: target/installer/
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 1
 
-  dependencies:
-    name: Check dependencies
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Install cargo-deny
-        run: |
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
-            --output cargo-deny.tar.gz
-          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tar.gz" \
-            | sha256sum --check
-          tar --extract --gzip --file cargo-deny.tar.gz
-          install cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny \
-            "$HOME/.cargo/bin/cargo-deny"
-
-      - name: Check dependencies
-        run: make dependency-check
-
-  release-readiness:
-    name: Check release
+  publish:
+    name: Publish release
+    needs:
+      - prepare
+      - distribution
+      - installer
+    if: needs.prepare.outputs.releases_created == 'true'
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
+      id-token: write
       pull-requests: read
     steps:
       - name: Check out repository
@@ -185,14 +157,53 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Verify package
-        run: make package-check
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release-assets
+          merge-multiple: true
 
-      - name: Check release plan
+      - name: Verify release assets
+        working-directory: ${{ runner.temp }}/release-assets
+        run: sha256sum --check -- *.sha256
+
+      - name: Create draft release and publish crate
+        id: release-plz
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release
-          dry_run: true
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           version: 0.3.160
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify release result
+        id: release
+        env:
+          ACTUAL_RELEASES: ${{ steps.release-plz.outputs.releases }}
+          PLANNED_RELEASES: ${{ needs.prepare.outputs.releases }}
+        run: |
+          actual_tag=$(printf '%s' "$ACTUAL_RELEASES" \
+            | jq --exit-status --raw-output \
+              'if length == 1 then .[0].tag else error("expected one release") end')
+          planned_tag=$(printf '%s' "$PLANNED_RELEASES" \
+            | jq --exit-status --raw-output \
+              'if length == 1 then .[0].tag else error("expected one planned release") end')
+          if [ "$actual_tag" != "$planned_tag" ]; then
+            echo "release tag $actual_tag does not match planned tag $planned_tag" >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$actual_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Attach release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release upload "$RELEASE_TAG" "${{ runner.temp }}"/release-assets/*
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest --verify-tag
