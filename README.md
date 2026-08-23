@@ -5,6 +5,11 @@ without storing long-lived credentials in agent configuration or project
 files. A paired mobile device authorizes each request and sends the requested
 secrets to the command.
 
+> [!WARNING]
+> Agentknock is an early preview. This documentation describes the intended
+> product, including components that are not yet publicly available. Preview
+> releases provide no backward-compatibility guarantees.
+
 ## How Agentknock works
 
 Agentknock delivers secrets from a paired mobile device when a command needs
