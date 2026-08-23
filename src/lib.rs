@@ -1,4 +1,12 @@
-//! TODO: Document the Agentknock project.
+//! Agentknock is primarily a command-line application.
+//!
+//! Start with the [Agentknock README] for installation, usage, and project
+//! documentation.
+//!
+//! The public items below form the unstable Agentknock embedding API. Direct
+//! use of this API is not currently recommended.
+//!
+//! [Agentknock README]: https://docs.rs/crate/agentknock/latest
 
 mod client;
 mod config;

@@ -295,15 +295,6 @@ Agentknock supports WSL2 through its Linux environment. Use the archive that
 matches the WSL2 architecture. Native Windows and macOS clients are not
 supported.
 
-## Use the Rust library
-
-The `agentknock` crate is intended to let applications request Agentknock
-secrets directly without invoking the CLI. Its public API is unstable, so
-direct library use is not currently recommended.
-
-See the [`agentknock` API documentation](https://docs.rs/agentknock) for the
-available operations.
-
 ## Documentation
 
 - [Client-device protocol](docs/client-device-protocol.md) defines the
@@ -314,6 +305,10 @@ available operations.
   construction and threat model.
 - [Command execution](docs/command-execution.md) defines how the Linux CLI
   selects, inspects, and starts an approved command.
+
+The [Rust API documentation](https://docs.rs/agentknock) describes the
+unstable interface for embedding Agentknock in applications. Direct library
+use is not currently recommended.
 
 User documentation is available at
 [agentknock.dev/doc](https://agentknock.dev/doc/).

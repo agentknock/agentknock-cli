@@ -2,7 +2,7 @@
 name = "agentknock"
 version = "0.1.0"
 categories = ["authentication", "command-line-utilities", "cryptography"]
-documentation = "https://docs.rs/agentknock"
+documentation = "https://docs.rs/crate/agentknock/latest"
 edition = "2024"
 homepage = "https://agentknock.dev/"
 include = [
