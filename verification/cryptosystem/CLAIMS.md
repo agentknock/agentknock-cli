@@ -1,7 +1,7 @@
 # Agentknock v1 formal-verification claims
 
 This file is the coverage ledger for the symbolic verification of
-[`docs/CRYPTOSYSTEM.md`](../../docs/CRYPTOSYSTEM.md). A result is meaningful
+[`docs/cryptosystem.md`](../../docs/cryptosystem.md). A result is meaningful
 only together with the abstraction and compromise conditions stated by the
 model that proves it.
 

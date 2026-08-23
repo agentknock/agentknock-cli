@@ -1,7 +1,7 @@
 # Agentknock v1 cryptosystem verification
 
 This directory is a reproducible, specification-level symbolic analysis of
-[`docs/CRYPTOSYSTEM.md`](../../docs/CRYPTOSYSTEM.md). It analyzes the protocol
+[`docs/cryptosystem.md`](../../docs/cryptosystem.md). It analyzes the protocol
 as written. It does **not** inspect, model, test, or make claims about the
 Agentknock implementation.
 
@@ -27,8 +27,8 @@ arguments that symbolic tools cannot make are in
 The recorded target is the following exact specification:
 
 ```text
-SHA-256  9962cc73781d6e8fea371aef914a66c6f128ef8a832dec3d3eb2f6e08a56a096
-file     docs/CRYPTOSYSTEM.md
+SHA-256  ac86cb6cb2e4808fb8eea8358c6b4b4946d5cecc5fae806307e7b5c60dcc2d6f
+file     docs/cryptosystem.md
 ```
 
 From the repository root, verify it with:
@@ -39,6 +39,12 @@ sha256sum -c verification/cryptosystem/SPECIFICATION.sha256
 
 If the specification changes, the models and coverage ledger must be reviewed;
 a matching old proof run is not evidence about the changed document.
+
+The JSON wire representation is defined separately in
+[`docs/client-device-protocol.md`](../../docs/client-device-protocol.md). It is
+intentionally outside this hashed verification target: concrete serialization,
+parsing, and interoperability are the O06 conformance obligation rather than a
+symbolic trace claim.
 
 ## Reproducing the analysis
 

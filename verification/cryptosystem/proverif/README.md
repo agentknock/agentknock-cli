@@ -1,7 +1,7 @@
 # ProVerif models for Agentknock v1
 
 These models independently check the unbounded-session symbolic
-cryptographic core of [`docs/CRYPTOSYSTEM.md`](../../../docs/CRYPTOSYSTEM.md).
+cryptographic core of [`docs/cryptosystem.md`](../../../docs/cryptosystem.md).
 They complement the Tamarin state-machine model; they do not replace it.
 
 ## Pinned tool

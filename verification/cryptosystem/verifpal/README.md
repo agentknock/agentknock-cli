@@ -1,7 +1,7 @@
 # Verifpal model of the Agentknock v1 cryptosystem
 
 This directory contains a bounded symbolic analysis of
-[`docs/CRYPTOSYSTEM.md`](../../../docs/CRYPTOSYSTEM.md) under an active
+[`docs/cryptosystem.md`](../../../docs/cryptosystem.md) under an active
 Dolev--Yao network attacker. It covers the cryptographic core of pairing and
 SAS-gated activation, ordinary paired traffic, response and completion
 binding, rotation fallback and confirmation, session mixups, and the stated

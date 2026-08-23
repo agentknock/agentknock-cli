@@ -220,8 +220,11 @@ trust to handle the values safely. Descendant commands and other processes
 with sufficient same-user inspection access might also observe them.
 
 For the complete design, threat model, and limitations, read the
-[Agentknock v1 cryptosystem](https://github.com/nakedible/agentknock-cli/blob/master/docs/CRYPTOSYSTEM.md)
-and [secure command execution analysis](https://github.com/nakedible/agentknock-cli/blob/master/docs/secure-command-execution.md).
+[Agentknock v1 cryptosystem](docs/cryptosystem.md) and
+[command execution design](docs/command-execution.md).
+The repository also includes [reproducible symbolic
+analysis](verification/cryptosystem/README.md) of the v1 cryptosystem, with
+claim-by-claim results, assumptions, and limitations.
 Report suspected vulnerabilities according to the
 [security policy](https://github.com/nakedible/agentknock-cli/security/policy).
 
@@ -230,6 +233,18 @@ Report suspected vulnerabilities according to the
 ## Use the Rust library
 
 ## Documentation
+
+- [Client-device protocol](docs/client-device-protocol.md) defines the
+  end-to-end messages and operations exchanged by a client and mobile device.
+- [Client-relay protocol](docs/client-relay-protocol.md) defines the WebSocket
+  interface used by clients.
+- [Cryptosystem](docs/cryptosystem.md) defines the end-to-end cryptographic
+  construction and threat model.
+- [Command execution](docs/command-execution.md) defines how the Linux CLI
+  selects, inspects, and starts an approved command.
+
+User documentation is available at
+[agentknock.dev/doc](https://agentknock.dev/doc/).
 
 ## Contribute
 

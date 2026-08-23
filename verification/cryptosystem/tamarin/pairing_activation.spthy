@@ -2,7 +2,7 @@
  * Agentknock v1: initial pairing, SAS comparison, and activation.
  *
  * This is a symbolic model of Sections 7 and 8 (as used for activation) of
- * docs/CRYPTOSYSTEM.md.  HPKE's KEM is modeled as ideal public-key
+ * docs/cryptosystem.md.  HPKE's KEM is modeled as ideal public-key
  * encapsulation of a fresh context seed, with domain-separated record keys
  * and exporters explicit.  Concrete HPKE/KEM security is assumption O01.
  * The user/OOB comparison is a

@@ -1,7 +1,7 @@
 # Tamarin model of the Agentknock v1 cryptosystem
 
 This directory contains the stateful part of the specification-level analysis
-of [`docs/CRYPTOSYSTEM.md`](../../../docs/CRYPTOSYSTEM.md). The models cover
+of [`docs/cryptosystem.md`](../../../docs/cryptosystem.md). The models cover
 pairing and SAS gating, request/response/completion slots, PSK rotation and
 overlap, retained exchanges, invalidation, per-binding isolation, compromise,
 and cloned or rolled-back client state.
