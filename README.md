@@ -235,7 +235,7 @@ Report suspected vulnerabilities according to the
 ## Documentation
 
 - [Client-device protocol](docs/client-device-protocol.md) defines the
-  end-to-end messages and operations exchanged by a client and mobile device.
+  end-to-end messages and operations exchanged by a client and paired device.
 - [Client-relay protocol](docs/client-relay-protocol.md) defines the WebSocket
   interface used by clients.
 - [Cryptosystem](docs/cryptosystem.md) defines the end-to-end cryptographic

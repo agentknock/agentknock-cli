@@ -12,6 +12,11 @@ application meaning defined here.
 
 ## Roles and exchanges
 
+The term **device** identifies the protocol endpoint that owns the device
+identity, controls secrets, and decides how to answer client requests. It does
+not imply a physical device or a particular user interface. A device can be a
+mobile application, a local service, or a cloud service.
+
 The client initiates every exchange. The device accepts, rejects, or answers
 the request. An exchange has the following logical messages:
 
@@ -93,8 +98,8 @@ The clear initial pairing response serializes
 ```
 
 The decoded device key and device random are each 32 bytes. This response is
-not authenticated until the user confirms the pairing short authentication
-string (SAS).
+not authenticated until the complete pairing short authentication string
+(SAS) is confirmed through a trusted out-of-band interaction.
 
 ### Initial pairing completion
 
@@ -190,9 +195,8 @@ Every protected plaintext sent by a client contains `app_info` and
 
 `app_info` identifies the application that initiated the operation.
 `lib_info` identifies the Agentknock protocol library embedded by that
-application. Each `name` and `version` value is an opaque string. Devices can
-use these values for diagnostics and compatibility handling, but they do not
-replace the outer `agentknock-v1` protocol selector.
+application. Each `name` and `version` value is an opaque string. These values
+do not replace the outer `agentknock-v1` protocol selector.
 
 The examples in the following sections omit these two members for brevity.
 They remain required in every protected client request and completion,
@@ -214,7 +218,8 @@ The client performs the following sequence:
 5. Store the resulting pairing as pending.
 6. Send the base-mode completion. If delivery fails, remove the pending
    pairing.
-7. Present the complete 12-digit SAS for comparison with the device.
+7. Present the complete 12-digit SAS for confirmation through a trusted
+   out-of-band interaction.
 
 If the exchange is abandoned before the SAS is presented, the client discards
 its in-memory transcript and starts any later attempt with fresh values.
@@ -243,14 +248,14 @@ The application plaintext in the pairing completion has this form:
 
 `platform` and `architecture` are required client-reported strings. The
 `hostname`, `machine_id`, and `os_version` members are optional. All metadata
-is untrusted until the user confirms the SAS and accepts the pairing. It must
-not cause security-sensitive effects before acceptance.
+is unauthenticated until the full SAS is confirmed and the pairing is
+accepted.
 
 ### Pairing activation
 
-After the user confirms the SAS and accepts the pairing on the device, the
-client activates its pending pairing through an ordinary paired exchange.
-Only this method is valid for a pending pairing.
+After the full SAS is confirmed and the device accepts the pairing, the client
+activates its pending pairing through an ordinary paired exchange. Only this
+method is valid for a pending pairing.
 
 The request plaintext is:
 
@@ -274,9 +279,10 @@ The device responds with one of the following plaintexts:
 }
 ```
 
-Before sending `ACCEPTED`, the device makes the pairing active and fixes that
-response for repeat delivery. The client marks its local pairing active only
-after it authenticates `ACCEPTED` and durably saves the active state.
+An authenticated `ACCEPTED` response guarantees that the device activated the
+pairing before releasing that response. Repeated delivery of the same request
+returns the same result. The client marks its local pairing active only after
+it authenticates `ACCEPTED` and durably records the active state.
 
 After local activation, the client sends this completion plaintext:
 
@@ -299,7 +305,7 @@ member. Version 1 defines the following methods:
 | --- | --- |
 | `SecretUse` | Request one or more secrets for an operation. |
 | `SecretList` | List secret metadata without secret values. |
-| `SecretUpload` | Deliver a secret proposal for later review. |
+| `SecretUpload` | Deliver a secret proposal for separate acceptance. |
 | `PairingRemove` | Remove the relationship between the client and device. |
 
 The device returns one terminal response for an accepted request. The client
@@ -521,8 +527,9 @@ no method-specific members.
 ## Secret upload
 
 The `SecretUpload` method delivers a proposal to the device. A successful
-response confirms that the device durably received the proposal for user
-review. It does not mean that the proposal was approved or applied.
+response confirms that the device durably accepted responsibility for the
+proposal. Acceptance or application of the proposed change is a separate
+decision and is not reported by this exchange.
 
 ### Secret upload request
 
@@ -545,11 +552,11 @@ An environment-secret upload has this form:
 }
 ```
 
-The `mode` member controls the change that the device proposes to the user:
+The `mode` member defines the proposed change if it is accepted:
 
-| Mode | Meaning after approval on the device |
+| Mode | Effect if accepted |
 | --- | --- |
-| `CREATE` | Create a secret. The user can choose another final name. |
+| `CREATE` | Create a secret. Its final name can differ from the proposed name. |
 | `UPDATE` | Change the supplied fields and retain unspecified content. |
 | `REPLACE` | Replace the complete secret and remove unspecified content. |
 
@@ -562,7 +569,7 @@ are retained. In `REPLACE`, omitted environment variables are removed.
 
 ### Secret upload response and completion
 
-The device confirms durable receipt with:
+The device confirms that it accepted responsibility for the proposal with:
 
 ```json
 {
@@ -570,18 +577,18 @@ The device confirms durable receipt with:
 }
 ```
 
-The device can reject a proposal that it cannot store for review:
+The device can reject the proposal immediately:
 
 ```json
 {
   "result": "REJECTED",
-  "message": "The upload cannot be stored."
+  "message": "The upload cannot be accepted."
 }
 ```
 
-`REJECTED` is an immediate protocol result, not the user's later decision
-about the proposal. The client completion repeats the response `result` and,
-for `REJECTED`, its `message`.
+`REJECTED` is an immediate protocol result, not a later decision about the
+proposed change. The client completion repeats the response `result` and, for
+`REJECTED`, its `message`.
 
 ## Pairing removal
 
@@ -599,10 +606,10 @@ An accepted response is an empty object:
 {}
 ```
 
-The device commits removal before it sends the response. After the client
-authenticates the response, it deletes its local pairing and sends a
-best-effort completion. The completion contains only the required client
-software information.
+An authenticated response guarantees that the device removed the pairing
+before releasing that response. The client then deletes its local pairing and
+sends a best-effort completion. The completion contains only the required
+client software information.
 
 Because local and device state cannot be deleted atomically, either endpoint
 can retain an unmatched pairing after a crash or forced local removal. A later
