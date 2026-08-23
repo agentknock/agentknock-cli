@@ -2,9 +2,9 @@ DIST_DIR := target/dist
 DIST_LINK := target/nix-dist
 DIST_TARGET := x86_64-unknown-linux-musl
 
-.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test release-build docs package-check dependency-check dist dist-check
+.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test installer-check installer-dist release-build docs package-check dependency-check dist dist-check
 
-check: fmt-check clippy-check test release-build docs
+check: fmt-check clippy-check test installer-check release-build docs
 
 fix: fmt-fix clippy-fix
 
@@ -23,6 +23,15 @@ clippy-fix:
 test:
 	cargo test --locked --all-targets --all-features
 	cargo test --locked --doc --all-features
+
+installer-check:
+	sh -n install.sh
+	sh tests/install.sh
+
+installer-dist: installer-check
+	install -d target/installer
+	install -m 0755 install.sh target/installer/install.sh
+	cd target/installer && sha256sum install.sh > install.sh.sha256
 
 release-build:
 	cargo build --locked --release --all-features

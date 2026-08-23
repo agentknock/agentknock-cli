@@ -104,6 +104,41 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  installer:
+    name: Installer
+    runs-on: ubuntu-24.04
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint installer
+        run: shellcheck install.sh tests/install.sh
+
+      - name: Build and test installer
+        run: make installer-dist
+
+      - name: Attest installer
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: target/installer/install.sh.sha256
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentknock-installer
+          path: target/installer/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   package:
     name: Package
     runs-on: ubuntu-24.04
