@@ -313,4 +313,13 @@ User documentation is available at
 
 ## Contribute
 
+Contributions are welcome as bug reports, feature proposals, and design
+discussions in GitHub issues. The maintainers write the final implementation;
+pull requests can serve as prototypes or reproductions but are not merged.
+Read [Contributing to Agentknock](CONTRIBUTING.md) before you open an issue or
+pull request.
+
 ## License
+
+Agentknock is available under your choice of the
+[Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT).
