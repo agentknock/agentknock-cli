@@ -139,23 +139,6 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  package:
-    name: Package
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Verify package
-        run: make package-check
-
   dependencies:
     name: Check dependencies
     runs-on: ubuntu-24.04
@@ -201,6 +184,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Verify package
+        run: make package-check
 
       - name: Check release plan
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
