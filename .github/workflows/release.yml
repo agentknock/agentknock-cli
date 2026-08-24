@@ -28,12 +28,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Configure GitHub authentication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh auth setup-git --hostname github.com --force
 
       - name: Prepare release and check release plan
         id: release-plz
