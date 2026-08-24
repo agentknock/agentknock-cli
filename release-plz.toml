@@ -2,3 +2,12 @@
 git_release_draft = true
 git_release_latest = false
 release_always = false
+
+[changelog]
+protect_breaking_commits = true
+commit_parsers = [
+    { message = "^Merge ", skip = true },
+    { message = '^feat(?:\([^)]*\))?!?:', group = "added" },
+    { message = '^fix(?:\([^)]*\))?!?:', group = "fixed" },
+    { message = "^.*", group = "other" },
+]
