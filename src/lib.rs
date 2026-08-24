@@ -13,6 +13,7 @@ mod config;
 mod crypto;
 mod pairing;
 mod protocol;
+mod proxy;
 mod secret_use;
 mod secrets;
 mod websocket;

@@ -12,8 +12,8 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 
 use support::{
-    TestHome, accept, assert_authenticated_request, encrypt_response, open_completion,
-    open_request, receive_json, send_json, websocket_server,
+    TestHome, accept, assert_authenticated_request, encrypt_response, http_connect_proxy,
+    open_completion, open_request, receive_json, send_json, websocket_server,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -101,10 +101,17 @@ async fn lists_secret_metadata_without_secret_values() {
         .await;
     })
     .await;
+    let (proxy_url, proxy) = http_connect_proxy().await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("ALL_PROXY", proxy_url)
+        .env_remove("all_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         .args(["secret", "list"])
         .output()
         .unwrap();
@@ -131,6 +138,7 @@ async fn lists_secret_metadata_without_secret_values() {
         })
     );
     server.await.unwrap();
+    proxy.await.unwrap();
 }
 
 #[test]
@@ -146,6 +154,28 @@ fn reports_when_no_pairing_exists() {
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("Agentknock isn't paired")
+    );
+}
+
+#[test]
+fn reports_an_invalid_https_proxy() {
+    let home = TestHome::active();
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("HTTPS_PROXY", "not a proxy URL")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .args(["secret", "list"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr).unwrap().contains(
+            "invalid proxy configuration: HTTPS_PROXY does not contain a valid proxy URL"
+        )
     );
 }
 

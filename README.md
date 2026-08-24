@@ -171,6 +171,20 @@ return the secrets before it starts the command. If the request is still
 waiting after 30 seconds, Agentknock writes a progress update with the elapsed
 time to standard error every 30 seconds. Press Ctrl-C to cancel the request.
 
+### Use a network proxy
+
+Agentknock uses `HTTPS_PROXY` for its secure WebSocket connection to the relay
+and falls back to `ALL_PROXY`. The lowercase forms `https_proxy` and
+`all_proxy` are also supported and take precedence over their uppercase forms.
+Set `NO_PROXY` or `no_proxy` to exclude hosts from proxying. Proxy URLs can use
+HTTP or HTTPS and can include HTTP Basic authentication credentials.
+
+For example, connect through an HTTP proxy:
+
+```sh
+HTTPS_PROXY=http://proxy.example:8080 agentknock secret list
+```
+
 ## Manage secrets
 
 Manage secrets primarily in the mobile app. The commands in this section

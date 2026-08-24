@@ -27,7 +27,11 @@ use hpke::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::{TcpListener, TcpStream},
+    task::JoinHandle,
+};
 use tokio_websockets::{Message, ServerBuilder, WebSocketStream};
 use ulid::Ulid;
 
@@ -132,6 +136,44 @@ where
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(handler(listener));
     (format!("ws://{address}"), task)
+}
+
+pub async fn http_connect_proxy() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut request = Vec::with_capacity(1024);
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let length = client.read(&mut buffer).await.unwrap();
+            assert_ne!(length, 0, "proxy client closed during CONNECT request");
+            request.extend_from_slice(&buffer[..length]);
+            if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+            assert!(request.len() < 8 * 1024, "CONNECT request is too large");
+        }
+
+        let request = std::str::from_utf8(&request).unwrap();
+        let authority = request
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("CONNECT ")
+            .unwrap()
+            .strip_suffix(" HTTP/1.1")
+            .unwrap();
+        let mut relay = TcpStream::connect(authority).await.unwrap();
+        client
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::io::copy_bidirectional(&mut client, &mut relay)
+            .await
+            .unwrap();
+    });
+    (format!("http://{address}"), task)
 }
 
 pub async fn accept(
