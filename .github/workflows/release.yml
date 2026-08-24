@@ -21,8 +21,8 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      releases: ${{ steps.release-plz.outputs.releases }}
-      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      release: ${{ steps.release.outputs.release }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,13 +41,59 @@ jobs:
         run: gh auth setup-git --hostname github.com --force
 
       - name: Prepare release and check release plan
-        id: release-plz
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           dry_run: true
           version: 0.3.160
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect release merge
+        id: release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          pull_requests=$(gh api "repos/$GH_REPO/commits/$MERGE_SHA/pulls")
+          release_count=$(printf '%s' "$pull_requests" | jq \
+            --arg merge_sha "$MERGE_SHA" \
+            --arg repository "$GH_REPO" '
+              [
+                .[]
+                | select(
+                    .merged_at != null
+                    and .merge_commit_sha == $merge_sha
+                    and .base.ref == "master"
+                    and (.head.ref | startswith("release-plz-"))
+                    and .head.repo.full_name == $repository
+                  )
+              ]
+              | length
+            ')
+
+          case "$release_count" in
+            0)
+              echo 'release=false' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            1) ;;
+            *)
+              echo "expected at most one associated release pull request, found $release_count" >&2
+              exit 1
+              ;;
+          esac
+
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq \
+            --exit-status --raw-output '
+              if (.packages | length) == 1 then
+                .packages[0].version
+              else
+                error("expected one package")
+              end
+            ')
+          echo 'release=true' >> "$GITHUB_OUTPUT"
+          printf 'tag=v%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Delete obsolete release branches
         env:
@@ -69,7 +115,7 @@ jobs:
   distribution:
     name: Release distribution (${{ matrix.architecture }} Linux)
     needs: prepare
-    if: needs.prepare.outputs.releases_created == 'true'
+    if: needs.prepare.outputs.release == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -122,7 +168,7 @@ jobs:
   installer:
     name: Release installer
     needs: prepare
-    if: needs.prepare.outputs.releases_created == 'true'
+    if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-24.04
     permissions:
       artifact-metadata: write
@@ -161,7 +207,7 @@ jobs:
       - prepare
       - distribution
       - installer
-    if: needs.prepare.outputs.releases_created == 'true'
+    if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -204,16 +250,13 @@ jobs:
         id: release
         env:
           ACTUAL_RELEASES: ${{ steps.release-plz.outputs.releases }}
-          PLANNED_RELEASES: ${{ needs.prepare.outputs.releases }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           actual_tag=$(printf '%s' "$ACTUAL_RELEASES" \
             | jq --exit-status --raw-output \
               'if length == 1 then .[0].tag else error("expected one release") end')
-          planned_tag=$(printf '%s' "$PLANNED_RELEASES" \
-            | jq --exit-status --raw-output \
-              'if length == 1 then .[0].tag else error("expected one planned release") end')
-          if [ "$actual_tag" != "$planned_tag" ]; then
-            echo "release tag $actual_tag does not match planned tag $planned_tag" >&2
+          if [ "$actual_tag" != "$EXPECTED_TAG" ]; then
+            echo "release tag $actual_tag does not match expected tag $EXPECTED_TAG" >&2
             exit 1
           fi
           printf 'tag=%s\n' "$actual_tag" >> "$GITHUB_OUTPUT"
