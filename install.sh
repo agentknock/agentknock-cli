@@ -53,7 +53,7 @@ main() {
 			;;
 	esac
 
-	repository_url=https://github.com/nakedible/agentknock-cli
+	repository_url=https://github.com/agentknock/agentknock-cli
 	latest_release_url=$repository_url/releases/latest
 	if ! release_url=$(curl --proto '=https' --tlsv1.2 --fail --silent \
 		--show-error --location --output /dev/null \

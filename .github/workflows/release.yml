@@ -15,7 +15,7 @@ concurrency:
 jobs:
   prepare:
     name: Prepare release
-    if: github.repository == 'nakedible/agentknock-cli'
+    if: github.repository == 'agentknock/agentknock-cli'
     runs-on: ubuntu-24.04
     permissions:
       contents: write

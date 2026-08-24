@@ -47,5 +47,5 @@ Give the maintainers reasonable time to investigate and fix a vulnerability
 before you disclose it publicly. The maintainers will coordinate disclosure
 with you and credit your contribution unless you ask to remain anonymous.
 
-[android-report]: https://github.com/nakedible/agentknock-android/security/advisories/new
-[cli-report]: https://github.com/nakedible/agentknock-cli/security/advisories/new
+[android-report]: https://github.com/agentknock/agentknock-android/security/advisories/new
+[cli-report]: https://github.com/agentknock/agentknock-cli/security/advisories/new

@@ -48,13 +48,13 @@ Run the same command again to update Agentknock.
 Use the GitHub release through mise:
 
 ```sh
-mise use --global github:nakedible/agentknock-cli
+mise use --global github:agentknock/agentknock-cli
 ```
 
 mise verifies the GitHub build attestation when one is available for the
 release artifact.
 
-Run `mise upgrade github:nakedible/agentknock-cli` to update Agentknock.
+Run `mise upgrade github:agentknock/agentknock-cli` to update Agentknock.
 
 ### Build from source with Cargo
 
@@ -77,7 +77,7 @@ Install the [GitHub CLI](https://cli.github.com/), then download and verify the
 latest x86-64 Linux archive:
 
 ```sh
-repository=nakedible/agentknock-cli
+repository=agentknock/agentknock-cli
 tag=$(gh release view --repo "$repository" --json tagName --jq .tagName)
 target=x86_64-unknown-linux-musl
 archive=agentknock-${target}.tar.gz
@@ -88,7 +88,7 @@ sha256sum --check "$archive.sha256"
 gh release verify "$tag" --repo "$repository"
 gh release verify-asset "$tag" "$archive" --repo "$repository"
 gh attestation verify "$archive" --repo "$repository" \
-  --signer-workflow nakedible/agentknock-cli/.github/workflows/release.yml
+  --signer-workflow agentknock/agentknock-cli/.github/workflows/release.yml
 ```
 
 Use `aarch64-unknown-linux-musl` as `target` for an ARM64 Linux system. Release
@@ -103,7 +103,7 @@ file:
 
 ```sh
 git clone --branch "$tag" --depth 1 \
-  https://github.com/nakedible/agentknock-cli.git "agentknock-cli-$tag"
+  https://github.com/agentknock/agentknock-cli.git "agentknock-cli-$tag"
 cd "agentknock-cli-$tag"
 make dist DIST_TARGET="$target"
 cmp "../$archive" "target/dist/$archive"
@@ -281,7 +281,7 @@ The repository also includes [reproducible symbolic
 analysis](verification/cryptosystem/README.md) of the v1 cryptosystem, with
 claim-by-claim results, assumptions, and limitations.
 Report suspected vulnerabilities according to the
-[security policy](https://github.com/nakedible/agentknock-cli/security/policy).
+[security policy](https://github.com/agentknock/agentknock-cli/security/policy).
 
 ## Supported platforms
 

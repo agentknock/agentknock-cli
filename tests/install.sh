@@ -70,10 +70,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$url" in
-	https://github.com/nakedible/agentknock-cli/releases/latest)
+	https://github.com/agentknock/agentknock-cli/releases/latest)
 		: > "$output"
 		[ "$write_out" = '%{url_effective}' ] || exit 1
-		printf '%s\n' "${TEST_RELEASE_URL:-https://github.com/nakedible/agentknock-cli/releases/tag/v1.2.3}"
+		printf '%s\n' "${TEST_RELEASE_URL:-https://github.com/agentknock/agentknock-cli/releases/tag/v1.2.3}"
 		;;
 	*/agentknock-*.tar.gz)
 		case "$url" in
