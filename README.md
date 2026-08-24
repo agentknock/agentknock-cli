@@ -38,7 +38,7 @@ platform, verifies its published SHA-256 checksum, and installs `agentknock`
 in `~/.local/bin`:
 
 ```sh
-curl -fsSL https://agentknock.dev/install.sh | bash
+curl -fsSL https://github.com/agentknock/agentknock-cli/releases/latest/download/install.sh | bash
 ```
 
 Run the same command again to update Agentknock.
