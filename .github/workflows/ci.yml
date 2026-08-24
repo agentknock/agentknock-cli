@@ -5,6 +5,7 @@ on:
     branches:
       - master
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,7 +13,7 @@ permissions:
 jobs:
   commit-messages:
     name: Check commit messages
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -33,7 +34,14 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: npx --no-install commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
+        run: |
+          base_sha=$BASE_SHA
+          head_sha=$HEAD_SHA
+          if [ -z "$base_sha" ]; then
+            base_sha=$(git merge-base origin/master HEAD)
+            head_sha=$(git rev-parse HEAD)
+          fi
+          npx --no-install commitlint --from "$base_sha" --to "$head_sha" --verbose
 
   check:
     name: Check (${{ matrix.architecture }}, stable)
@@ -214,6 +222,7 @@ jobs:
         run: make package-check
 
       - name: Check release plan
+        if: github.event_name == 'workflow_dispatch'
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release

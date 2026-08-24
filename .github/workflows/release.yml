@@ -18,6 +18,7 @@ jobs:
     if: github.repository == 'agentknock/agentknock-cli'
     runs-on: ubuntu-24.04
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     outputs:
@@ -65,6 +66,17 @@ jobs:
             fi
           done < <(gh api --paginate "repos/$GH_REPO/branches?per_page=100" \
             --jq '.[].name | select(startswith("release-plz-"))')
+
+      - name: Run CI for release pull request
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release-plz.outputs.pr }}
+        run: |
+          branch=$(printf '%s' "$RELEASE_PR" \
+            | jq --exit-status --raw-output '.head_branch')
+          gh workflow run ci.yml --repo "$GH_REPO" --ref "$branch"
 
   distribution:
     name: Release distribution (${{ matrix.architecture }} Linux)
