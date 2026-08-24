@@ -25,16 +25,16 @@ description = "Developer secrets on your phone, provided only to approved comman
 integration-tests = []
 
 [dependencies]
-atomic-write-file = "0.3.0"
-base64 = "0.22.1"
+atomic-write-file = "0.3.1"
+base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
 dotenvy = "0.15.7"
-futures-util = { version = "0.3.32", features = ["sink"] }
+futures-util = { version = "0.3.34", features = ["sink"] }
 getrandom = "0.4.3"
 hkdf = "0.13.0"
 hpke = { version = "0.14.0", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
-http = "1.4.0"
+http = "1.5.0"
 libc = "0.2.189"
 rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 rpassword = "7.5.4"
