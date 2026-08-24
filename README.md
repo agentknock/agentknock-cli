@@ -1,5 +1,7 @@
 # Agentknock
 
+Developer secrets on your phone, provided only to approved commands.
+
 [Agentknock](https://agentknock.dev/) lets command-line tools use secrets
 without storing long-lived credentials in agent configuration or project
 files. A paired mobile device authorizes each request and sends the requested
