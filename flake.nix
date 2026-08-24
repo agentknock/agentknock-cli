@@ -61,6 +61,16 @@
                 exit 1
               fi
             '';
+
+            meta = {
+              inherit (manifest.package) description homepage;
+              license = with pkgs.lib.licenses; [
+                asl20
+                mit
+              ];
+              mainProgram = "agentknock";
+              platforms = [ system ];
+            };
           };
 
           dist =
@@ -101,7 +111,7 @@
         in
         {
           inherit agentknock dist;
-          default = dist;
+          default = agentknock;
         }
       ) targets;
     in
