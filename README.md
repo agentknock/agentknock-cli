@@ -58,6 +58,23 @@ release artifact.
 
 Run `mise upgrade github:agentknock/agentknock-cli` to update Agentknock.
 
+### Use npm
+
+Run Agentknock without installing it globally:
+
+```sh
+npx agentknock --help
+```
+
+To make the command persistently available, install it globally:
+
+```sh
+npm install --global agentknock
+```
+
+The npm package requires Node.js `^22.15.0` or `>=24.0.0`. Run
+`npm update --global agentknock` to update Agentknock.
+
 ### Use Nix
 
 Run Agentknock without installing it in a profile:
