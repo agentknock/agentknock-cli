@@ -90,7 +90,7 @@ sha256sum --check "$archive.sha256"
 gh release verify "$tag" --repo "$repository"
 gh release verify-asset "$tag" "$archive" --repo "$repository"
 gh attestation verify "$archive" --repo "$repository" \
-  --signer-workflow agentknock/agentknock-cli/.github/workflows/release.yml
+  --signer-workflow agentknock/agentknock-cli/.github/workflows/ci.yml
 ```
 
 Use `aarch64-unknown-linux-musl` as `target` for an ARM64 Linux system. Release
