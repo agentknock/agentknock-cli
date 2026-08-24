@@ -58,6 +58,22 @@ release artifact.
 
 Run `mise upgrade github:agentknock/agentknock-cli` to update Agentknock.
 
+### Use Nix
+
+Run Agentknock without installing it in a profile:
+
+```sh
+nix run github:agentknock/agentknock-cli -- --help
+```
+
+To make the command persistently available, install it in your Nix profile:
+
+```sh
+nix profile add github:agentknock/agentknock-cli
+```
+
+Run `nix profile upgrade agentknock-cli` to update Agentknock.
+
 ### Build from source with Cargo
 
 Install Rust 1.89 or later, then build and install Agentknock from crates.io:
