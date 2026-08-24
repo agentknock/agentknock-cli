@@ -226,3 +226,100 @@ jobs:
           version: 0.3.160
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Release
+    needs:
+      - check
+      - msrv
+      - musl
+      - installer
+      - dependencies
+      - release-readiness
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    environment: release
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Configure GitHub authentication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh auth setup-git --hostname github.com --force
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: agentknock-*
+          path: ${{ runner.temp }}/release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        working-directory: ${{ runner.temp }}/release-assets
+        run: sha256sum --check -- *.sha256
+
+      - name: Prepare or publish release
+        id: release-plz
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          version: 0.3.160
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read release result
+        if: steps.release-plz.outputs.releases_created == 'true'
+        id: release
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag=$(printf '%s' "$RELEASES" \
+            | jq --exit-status --raw-output \
+              'if length == 1 then .[0].tag else error("expected one release") end')
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Attach release assets
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release upload "$RELEASE_TAG" "${{ runner.temp }}"/release-assets/*
+
+      - name: Publish immutable release
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest --verify-tag
+
+      - name: Delete obsolete release branches
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          open_branches=$(gh api --paginate "repos/$GH_REPO/pulls?state=open&per_page=100" \
+            --jq '.[].head.ref')
+
+          while IFS= read -r branch; do
+            if ! printf '%s\n' "$open_branches" \
+              | grep --fixed-strings --line-regexp --quiet -- "$branch"; then
+              echo "Deleting obsolete release branch: $branch"
+              gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$branch"
+            fi
+          done < <(gh api --paginate "repos/$GH_REPO/branches?per_page=100" \
+            --jq '.[].name | select(startswith("release-plz-"))')
