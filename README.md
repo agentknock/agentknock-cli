@@ -365,7 +365,7 @@ unstable interface for embedding Agentknock in applications. Direct library
 use is not currently recommended.
 
 User documentation is available at
-[agentknock.dev/doc](https://agentknock.dev/doc/).
+[agentknock.dev/docs](https://agentknock.dev/docs/).
 
 ## Contribute
 
