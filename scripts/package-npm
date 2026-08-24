@@ -1,0 +1,66 @@
+#!/bin/sh
+
+set -eu
+
+repository_root=$(unset CDPATH; cd -- "$(dirname "$0")/.." && pwd)
+dist_dir=${1:-$repository_root/target/dist}
+output_dir=${2:-$repository_root/target/npm}
+staging_dir=$(mktemp -d)
+
+cleanup() {
+	rm -rf -- "$staging_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+version=$(awk '
+	/^\[package\]$/ { package = 1; next }
+	/^\[/ { package = 0 }
+	package && /^version = "/ {
+		sub(/^version = "/, "")
+		sub(/"$/, "")
+		print
+		exit
+	}
+' "$repository_root/Cargo.toml")
+[ -n "$version" ] || {
+	printf 'could not read the Agentknock version from Cargo.toml\n' >&2
+	exit 1
+}
+
+install -D -m 0755 "$repository_root/npm/agentknock.js" \
+	"$staging_dir/agentknock.js"
+install -D -m 0644 "$repository_root/npm/package.json" \
+	"$staging_dir/package.json"
+install -D -m 0644 "$repository_root/README.md" "$staging_dir/README.md"
+install -D -m 0644 "$repository_root/LICENSE-APACHE" \
+	"$staging_dir/LICENSE-APACHE"
+install -D -m 0644 "$repository_root/LICENSE-MIT" \
+	"$staging_dir/LICENSE-MIT"
+
+npm pkg set "version=$version" --prefix "$staging_dir"
+npm pkg delete private --prefix "$staging_dir"
+
+for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+	archive=agentknock-$target.tar.gz
+	(
+		cd "$dist_dir"
+		sha256sum --check "$archive.sha256"
+	)
+
+	extract_dir=$staging_dir/extract/$target
+	mkdir -p "$extract_dir"
+	tar --extract --gzip --file="$dist_dir/$archive" \
+		--directory="$extract_dir" agentknock
+	install -D -m 0755 "$extract_dir/agentknock" \
+		"$staging_dir/bin/agentknock-$target"
+done
+rm -rf -- "$staging_dir/extract"
+
+mkdir -p "$output_dir"
+npm pack "$staging_dir" --ignore-scripts --loglevel=error \
+	--pack-destination "$output_dir"
+package=agentknock-$version.tgz
+(
+	cd "$output_dir"
+	sha256sum "$package" > "$package.sha256"
+)

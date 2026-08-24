@@ -1,0 +1,46 @@
+{
+  "name": "agentknock",
+  "version": "0.0.0",
+  "description": "Developer secrets on your phone, provided only to approved commands.",
+  "keywords": [
+    "agents",
+    "approval",
+    "authorization",
+    "mobile",
+    "secrets"
+  ],
+  "homepage": "https://agentknock.dev/",
+  "bugs": {
+    "url": "https://github.com/agentknock/agentknock-cli/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentknock/agentknock-cli.git"
+  },
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "bin": {
+    "agentknock": "agentknock.js"
+  },
+  "files": [
+    "agentknock.js",
+    "bin/",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "engines": {
+    "node": "^22.15.0 || >=24.0.0"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "private": true
+}

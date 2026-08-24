@@ -57,6 +57,11 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
 
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
       - name: Run checks and integration tests
         run: make check
 
@@ -143,8 +148,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Lint installer
-        run: shellcheck install.sh tests/install.sh
+      - name: Lint shell scripts
+        run: >-
+          shellcheck install.sh scripts/check-dist scripts/check-npm-dist
+          scripts/package-npm tests/install.sh tests/npm.sh
 
       - name: Build and test installer
         run: make installer-dist
@@ -160,6 +167,51 @@ jobs:
         with:
           name: agentknock-installer
           path: target/installer/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  npm:
+    name: npm package
+    needs: musl
+    runs-on: ubuntu-24.04
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Download Linux distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: agentknock-*-unknown-linux-musl
+          path: target/dist
+          merge-multiple: true
+
+      - name: Build and test npm package
+        run: make npm-dist-check
+
+      - name: Attest npm package
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: target/npm/agentknock-*.tgz
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentknock-npm
+          path: target/npm/
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -234,6 +286,7 @@ jobs:
       - msrv
       - musl
       - installer
+      - npm
       - dependencies
       - release-readiness
     if: github.event_name == 'push'
@@ -292,6 +345,27 @@ jobs:
             | jq --exit-status --raw-output \
               'if length == 1 then .[0].tag else error("expected one release") end')
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install Node.js
+        if: steps.release-plz.outputs.releases_created == 'true'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm
+        if: steps.release-plz.outputs.releases_created == 'true'
+        run: npm install --global npm@12.0.2
+
+      - name: Publish npm package
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          package="${{ runner.temp }}/release-assets/agentknock-${RELEASE_TAG#v}.tgz"
+          test -f "$package"
+          npm publish "$package" --access public
 
       - name: Attach release assets
         if: steps.release-plz.outputs.releases_created == 'true'

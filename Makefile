@@ -2,9 +2,9 @@ DIST_DIR := target/dist
 DIST_LINK := target/nix-dist
 DIST_TARGET := x86_64-unknown-linux-musl
 
-.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test installer-check installer-dist release-build docs package-check dependency-check dist dist-check
+.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test installer-check installer-dist npm-check npm-dist npm-dist-check release-build docs package-check dependency-check dist dist-check
 
-check: fmt-check clippy-check test installer-check release-build docs
+check: fmt-check clippy-check test installer-check npm-check release-build docs
 
 fix: fmt-fix clippy-fix
 
@@ -32,6 +32,16 @@ installer-dist: installer-check
 	install -d target/installer
 	install -m 0755 install.sh target/installer/install.sh
 	cd target/installer && sha256sum install.sh > install.sh.sha256
+
+npm-check:
+	node --check npm/agentknock.js
+	sh tests/npm.sh
+
+npm-dist:
+	./scripts/package-npm "$(DIST_DIR)" target/npm
+
+npm-dist-check: npm-dist
+	./scripts/check-npm-dist target/npm
 
 release-build:
 	cargo build --locked --release --all-features
