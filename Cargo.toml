@@ -35,6 +35,7 @@ getrandom = "0.4.3"
 hkdf = "0.13.0"
 hpke = { version = "0.14.0", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 http = "1.5.0"
+hyper-util = { version = "0.1.20", features = ["client-proxy"] }
 libc = "0.2.189"
 rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 rpassword = "7.5.4"

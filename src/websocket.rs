@@ -7,14 +7,16 @@ use std::{
 };
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use http::{HeaderValue, header::AUTHORIZATION};
+use http::{HeaderValue, Uri, header::AUTHORIZATION};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::{net::TcpStream, time::Instant};
-use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, WebSocketStream, upgrade};
+use tokio::time::Instant;
+use tokio_websockets::{
+    ClientBuilder, Connector, Limits, MaybeTlsStream, Message, WebSocketStream, upgrade,
+};
 
-use crate::config::Pairing;
+use crate::{config::Pairing, proxy};
 
 const RELAY_URL: &str = "wss://relay.agentknock.dev";
 #[cfg(all(feature = "integration-tests", debug_assertions))]
@@ -35,7 +37,7 @@ const BRIEF_RETRY_POLICY: RetryPolicy = RetryPolicy {
     maximum_failures: 2,
 };
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<MaybeTlsStream<proxy::Stream>>;
 
 #[derive(Clone, Copy)]
 struct RetryPolicy {
@@ -46,7 +48,8 @@ struct RetryPolicy {
 }
 
 pub(crate) struct RelayExchange {
-    url: String,
+    uri: Uri,
+    proxy: proxy::Config,
     connection_kind: ConnectionKind,
     authorization: HeaderValue,
     client_id: String,
@@ -112,8 +115,15 @@ impl RelayExchange {
         let authorization = HeaderValue::from_str(&format!("Bearer {client_token}"))
             .map_err(|_| Error::InvalidClientToken)?;
 
+        let url = format!("{}{path}", relay_url.trim_end_matches('/'));
+        let uri = url
+            .parse::<Uri>()
+            .map_err(|error| Error::InvalidRelayUrl(error.to_string()))?;
+        let proxy = proxy::Config::from_env(&uri)?;
+
         Ok(Self {
-            url: format!("{}{path}", relay_url.trim_end_matches('/')),
+            uri,
+            proxy,
             connection_kind,
             authorization,
             client_id: client_id.to_owned(),
@@ -413,27 +423,47 @@ impl RelayExchange {
         }
         ensure_rustls_provider();
         loop {
-            let builder = ClientBuilder::new()
-                .uri(&self.url)
-                .map_err(|error| Error::InvalidRelayUrl(error.to_string()))?
+            let builder = ClientBuilder::from_uri(self.uri.clone())
                 .limits(Limits::default().max_payload_len(Some(MAXIMUM_FRAME_SIZE)))
                 .add_header(AUTHORIZATION, self.authorization.clone())?;
-            match tokio::time::timeout(retry.policy.connection_timeout, builder.connect()).await {
+            let connect = async {
+                let stream = self.proxy.connect(&self.uri).await?;
+                let host = self.uri.host().ok_or(proxy::ConnectionError::MissingHost)?;
+                let connector = match self.uri.scheme_str() {
+                    Some("wss") => Connector::new()?,
+                    Some("ws") => Connector::Plain,
+                    _ => return Err(proxy::ConnectionError::UnsupportedDestination),
+                };
+                let stream = connector.wrap(host, stream).await?;
+                builder
+                    .connect_on(stream)
+                    .await
+                    .map_err(proxy::ConnectionError::from)
+            };
+            match tokio::time::timeout(retry.policy.connection_timeout, connect).await {
                 Ok(Ok((socket, _))) => {
                     self.socket = Some(socket);
                     return Ok(true);
                 }
-                Ok(Err(tokio_websockets::Error::Upgrade(
+                Ok(Err(proxy::ConnectionError::WebSocket(tokio_websockets::Error::Upgrade(
                     upgrade::Error::DidNotSwitchProtocols(status),
-                ))) if status == 403 && matches!(self.connection_kind, ConnectionKind::Client) => {
+                )))) if status == 403 && matches!(self.connection_kind, ConnectionKind::Client) => {
                     return Err(Error::ClientInactive {
                         code: status,
                         reason: "WebSocket setup returned HTTP status 403".into(),
                     });
                 }
-                Ok(Err(tokio_websockets::Error::Upgrade(
+                Ok(Err(proxy::ConnectionError::WebSocket(tokio_websockets::Error::Upgrade(
                     upgrade::Error::DidNotSwitchProtocols(status),
-                ))) if status < 500 => return Err(Error::UnexpectedStatus(status)),
+                )))) if status < 500 => return Err(Error::UnexpectedStatus(status)),
+                Ok(Err(error @ proxy::ConnectionError::Rejected(status)))
+                    if (500..600).contains(&status) =>
+                {
+                    retry.failed_with(error.to_string()).await?;
+                }
+                Ok(Err(proxy::ConnectionError::Rejected(status))) => {
+                    return Err(Error::ProxyRejected(status));
+                }
                 Ok(Err(error)) => retry.failed_with(error.to_string()).await?,
                 Err(_) => retry.failed_with("connection timed out".into()).await?,
             }
@@ -932,6 +962,12 @@ pub(crate) enum Error {
 
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(String),
+
+    #[error("invalid proxy configuration: {0}")]
+    ProxyConfiguration(#[from] proxy::ConfigurationError),
+
+    #[error("proxy rejected the relay connection with HTTP status {0}")]
+    ProxyRejected(u16),
 
     #[error("client token can't be used in an Authorization header")]
     InvalidClientToken,
