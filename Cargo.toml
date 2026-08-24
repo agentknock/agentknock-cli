@@ -19,7 +19,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/agentknock/agentknock-cli"
 rust-version = "1.89"
-description = "Mobile-approved secret delivery for command-line tools and applications."
+description = "Developer secrets on your phone, provided only to approved commands."
 
 [features]
 integration-tests = []
