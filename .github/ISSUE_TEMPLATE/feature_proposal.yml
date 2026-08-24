@@ -1,5 +1,7 @@
 name: Propose a feature
 description: Propose a change or addition to Agentknock.
+labels:
+  - enhancement
 body:
   - type: markdown
     attributes:

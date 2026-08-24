@@ -1,5 +1,7 @@
 name: Report a bug
 description: Report reproducible incorrect behavior in Agentknock.
+labels:
+  - bug
 body:
   - type: markdown
     attributes:
