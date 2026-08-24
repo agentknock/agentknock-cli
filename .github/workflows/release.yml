@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Install Rust
         run: |
@@ -43,6 +43,23 @@ jobs:
           version: 0.3.160
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete obsolete release branches
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          open_branches=$(gh api --paginate "repos/$GH_REPO/pulls?state=open&per_page=100" \
+            --jq '.[].head.ref')
+
+          while IFS= read -r branch; do
+            if ! printf '%s\n' "$open_branches" \
+              | grep --fixed-strings --line-regexp --quiet -- "$branch"; then
+              echo "Deleting obsolete release branch: $branch"
+              gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$branch"
+            fi
+          done < <(gh api --paginate "repos/$GH_REPO/branches?per_page=100" \
+            --jq '.[].name | select(startswith("release-plz-"))')
 
   distribution:
     name: Release distribution (${{ matrix.architecture }} Linux)
