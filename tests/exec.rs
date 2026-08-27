@@ -39,6 +39,219 @@ fn approved_environment(secret: &str, variables: serde_json::Map<String, Value>)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signs_a_git_commit_with_an_ssh_secret() {
+    let home = TestHome::active();
+    let repository = home.path().join("repository");
+    let temporary_directory = home.path().join("temporary files");
+    fs::create_dir(&repository).unwrap();
+    fs::create_dir(&temporary_directory).unwrap();
+    run(Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository));
+    fs::write(repository.join("example.txt"), "example\n").unwrap();
+    run(Command::new("git")
+        .args(["add", "example.txt"])
+        .current_dir(&repository));
+
+    let private_key = home.path().join("signing-key");
+    run(Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&private_key));
+    let public_key = fs::read_to_string(private_key.with_extension("pub"))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let device_private_key = home.device_private_key.clone();
+    let server_private_key = private_key.clone();
+    let server_public_key = public_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap().to_owned();
+        let invocation_id = request["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, &invocation_id, &request["payload"]);
+        assert_eq!(plaintext["method"], "Invocation");
+        let invocation_token = plaintext["invocation_token"].as_str().unwrap().to_owned();
+        assert_eq!(BASE64_STANDARD.decode(&invocation_token).unwrap().len(), 32);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": invocation_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": invocation_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({
+                        "result": "APPROVED",
+                        "secrets": {
+                            "git-signing": {
+                                "type": "ssh",
+                                "public_key": server_public_key,
+                            },
+                        },
+                    }),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        assert_eq!(
+            open_completion(&mut context, &completion["payload"])["result"],
+            "APPROVED"
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": invocation_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+        drop(socket);
+
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap().to_owned();
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, &request_id, &request["payload"]);
+        assert_eq!(plaintext["method"], "GitSign");
+        assert_eq!(plaintext["invocation_id"], invocation_id);
+        assert_eq!(plaintext["invocation_token"], invocation_token);
+        assert_eq!(plaintext["secret"], "git-signing");
+        assert!(plaintext.get("namespace").is_none());
+        let data = BASE64_STANDARD
+            .decode(plaintext["message"].as_str().unwrap())
+            .unwrap();
+        let data_text = String::from_utf8(data.clone()).unwrap();
+        assert!(
+            data_text.ends_with("\n\nSign this exact change\n"),
+            "{data_text}"
+        );
+
+        let payload = tempfile::NamedTempFile::new().unwrap();
+        fs::write(payload.path(), data).unwrap();
+        run(Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-n", "git", "-f"])
+            .arg(&server_private_key)
+            .arg(payload.path()));
+        let mut signature_path = payload.path().as_os_str().to_owned();
+        signature_path.push(".sig");
+        let signature = fs::read_to_string(signature_path).unwrap();
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({
+                        "result": "APPROVED",
+                        "signature": signature,
+                    }),
+                ),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        assert_eq!(
+            open_completion(&mut context, &completion["payload"])["result"],
+            "APPROVED"
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("TMPDIR", temporary_directory)
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["exec", "-s", "git-signing", "--", "git", "-C"])
+        .arg(&repository)
+        .args([
+            "-c",
+            "user.name=Agentknock Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "gpg.format=ssh",
+            "commit",
+            "-S",
+            "-m",
+            "Sign this exact change",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.await.unwrap();
+
+    let allowed_signers = home.path().join("allowed-signers");
+    fs::write(&allowed_signers, format!("test@example.com {public_key}\n")).unwrap();
+    run(Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args([
+            "-c",
+            &format!("gpg.ssh.allowedSignersFile={}", allowed_signers.display()),
+        ])
+        .args(["verify-commit", "HEAD"]));
+}
+
+fn run(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_secret_use_and_executes_with_the_returned_environment() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
@@ -55,7 +268,7 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         assert!(request.get("pairing_id").is_none());
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &request);
-        assert_eq!(plaintext["method"], "SecretUse");
+        assert_eq!(plaintext["method"], "Invocation");
         assert_eq!(plaintext["secrets"], json!(["cloudflare", "github"]));
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
@@ -451,7 +664,7 @@ fn native_exec_probe() {
 }
 
 #[test]
-fn rejects_a_missing_command_before_requesting_secret_use() {
+fn rejects_a_missing_command_before_sending_an_invocation() {
     let home = TestHome::active();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
@@ -470,7 +683,7 @@ fn rejects_a_missing_command_before_requesting_secret_use() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("wasn't found"), "{stderr}");
     assert!(
-        stderr.contains("No secret use request was sent."),
+        stderr.contains("Agentknock did not contact the device."),
         "{stderr}"
     );
     assert!(!stderr.contains("relay"), "{stderr}");

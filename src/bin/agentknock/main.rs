@@ -2,6 +2,7 @@
 compile_error!("the agentknock CLI currently supports Linux only");
 
 mod executable;
+mod invocation_service;
 
 use std::{
     cell::Cell,
@@ -19,10 +20,10 @@ use std::{
 };
 
 use agentknock::{
-    ApplicationInfo, Client, ConfigurationError, EnvironmentSecret, PairingProgress,
-    PairingRemoveError, PairingSas, PairingStatus, RequestError, Secret, SecretListProgress,
-    SecretUploadError, SecretUploadMode, SecretUploadProgress, SecretUseDenialReason,
-    SecretUseOperation, SecretUseOutput, SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
+    ApplicationInfo, Client, ConfigurationError, DenialReason, PairingProgress, PairingRemoveError,
+    PairingSas, PairingStatus, RequestError, Secret, SecretListProgress, SecretUpload,
+    SecretUploadError, SecretUploadMode, SecretUploadProgress, SecretUseOperation, SecretUseOutput,
+    SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{SelectedExecutable, SignalState};
@@ -39,8 +40,8 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
 #[command(
     name = "agentknock",
     version,
-    about = "Use and manage secrets, or pair with a device.",
-    long_about = "Pair this client with a device, request secret use, list available secrets, and upload secrets for review on the device.\n\nBefore you use or manage secrets, run `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
+    about = "Run commands with secrets, manage secrets, or pair with a device.",
+    long_about = "Pair this client with a device, run commands with selected secrets, list available secrets, and upload secrets for review on the device.\n\nBefore you use or manage secrets, run `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
     max_term_width = 120,
     arg_required_else_help = true,
     subcommand_required = true,
@@ -54,14 +55,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
-    /// Request secret use, then run a command.
+    /// Run a command with selected secrets.
     ///
-    /// The request includes the secret names, optional reason, command, and arguments. It also
-    /// includes the working directory, selected executable path, SHA-256 hash when available,
-    /// paths of the programs that launched Agentknock, and how standard input, output, and error
-    /// are connected. If the device approves the secret use request, Agentknock adds the returned
-    /// environment variables to the command's environment. Returned values replace existing
-    /// values with the same names. Agentknock then replaces itself with the command.
+    /// Before running the command, Agentknock sends the device the selected secret names, optional
+    /// reason, command, and arguments. It also sends the working directory, selected executable
+    /// path, SHA-256 hash when available, paths of the programs that launched Agentknock, and how
+    /// standard input, output, and error are connected. If the response contains environment
+    /// variables, Agentknock adds them to the command's environment. Returned values replace
+    /// existing values with the same names. An SSH secret can sign Git commits and tags when Git
+    /// uses SSH signing; the device makes a separate decision for each signature. Agentknock then
+    /// replaces itself with the command.
     ///
     /// Specify each secret with a separate `--secret` option. The `--` separator is required;
     /// Agentknock treats everything after it as the command and its arguments. Agentknock doesn't
@@ -71,14 +74,14 @@ enum Command {
     /// Otherwise, Agentknock doesn't run the command.
     ///
     /// Agentknock writes its messages to standard error. The command inherits standard input,
-    /// standard output, and standard error. While the request waits for the device, Agentknock
+    /// standard output, and standard error. While Agentknock waits for the device to respond, it
     /// reports progress and total elapsed time every 30 seconds unless you use `--quiet`.
     /// Interrupting Agentknock prevents the command from running.
     ///
     /// You can use `agentknock x` as a shorter alias for `agentknock exec`.
     #[command(
         visible_alias = "x",
-        after_long_help = "Examples:\n  Use one secret:\n    agentknock exec -s github -- gh issue list\n\n  Use multiple secrets and explain why:\n    agentknock exec -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy"
+        after_long_help = "Examples:\n  Use one secret:\n    agentknock exec -s github -- gh issue list\n\n  Use multiple secrets and explain why:\n    agentknock exec -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n  Sign a Git commit with an SSH secret:\n    agentknock exec -s git-signing -- git -c gpg.format=ssh commit -S -m \"Describe the change\""
     )]
     Exec(ExecCommand),
 
@@ -103,8 +106,8 @@ enum Command {
 
     /// List secrets or upload a secret to the paired device.
     ///
-    /// A secret defines data or operations that the paired device can provide. This version of
-    /// Agentknock can use, list, and upload secrets of type Environment variables.
+    /// A secret defines data or operations that the paired device can provide. Agentknock can list
+    /// and upload environment-variable and SSH-key secrets.
     ///
     /// Secret commands require an active pairing. Listing returns secret metadata without secret
     /// values. Uploading sends secret data to the device for review.
@@ -135,9 +138,9 @@ struct ExecCommand {
     )]
     secrets: Vec<String>,
 
-    /// Explanation for the secret use request.
+    /// Explain why the command needs the selected secrets.
     ///
-    /// Agentknock sends this text unchanged to the device as part of the secret use request.
+    /// Agentknock sends this text unchanged to the device with the request.
     #[arg(
         long,
         value_name = "REASON",
@@ -145,16 +148,16 @@ struct ExecCommand {
     )]
     reason: Option<String>,
 
-    /// Suppress Agentknock secret use and command-launch messages.
+    /// Suppress Agentknock status and command-launch messages.
     ///
     /// This option doesn't suppress output from the command.
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
 
-    /// Show each secret use request state change.
+    /// Show detailed request and command-launch messages.
     ///
-    /// Before Agentknock runs the command, it lists the names of the environment variables that
-    /// it received. It never displays their values.
+    /// Before Agentknock runs the command, it lists the environment variable names and selected
+    /// SSH secret. It never displays environment values or private keys.
     #[arg(long, conflicts_with = "quiet")]
     verbose: bool,
 
@@ -225,7 +228,7 @@ enum PairingCommand {
     ///
     /// By default, Agentknock asks the device to remove the pairing and waits for an authenticated
     /// response before it deletes the local pairing. After removal, this client can no longer
-    /// request secret use from the device.
+    /// run commands with secrets from the device.
     ///
     /// If the device can't be contacted, use `--force` to delete only the local pairing.
     /// Without `--force`, Agentknock reports progress and total elapsed time every 30 seconds while
@@ -245,8 +248,8 @@ enum SecretCommand {
     /// List secrets available from the paired device.
     ///
     /// Request metadata for the secrets available to this client. Agentknock writes a JSON
-    /// object to standard output. Each secret includes its type, optional description, and the
-    /// environment variable names that it provides. The output never includes secret values.
+    /// object to standard output. Each secret includes its type, optional description, and
+    /// type-specific public metadata. The output never includes secret values.
     ///
     /// Agentknock writes progress and error messages to standard error, so you can redirect or
     /// process the JSON output separately.
@@ -254,29 +257,29 @@ enum SecretCommand {
     /// While the request waits for the device, Agentknock reports progress and total elapsed time
     /// every 30 seconds.
     #[command(
-        after_long_help = "Example output:\n  {\n    \"secrets\": {\n      \"github\": {\n        \"description\": \"GitHub API access\",\n        \"type\": \"environment\",\n        \"variables\": [\"GH_TOKEN\"]\n      }\n    }\n  }"
+        after_long_help = "Example output:\n  {\n    \"secrets\": {\n      \"git-signing\": {\n        \"description\": \"Git signing key\",\n        \"type\": \"ssh\",\n        \"public_key\": \"ssh-ed25519 AAAA...\"\n      },\n      \"github\": {\n        \"description\": \"GitHub API access\",\n        \"type\": \"environment\",\n        \"variables\": [\"GH_TOKEN\"]\n      }\n    }\n  }"
     )]
     List,
 
     /// Upload a secret to the paired device.
     ///
-    /// Build a secret of type Environment variables from one or more local sources and upload it
-    /// to the paired device. The command completes after the device confirms that it stored the
-    /// upload. The secret remains unavailable until you approve the upload on the device.
-    /// Agentknock doesn't wait for that decision.
+    /// Build an environment-variable or SSH-key secret from local data and upload it to the paired
+    /// device. The command completes after the device confirms that it stored the upload. The
+    /// secret remains unavailable until you approve the upload on the device. Agentknock doesn't
+    /// wait for that decision.
     ///
     /// Without `--replace` or `--update`, the upload uses Create mode. Use `--replace` to upload
     /// the complete replacement for an existing secret. Use `--update` to upload only the fields
     /// to change while retaining fields that you don't supply.
     ///
-    /// You can combine and repeat input options, but each environment variable name can occur only
-    /// once. At most one input can read from standard input. Environment variable names must be
-    /// portable shell identifiers. All names and values must be valid UTF-8.
+    /// You can combine and repeat environment-variable input options, but each variable name can
+    /// occur only once. An SSH-key source can't be combined with environment-variable sources. At
+    /// most one input can read from standard input. All input must be valid UTF-8.
     ///
     /// While the upload waits for the device, Agentknock reports progress and total elapsed time
     /// every 30 seconds.
     #[command(
-        after_long_help = "Examples:\n  Create a secret from the current environment:\n    agentknock secret upload github --description \"GitHub API access\" --from-env GH_TOKEN\n\n  Create a secret from a dotenv file:\n    agentknock secret upload development --from-env-file .env\n\n  Update one environment variable in an existing secret:\n    agentknock secret upload github --update --from-prompt GH_TOKEN"
+        after_long_help = "Examples:\n  Create a secret from the current environment:\n    agentknock secret upload github --description \"GitHub API access\" --from-env GH_TOKEN\n\n  Create a secret from a dotenv file:\n    agentknock secret upload development --from-env-file .env\n\n  Upload an SSH private key:\n    agentknock secret upload production-ssh --from-ssh-key ~/.ssh/id_ed25519\n\n  Update one environment variable in an existing secret:\n    agentknock secret upload github --update --from-prompt GH_TOKEN"
     )]
     Upload(SecretUploadCommand),
 }
@@ -302,22 +305,36 @@ struct SecretUploadCommand {
 
     /// Use Replace mode for an existing secret.
     ///
-    /// Existing environment variables that you don't supply are removed.
+    /// Existing content that you don't supply is removed.
     #[arg(long, conflicts_with = "update")]
     replace: bool,
 
     /// Use Update mode for an existing secret.
     ///
-    /// Existing environment variables that you don't supply are retained.
+    /// Existing content that you don't supply is retained.
     #[arg(long, conflicts_with = "replace")]
     update: bool,
+
+    /// Read an SSH private key from a file.
+    ///
+    /// The device currently accepts unencrypted Ed25519 keys in OpenSSH private-key format. Use
+    /// `-` to read the key from standard input. This option can't be combined with an environment
+    /// variable source.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = parse_path,
+        required_unless_present = "environment_sources",
+        conflicts_with = "environment_sources"
+    )]
+    from_ssh_key: Option<PathBuf>,
 
     #[command(flatten, next_help_heading = "Environment variable sources")]
     environment: EnvironmentSecretInput,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
-#[group(required = true, multiple = true)]
+#[group(id = "environment_sources", multiple = true)]
 struct EnvironmentSecretInput {
     /// Read an environment variable from the current process environment.
     ///
@@ -385,6 +402,7 @@ enum PairingOperation {
 enum CommandError {
     ExecRequest(RequestError),
     ExecSelection { program: String, source: io::Error },
+    ExecInvocationService(io::Error),
     ExecSignal(io::Error),
     ExecInterrupted,
     ExecProcess { program: String, source: io::Error },
@@ -612,9 +630,19 @@ fn print_exec_usage_error(message: impl std::fmt::Display) {
     eprintln!("For more information, run 'agentknock exec --help'.");
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let arguments = std::env::args_os().collect::<Vec<_>>();
+    if invocation_service::git_signing_helper_requested(&arguments) {
+        return invocation_service::run_git_signing_helper(&arguments);
+    }
+    if invocation_service::requested(&arguments) {
+        return invocation_service::run();
+    }
+    run_cli(arguments)
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
     if exec_is_missing_separator(&arguments) {
         print_missing_exec_separator();
         return ExitCode::from(2);
@@ -674,6 +702,28 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             let mut signals = CommandSignals::new().map_err(CommandError::ExecSignal)?;
             let secret_use_output =
                 request_exec_secrets(&client, request, output, &mut signals).await?;
+            let invocation_service = match secret_use_output.ssh() {
+                Some(ssh) => Some(
+                    invocation_service::InvocationService::start(
+                        secret_use_output.invocation(),
+                        ssh,
+                        output == OutputMode::Quiet,
+                        output == OutputMode::Verbose,
+                    )
+                    .map_err(CommandError::ExecInvocationService)?,
+                ),
+                None => None,
+            };
+            let git_config_count = secret_use_output
+                .environment_variable("GIT_CONFIG_COUNT")
+                .map(OsString::from)
+                .or_else(|| env::var_os("GIT_CONFIG_COUNT"));
+            let additional_environment = match &invocation_service {
+                Some(service) => service
+                    .git_environment(git_config_count.as_deref())
+                    .map_err(CommandError::ExecInvocationService)?,
+                None => BTreeMap::new(),
+            };
             let blocked_signals = signal_state
                 .block_interrupts()
                 .map_err(CommandError::ExecSignal)?;
@@ -685,12 +735,18 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 return Err(CommandError::ExecInterrupted);
             }
             if output == OutputMode::Verbose {
-                print_received_environment(&secret_use_output);
+                print_received_secrets(&secret_use_output);
                 print_message(format_args!("Running command {program:?}."));
             }
             let program = program.clone();
             selected
-                .execute(arguments, secret_use_output, &signal_state, blocked_signals)
+                .execute(
+                    arguments,
+                    secret_use_output,
+                    additional_environment,
+                    &signal_state,
+                    blocked_signals,
+                )
                 .map_err(|source| {
                     if source.kind() == io::ErrorKind::Interrupted {
                         CommandError::ExecInterrupted
@@ -715,7 +771,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             finish_pairing_for_cli(&client)
                 .await
                 .map_err(CommandError::FinishPairing)?;
-            println!("Pairing complete. Agentknock is ready to request secret use.");
+            println!("Pairing complete. Agentknock is ready to run commands with secrets.");
         }
         Operation::AbortPairing => {
             client.abort_pairing().map_err(CommandError::AbortPairing)?;
@@ -745,7 +801,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             upload_secret_for_cli(&client, &secret, mode)
                 .await
                 .map_err(CommandError::UploadSecret)?;
-            println!("Secret upload {:?} delivered to the device.", secret.name);
+            println!("Secret upload {:?} delivered to the device.", secret.name());
             println!("The secret isn't available until you approve the upload on the device.");
             println!("Suggested action: Review the secret upload on the device.");
         }
@@ -807,7 +863,7 @@ async fn list_secrets_for_cli(client: &Client) -> Result<Secrets, RequestError> 
 
 async fn upload_secret_for_cli(
     client: &Client,
-    secret: &EnvironmentSecret,
+    secret: &SecretUpload,
     mode: SecretUploadMode,
 ) -> Result<(), SecretUploadError> {
     let mut signals = CommandSignals::new()
@@ -823,7 +879,27 @@ async fn upload_secret_for_cli(
 
 fn read_secret(
     command: SecretUploadCommand,
-) -> Result<(EnvironmentSecret, SecretUploadMode), SecretInputError> {
+) -> Result<(SecretUpload, SecretUploadMode), SecretInputError> {
+    let mode = if command.replace {
+        SecretUploadMode::Replace
+    } else if command.update {
+        SecretUploadMode::Update
+    } else {
+        SecretUploadMode::Create
+    };
+
+    if let Some(path) = command.from_ssh_key {
+        let private_key = read_secret_source(&path)?;
+        return Ok((
+            SecretUpload::Ssh {
+                name: command.name,
+                description: command.description,
+                private_key,
+            },
+            mode,
+        ));
+    }
+
     let stdin_sources = command
         .environment
         .from_file
@@ -888,15 +964,8 @@ fn read_secret(
         return Err(SecretInputError::NoEnvironmentVariables);
     }
 
-    let mode = if command.replace {
-        SecretUploadMode::Replace
-    } else if command.update {
-        SecretUploadMode::Update
-    } else {
-        SecretUploadMode::Create
-    };
     Ok((
-        EnvironmentSecret {
+        SecretUpload::Environment {
             name: command.name,
             description: command.description,
             variables,
@@ -1196,7 +1265,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                     ));
                 }
             }
-            print_message("No secret use request was sent.");
+            print_message("Agentknock did not contact the device.");
             match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message("Suggested action: Check the command name or path.");
@@ -1213,6 +1282,12 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             ));
             print_message("The command didn't run.");
         }
+        CommandError::ExecInvocationService(source) if output != OutputMode::Quiet => {
+            print_message(format_args!(
+                "Agentknock couldn't prepare SSH access for the command: {source}."
+            ));
+            print_message("The command didn't run.");
+        }
         CommandError::ExecInterrupted if output != OutputMode::Quiet => {
             print_message(
                 "Agentknock received an interrupt or termination signal. The command didn't run.",
@@ -1220,7 +1295,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "Secret use was approved, but Agentknock couldn't run command {program:?}: {source}."
+                "The device approved the request, but Agentknock couldn't run command {program:?}: {source}."
             ));
             match source.kind() {
                 io::ErrorKind::NotFound => {
@@ -1236,6 +1311,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::ExecRequest(_)
         | CommandError::ExecSelection { .. }
+        | CommandError::ExecInvocationService(_)
         | CommandError::ExecSignal(_)
         | CommandError::ExecInterrupted
         | CommandError::ExecProcess { .. } => {}
@@ -1387,42 +1463,42 @@ fn print_exec_request_error(error: &RequestError) {
     match error {
         RequestError::Configuration(error) => print_exec_configuration_error(error),
         RequestError::Denied {
-            reason: SecretUseDenialReason::UserDenied,
+            reason: DenialReason::UserDenied,
             message,
         } => {
             print_message(format_args!(
-                "The device denied the secret use request: {message}"
+                "The device denied use of the selected secrets: {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Denied {
-            reason: SecretUseDenialReason::PolicyDenied,
+            reason: DenialReason::PolicyDenied,
             message,
         } => {
             print_message(format_args!(
-                "Device policy denied the secret use request: {message}"
+                "Device policy denied use of the selected secrets: {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Denied {
-            reason: SecretUseDenialReason::InvalidRequest,
+            reason: DenialReason::InvalidRequest,
             message,
         } => {
             print_message(format_args!(
-                "The device rejected the secret use request as invalid: {message}"
+                "The device rejected the request as invalid: {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Denied {
-            reason: SecretUseDenialReason::Other,
+            reason: DenialReason::Other,
             message,
         } => {
-            print_message(format_args!("The secret use request was denied: {message}"));
+            print_message(format_args!("The device denied the request: {message}"));
             print_message("The command didn't run.");
         }
         RequestError::Interrupted => {
             print_message(
-                "Agentknock received a signal and canceled the secret use request. The command didn't run.",
+                "Agentknock received a signal and canceled the request. The command didn't run.",
             );
         }
         RequestError::RelayUnavailable { failures } => {
@@ -1448,12 +1524,14 @@ fn print_exec_request_error(error: &RequestError) {
         }
         RequestError::DeviceRejected { code, message } => {
             print_message(format_args!(
-                "The device couldn't process the secret use request ({code}): {message}"
+                "The device couldn't process the request ({code}): {message}"
             ));
             print_message("The command didn't run.");
         }
         RequestError::Other(source) => {
-            print_message(format_args!("The secret use request failed: {source}."));
+            print_message(format_args!(
+                "Agentknock couldn't prepare the selected secrets for the command: {source}."
+            ));
             print_message("The command didn't run.");
         }
         RequestError::PairingRejected => {
@@ -1461,7 +1539,9 @@ fn print_exec_request_error(error: &RequestError) {
             print_message("The command didn't run.");
         }
         _ => {
-            print_message(format_args!("The secret use request failed: {error}."));
+            print_message(format_args!(
+                "Agentknock couldn't prepare the selected secrets for the command: {error}."
+            ));
             print_message("The command didn't run.");
         }
     }
@@ -1559,7 +1639,7 @@ fn print_finish_pairing_error(error: &RequestError) {
         }
         RequestError::Configuration(ConfigurationError::PairingNotPending { .. }) => {
             print_plain_error(
-                "Pairing is already complete. Agentknock is ready to request secret use.",
+                "Pairing is already complete. Agentknock is ready to run commands with secrets.",
             );
         }
         RequestError::Configuration(error) => {
@@ -1756,16 +1836,21 @@ fn print_progress(progress: SecretUseProgress) {
     print_message(progress_message(progress));
 }
 
-fn print_received_environment(secret_use_output: &SecretUseOutput) {
+fn print_received_secrets(secret_use_output: &SecretUseOutput) {
     let mut names = secret_use_output.environment_variable_names().peekable();
     if names.peek().is_none() {
-        print_message("Secret use approved, but the secrets provided no environment variables.");
-        return;
+        print_message("The device returned no environment variables.");
+    } else {
+        print_message("Received these environment variables:");
+        for name in names {
+            print_message(format_args!("- {name}"));
+        }
     }
-
-    print_message("Secret use approved. Received these environment variables:");
-    for name in names {
-        print_message(format_args!("- {name}"));
+    if let Some(ssh) = secret_use_output.ssh() {
+        print_message(format_args!(
+            "SSH secret {:?} is available to the command.",
+            ssh.name()
+        ));
     }
 }
 
@@ -1782,6 +1867,23 @@ fn print_secrets(secrets: &Secrets) {
                     "description": description,
                     "type": "environment",
                     "variables": variables,
+                }),
+                Secret::Ssh {
+                    description,
+                    public_key,
+                    ..
+                } => serde_json::json!({
+                    "description": description,
+                    "type": "ssh",
+                    "public_key": public_key,
+                }),
+                Secret::Unknown {
+                    description,
+                    secret_type,
+                    ..
+                } => serde_json::json!({
+                    "description": description,
+                    "type": secret_type,
                 }),
                 _ => serde_json::json!({"type": "unknown"}),
             };
@@ -1833,7 +1935,7 @@ fn launcher_chain() -> Vec<String> {
         let Some(parent_id) = parent_id(&status) else {
             break;
         };
-        if parent_id <= 1 || parent_id == process_id {
+        if parent_id <= 1 {
             break;
         }
         let executable = match std::fs::read_link(format!("/proc/{parent_id}/exe")) {
@@ -1862,16 +1964,14 @@ fn parent_id(status: &str) -> Option<u32> {
 
 fn progress_message(progress: SecretUseProgress) -> &'static str {
     match progress {
-        SecretUseProgress::Preparing => "Preparing the secret use request.",
-        SecretUseProgress::WaitingForDelivery => {
-            "Waiting for the device to receive the secret use request."
-        }
+        SecretUseProgress::Preparing => "Preparing the request for the selected secrets.",
+        SecretUseProgress::WaitingForDelivery => "Waiting for the device to receive the request.",
         SecretUseProgress::WaitingForResponse => {
-            "The device received the secret use request. Waiting for its response."
+            "The device received the request. Waiting for its response."
         }
         SecretUseProgress::Completing => "Device response received. Confirming receipt.",
-        SecretUseProgress::Completed => "Secret use request complete.",
-        _ => "Processing the secret use request.",
+        SecretUseProgress::Completed => "Request complete.",
+        _ => "Processing the request.",
     }
 }
 
@@ -2005,11 +2105,11 @@ mod tests {
 
         assert_eq!(
             progress_message(WaitingForDelivery),
-            "Waiting for the device to receive the secret use request."
+            "Waiting for the device to receive the request."
         );
         assert_eq!(
             progress_message(WaitingForResponse),
-            "The device received the secret use request. Waiting for its response."
+            "The device received the request. Waiting for its response."
         );
         assert_eq!(
             progress_message(Completing),
@@ -2170,6 +2270,7 @@ mod tests {
                     description: Some("GitHub API access".into()),
                     replace: false,
                     update: true,
+                    from_ssh_key: None,
                     environment: EnvironmentSecretInput {
                         from_env: vec!["GH_TOKEN".into()],
                         from_file: vec![VariableFile {
@@ -2178,6 +2279,39 @@ mod tests {
                         }],
                         from_prompt: vec!["GH_SECRET".into()],
                         from_env_file: vec!["shared.env".into()],
+                    },
+                }),
+                OutputMode::Normal,
+            )
+        );
+    }
+
+    #[test]
+    fn parses_ssh_secret_upload_command() {
+        let cli = Cli::try_parse_from([
+            "agentknock",
+            "secret",
+            "upload",
+            "production-ssh",
+            "--from-ssh-key",
+            "/tmp/id_ed25519",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.into_operation(),
+            (
+                Operation::UploadSecret(SecretUploadCommand {
+                    name: "production-ssh".into(),
+                    description: None,
+                    replace: false,
+                    update: false,
+                    from_ssh_key: Some("/tmp/id_ed25519".into()),
+                    environment: EnvironmentSecretInput {
+                        from_env: Vec::new(),
+                        from_file: Vec::new(),
+                        from_prompt: Vec::new(),
+                        from_env_file: Vec::new(),
                     },
                 }),
                 OutputMode::Normal,
@@ -2198,7 +2332,8 @@ mod tests {
             (
                 &["exec", "--help"],
                 &[
-                    "adds the returned environment variables",
+                    "adds them to the command's environment",
+                    "separate decision for each signature",
                     "The `--` separator is required",
                     "doesn't invoke a shell",
                     "Repeat this option",
@@ -2262,6 +2397,7 @@ mod tests {
                 &[
                     "JSON object to standard output",
                     "never includes secret values",
+                    "type-specific public metadata",
                     "Example output:",
                 ],
             ),
@@ -2271,6 +2407,7 @@ mod tests {
                     "doesn't wait for that decision",
                     "Use `--replace`",
                     "At most one input can read from standard input",
+                    "SSH-key source can't be combined",
                     "Environment variable sources:",
                     "without trimming whitespace",
                     "Examples:",
@@ -2320,6 +2457,23 @@ mod tests {
             "--update",
             "--from-env",
             "GH_TOKEN",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rejects_mixed_ssh_and_environment_secret_sources() {
+        let error = Cli::try_parse_from([
+            "agentknock",
+            "secret",
+            "upload",
+            "mixed",
+            "--from-ssh-key",
+            "/tmp/id_ed25519",
+            "--from-env",
+            "TOKEN",
         ])
         .unwrap_err();
 

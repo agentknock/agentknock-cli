@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future};
+use std::{collections::BTreeMap, future::Future, io};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,6 +29,24 @@ pub enum Secret {
         /// Names are sorted and contain no duplicates.
         variables: Vec<String>,
     },
+
+    /// A secret that provides SSH operations without exposing its private key.
+    #[non_exhaustive]
+    Ssh {
+        /// An optional human-readable description.
+        description: Option<String>,
+        /// The public key in OpenSSH format.
+        public_key: String,
+    },
+
+    /// A secret type that this library version doesn't recognize.
+    #[non_exhaustive]
+    Unknown {
+        /// An optional human-readable description.
+        description: Option<String>,
+        /// The type name reported by the device.
+        secret_type: String,
+    },
 }
 
 /// Secret metadata keyed by secret name.
@@ -36,24 +54,38 @@ pub enum Secret {
 /// Iteration yields secret names in lexicographic order.
 pub type Secrets = BTreeMap<String, Secret>;
 
-/// An environment-variable secret to upload to the device.
-#[derive(Debug, Eq, PartialEq)]
-pub struct EnvironmentSecret {
-    /// The name of the new or existing secret.
-    ///
-    /// In [`SecretUploadMode::Create`] the device can let the user choose a
-    /// different name when accepting the upload. In the other modes, this must
-    /// identify the existing secret to change.
-    pub name: String,
+/// A secret to upload to the device.
+#[derive(Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SecretUpload {
+    /// An environment-variable secret.
+    Environment {
+        /// The name of the new or existing secret.
+        name: String,
+        /// The proposed description.
+        description: Option<String>,
+        /// Environment variable values keyed by variable name.
+        variables: BTreeMap<String, String>,
+    },
 
-    /// The proposed description.
-    ///
-    /// In [`SecretUploadMode::Update`], `None` retains the existing
-    /// description. An empty string proposes removing it.
-    pub description: Option<String>,
+    /// An SSH private-key secret.
+    Ssh {
+        /// The name of the new or existing secret.
+        name: String,
+        /// The proposed description.
+        description: Option<String>,
+        /// An unencrypted private key in OpenSSH format.
+        private_key: String,
+    },
+}
 
-    /// Environment variable values keyed by variable name.
-    pub variables: BTreeMap<String, String>,
+impl SecretUpload {
+    /// Returns the proposed or existing secret name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Environment { name, .. } | Self::Ssh { name, .. } => name,
+        }
+    }
 }
 
 /// How an uploaded secret changes device state after user acceptance.
@@ -62,10 +94,10 @@ pub enum SecretUploadMode {
     /// Proposes a new secret whose final name the user can choose on the device.
     Create,
 
-    /// Replaces an existing secret, removing variables that aren't supplied.
+    /// Replaces an existing secret and removes content that isn't supplied.
     Replace,
 
-    /// Updates supplied fields while retaining variables that aren't supplied.
+    /// Updates supplied fields while retaining content that isn't supplied.
     Update,
 }
 
@@ -237,14 +269,15 @@ impl Client {
         }
         progress(SecretListProgress::Completed);
 
-        Ok(response
+        response
             .secrets
             .into_iter()
-            .map(|(name, secret)| (name, secret.into()))
-            .collect())
+            .map(|(name, secret)| Ok((name, secret.try_into()?)))
+            .collect::<io::Result<_>>()
+            .map_err(RequestError::other)
     }
 
-    /// Uploads an environment-variable secret for review on the device.
+    /// Uploads a secret for review on the device.
     ///
     /// Success means that the device received and stored the upload proposal.
     /// It doesn't mean that the user accepted the proposal or that the secret
@@ -267,7 +300,7 @@ impl Client {
     /// authenticated.
     pub async fn upload_secret<P>(
         &self,
-        secret: &EnvironmentSecret,
+        secret: &SecretUpload,
         mode: SecretUploadMode,
         cancellation: impl Future<Output = ()>,
         mut progress: P,
@@ -284,7 +317,7 @@ impl Client {
         let request_payload = UploadRequest {
             method: Method::SecretUpload,
             mode: mode.into(),
-            secret: NamedSecretMessage::from(secret),
+            secret: UploadSecretMessage::from(secret),
         };
         let plaintext = self.encode(&request_payload).map_err(RequestError::other)?;
         let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
@@ -362,14 +395,14 @@ struct EmptyMessage {}
 
 #[derive(Deserialize)]
 struct ListResponse {
-    secrets: BTreeMap<String, SecretMessage<Vec<String>>>,
+    secrets: BTreeMap<String, ListedSecretMessage>,
 }
 
 #[derive(Serialize)]
-struct UploadRequest {
+struct UploadRequest<'a> {
     method: Method,
     mode: SecretUploadModeMessage,
-    secret: NamedSecretMessage<BTreeMap<String, EnvironmentVariableMessage>>,
+    secret: UploadSecretMessage<'a>,
 }
 
 #[derive(Serialize)]
@@ -409,6 +442,7 @@ pub(crate) struct SecretMessage<T> {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum SecretContentsMessage<T> {
     Environment { variables: T },
+    Ssh { public_key: String },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -416,49 +450,100 @@ pub(crate) struct EnvironmentVariableMessage {
     pub(crate) value: String,
 }
 
-#[derive(Serialize)]
-struct NamedSecretMessage<T> {
-    name: String,
+#[derive(Deserialize)]
+struct ListedSecretMessage {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "type")]
+    secret_type: String,
     #[serde(flatten)]
-    secret: SecretMessage<T>,
+    metadata: BTreeMap<String, serde_json::Value>,
 }
 
-impl From<&EnvironmentSecret> for NamedSecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
-    fn from(secret: &EnvironmentSecret) -> Self {
-        Self {
-            name: secret.name.clone(),
-            secret: SecretMessage {
-                description: secret.description.clone(),
-                contents: SecretContentsMessage::Environment {
-                    variables: secret
-                        .variables
-                        .iter()
-                        .map(|(name, value)| {
-                            (
-                                name.clone(),
-                                EnvironmentVariableMessage {
-                                    value: value.clone(),
-                                },
-                            )
-                        })
-                        .collect(),
-                },
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UploadSecretMessage<'a> {
+    Environment {
+        name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+        variables: BTreeMap<&'a str, UploadEnvironmentVariableMessage<'a>>,
+    },
+    Ssh {
+        name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+        private_key: &'a str,
+    },
+}
+
+#[derive(Serialize)]
+struct UploadEnvironmentVariableMessage<'a> {
+    value: &'a str,
+}
+
+impl<'a> From<&'a SecretUpload> for UploadSecretMessage<'a> {
+    fn from(secret: &'a SecretUpload) -> Self {
+        match secret {
+            SecretUpload::Environment {
+                name,
+                description,
+                variables,
+            } => Self::Environment {
+                name,
+                description: description.as_deref(),
+                variables: variables
+                    .iter()
+                    .map(|(name, value)| {
+                        (name.as_str(), UploadEnvironmentVariableMessage { value })
+                    })
+                    .collect(),
+            },
+            SecretUpload::Ssh {
+                name,
+                description,
+                private_key,
+            } => Self::Ssh {
+                name,
+                description: description.as_deref(),
+                private_key,
             },
         }
     }
 }
 
-impl From<SecretMessage<Vec<String>>> for Secret {
-    fn from(secret: SecretMessage<Vec<String>>) -> Self {
-        match secret.contents {
-            SecretContentsMessage::Environment { mut variables } => {
+impl TryFrom<ListedSecretMessage> for Secret {
+    type Error = io::Error;
+
+    fn try_from(mut secret: ListedSecretMessage) -> Result<Self, Self::Error> {
+        match secret.secret_type.as_str() {
+            "environment" => {
+                let variables = secret.metadata.remove("variables").ok_or_else(|| {
+                    io::Error::other("environment secret metadata has no variables")
+                })?;
+                let mut variables: Vec<String> =
+                    serde_json::from_value(variables).map_err(io::Error::other)?;
                 variables.sort();
                 variables.dedup();
-                Self::Environment {
+                Ok(Self::Environment {
                     description: secret.description,
                     variables,
-                }
+                })
             }
+            "ssh" => Ok(Self::Ssh {
+                description: secret.description,
+                public_key: serde_json::from_value(
+                    secret
+                        .metadata
+                        .remove("public_key")
+                        .ok_or_else(|| io::Error::other("SSH secret metadata has no public key"))?,
+                )
+                .map_err(io::Error::other)?,
+            }),
+            _ => Ok(Self::Unknown {
+                description: secret.description,
+                secret_type: secret.secret_type,
+            }),
         }
     }
 }

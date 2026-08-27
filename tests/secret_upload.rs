@@ -149,6 +149,115 @@ async fn uploads_an_environment_secret_from_multiple_sources() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_an_ssh_private_key() {
+    let home = TestHome::active();
+    let key_path = home.path().join("id_ed25519");
+    let private_key = concat!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        "example\n",
+        "-----END OPENSSH PRIVATE KEY-----\n",
+    );
+    fs::write(&key_path, private_key).unwrap();
+
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (upgrade, mut socket) = accept(&listener).await;
+        assert_authenticated_request(&upgrade);
+        let frame = receive_json(&mut socket).await;
+        let client_id = frame["client_id"].as_str().unwrap().to_owned();
+        let request_id = frame["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, &request_id, &frame["payload"]);
+        assert_eq!(
+            plaintext,
+            json!({
+                "app_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "lib_info": {
+                    "name": "agentknock",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "method": "SecretUpload",
+                "mode": "CREATE",
+                "secret": {
+                    "name": "production-ssh",
+                    "description": "Production host access",
+                    "type": "ssh",
+                    "private_key": private_key,
+                },
+            })
+        );
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(&context, &key, &json!({"result": "RECEIVED"})),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        assert_eq!(
+            open_completion(&mut context, &completion["payload"])["result"],
+            "RECEIVED"
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args([
+            "secret",
+            "upload",
+            "production-ssh",
+            "--description",
+            "Production host access",
+            "--from-ssh-key",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains(private_key)
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn updates_an_environment_variable_from_standard_input() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();

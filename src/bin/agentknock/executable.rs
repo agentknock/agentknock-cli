@@ -154,12 +154,13 @@ impl SelectedExecutable {
         self,
         arguments: &[String],
         secret_use_output: SecretUseOutput,
+        additional_environment: BTreeMap<OsString, OsString>,
         signal_state: &SignalState,
         blocked_signals: BlockedSignals,
     ) -> io::Result<()> {
         self.verify_hash()?;
         let arguments = c_arguments(&self.command, arguments)?;
-        let environment = c_environment(secret_use_output)?;
+        let environment = c_environment(secret_use_output, additional_environment)?;
         if blocked_signals.interrupted()? {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -228,7 +229,7 @@ impl SelectedExecutable {
         if actual != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the selected command changed after the secret use request",
+                "the selected command changed while Agentknock waited for the device",
             ));
         }
         Ok(())
@@ -450,7 +451,7 @@ fn default_search_path() -> io::Result<OsString> {
     if actual == 0 {
         return Err(io::Error::last_os_error());
     }
-    value.truncate(actual.saturating_sub(1));
+    value.truncate(actual - 1);
     Ok(OsString::from_vec(value))
 }
 
@@ -475,7 +476,10 @@ fn c_arguments(command: &str, arguments: &[String]) -> io::Result<Vec<CString>> 
         .collect()
 }
 
-fn c_environment(secret_use_output: SecretUseOutput) -> io::Result<Vec<CString>> {
+fn c_environment(
+    secret_use_output: SecretUseOutput,
+    additional_environment: BTreeMap<OsString, OsString>,
+) -> io::Result<Vec<CString>> {
     let mut environment = env::vars_os().collect::<BTreeMap<_, _>>();
     for (name, value) in secret_use_output.into_environment() {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
@@ -492,6 +496,7 @@ fn c_environment(secret_use_output: SecretUseOutput) -> io::Result<Vec<CString>>
         }
         environment.insert(OsString::from(name), OsString::from(value));
     }
+    environment.extend(additional_environment);
 
     environment
         .into_iter()
@@ -582,38 +587,16 @@ fn signal_is_member(set: &libc::sigset_t, signal: libc::c_int) -> io::Result<boo
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt as _, path::Path};
+    use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt as _};
 
     use sha2::{Digest as _, Sha256};
-    use ulid::Ulid;
 
     use super::SelectedExecutable;
     use agentknock::ExecutableMode;
 
-    struct TestDirectory(std::path::PathBuf);
-
-    impl TestDirectory {
-        fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("agentknock-executable-{}", Ulid::generate()));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn selects_and_hashes_a_shebang_script() {
-        let directory = TestDirectory::new();
+        let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("tool");
         fs::write(&script, b"#!/bin/sh\necho selected\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -637,7 +620,7 @@ mod tests {
 
     #[test]
     fn ignores_a_non_executable_path_candidate() {
-        let directory = TestDirectory::new();
+        let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("tool"), b"not executable").unwrap();
         let cwd = super::open_directory(directory.path()).unwrap();
 
@@ -655,7 +638,7 @@ mod tests {
 
     #[test]
     fn continues_the_path_search_after_a_non_executable_candidate() {
-        let directory = TestDirectory::new();
+        let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("first");
         let second = directory.path().join("second");
         fs::create_dir(&first).unwrap();
@@ -680,7 +663,7 @@ mod tests {
 
     #[test]
     fn an_empty_path_component_uses_the_captured_working_directory() {
-        let directory = TestDirectory::new();
+        let directory = tempfile::tempdir().unwrap();
         let selected = directory.path().join("tool");
         fs::write(&selected, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&selected, fs::Permissions::from_mode(0o700)).unwrap();
@@ -699,7 +682,7 @@ mod tests {
 
     #[test]
     fn detects_an_in_place_change_after_selection() {
-        let directory = TestDirectory::new();
+        let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("tool");
         fs::write(&script, b"#!/bin/sh\necho before\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -716,12 +699,16 @@ mod tests {
 
         let error = executable.verify_hash().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("changed after"));
+        assert!(
+            error
+                .to_string()
+                .contains("changed while Agentknock waited for the device")
+        );
     }
 
     #[test]
     fn detects_a_script_path_replacement_after_selection() {
-        let directory = TestDirectory::new();
+        let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("tool");
         let replacement = directory.path().join("replacement");
         fs::write(&script, b"#!/bin/sh\necho before\n").unwrap();

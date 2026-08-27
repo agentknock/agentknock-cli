@@ -37,13 +37,11 @@ unprotected error report can be forged by the relay.
 ## JSON representation
 
 Each message is a UTF-8 JSON object. Member names and string values are
-case-sensitive. Numbers, booleans, arrays, objects, and `null` values are valid
-only where a message definition permits them.
+case-sensitive.
 
 A sender includes every required member and omits an optional member when it
 has no value. A receiver rejects a missing required member or a member of the
-wrong JSON type. A receiver ignores unknown members. An unknown member has no
-meaning until a compatible revision of this protocol assigns one.
+wrong JSON type. A receiver ignores unknown members.
 
 JSON object member order and insignificant whitespace have no meaning. This
 protocol does not require a canonical JSON serialization. Handling of
@@ -303,7 +301,8 @@ member. Version 1 defines the following methods:
 
 | Method | Purpose |
 | --- | --- |
-| `SecretUse` | Request one or more secrets for an operation. |
+| `Invocation` | Prepare one or more secrets for a command invocation. |
+| `GitSign` | Request a Git SSH signature for an existing invocation. |
 | `SecretList` | List secret metadata without secret values. |
 | `SecretUpload` | Deliver a secret proposal for separate acceptance. |
 | `PairingRemove` | Remove the relationship between the client and device. |
@@ -316,9 +315,10 @@ application operation or another terminal result.
 ## Secret representation
 
 A secret has one name and one type. Secret names share one flat namespace on
-the device. Version 1 defines the `environment` type.
+the device. Version 1 defines the `environment` and `ssh` types.
 
-Secret metadata represents environment variables as a list of names:
+Environment-secret metadata represents environment variables as a list of
+names:
 
 ```json
 {
@@ -331,7 +331,7 @@ Secret metadata represents environment variables as a list of names:
 The optional `description` member contains human-readable text. The
 `variables` array contains no values. A sender emits each name at most once.
 
-Secret contents represent environment variables as a map:
+Environment-secret contents represent environment variables as a map:
 
 ```json
 {
@@ -346,21 +346,35 @@ Secret contents represent environment variables as a map:
 ```
 
 The map key is the environment variable name. The `value` string is its exact
-UTF-8 value. The secret type controls how a client can use the contents; a
-receiver must not reinterpret an unknown type as `environment`.
+UTF-8 value.
 
-## Secret use
+SSH-secret metadata and invocation contents contain only the public key:
 
-The `SecretUse` method asks the device to authorize one operation with a set
-of named secrets.
+```json
+{
+  "description": "Release signing key",
+  "type": "ssh",
+  "public_key": "ssh-ed25519 AAAA..."
+}
+```
 
-### Secret use request
+The `public_key` member contains one public key in OpenSSH format. The private
+key remains on the device.
+
+## Invocation
+
+The `Invocation` method asks the device to prepare a set of named secrets for
+one command invocation. Environment secrets can release values in the
+response. SSH secrets release only their public keys; later `GitSign`
+exchanges request individual signatures.
+
+### Invocation request
 
 An `exec` request has this plaintext shape:
 
 ```json
 {
-  "method": "SecretUse",
+  "method": "Invocation",
   "secrets": ["cloudflare", "github"],
   "reason": "Publish the release",
   "operation": {
@@ -375,13 +389,16 @@ An `exec` request has this plaintext shape:
     "stdout": "TERMINAL",
     "stderr": "TERMINAL"
   },
-  "launcher_chain": ["/usr/bin/bash"]
+  "launcher_chain": ["/usr/bin/bash"],
+  "invocation_token": "base64 invocation token"
 }
 ```
 
 The `secrets` array is nonempty, sorted lexicographically, and contains no
 duplicates or empty names. The optional `reason` is untrusted text supplied by
-the client.
+the client. The `invocation_token` is a fresh 32-byte random value. The device
+associates it with the request identifier and selected secrets for later
+operations belonging to this invocation.
 
 For an `exec` operation:
 
@@ -400,7 +417,7 @@ For an `exec` operation:
 The metadata is approval context, not remote attestation. The device treats it
 as client-supplied data.
 
-### Approved secret use response
+### Approved invocation response
 
 An approval response contains the requested secret contents:
 
@@ -424,6 +441,11 @@ An approval response contains the requested secret contents:
           "value": "secret value"
         }
       }
+    },
+    "release-signing": {
+      "description": "Release signing key",
+      "type": "ssh",
+      "public_key": "ssh-ed25519 AAAA..."
     }
   }
 }
@@ -432,7 +454,8 @@ An approval response contains the requested secret contents:
 The `secrets` map contains exactly the names in the request. If more than one
 secret provides the same environment variable, every provided value must be
 identical. The client rejects the response and does not start the operation if
-either condition fails.
+either condition fails. A client invocation supports at most one SSH secret
+and rejects a response containing more than one.
 
 The approval completion omits secret contents:
 
@@ -442,7 +465,7 @@ The approval completion omits secret contents:
 }
 ```
 
-### Denied secret use response
+### Denied invocation response
 
 A denial response has this form:
 
@@ -466,10 +489,10 @@ A denial response has this form:
 The `message` member contains diagnostic text. The denial completion repeats
 the complete denial plaintext, including `reason` and `message`.
 
-### Aborted secret use completion
+### Aborted invocation completion
 
 `ABORTED` is a client completion result. A device must not send it as a secret
-use response.
+invocation response.
 
 ```json
 {
@@ -493,6 +516,62 @@ If the client has sent the request but cannot obtain a usable response, it
 sends an aborted completion when it still has the live cryptographic context.
 This handoff is best effort and does not delay termination indefinitely.
 
+## Git signing
+
+The `GitSign` method requests one SSHSIG signature in the `git` namespace. It
+uses a new paired exchange related to an earlier `Invocation` exchange. The
+device makes a separate decision for every Git signature request; accepting
+the invocation does not approve later signatures.
+
+### Git signing request
+
+```json
+{
+  "method": "GitSign",
+  "invocation_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+  "invocation_token": "base64 invocation token",
+  "secret": "release-signing",
+  "message": "base64 Git signing payload"
+}
+```
+
+`invocation_id` is the request identifier of the related `Invocation`.
+`invocation_token` is the same decoded 32-byte value supplied in that
+invocation. `secret` names the SSH secret selected by the invocation.
+`message` is the Base64 encoding of the exact bytes that Git asks the signing
+program to sign. The SSHSIG namespace is fixed to `git` and is not transmitted.
+
+The device rejects the request unless the invocation identifier, token, and
+secret are consistent with one another.
+
+### Git signing response and completion
+
+An approved response contains an ASCII-armored SSHSIG signature:
+
+```json
+{
+  "result": "APPROVED",
+  "signature": "-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----\n"
+}
+```
+
+The signature covers the decoded `message` bytes with namespace `git` and the
+SSH key named by `secret`. The approval completion omits the signature:
+
+```json
+{
+  "result": "APPROVED"
+}
+```
+
+A denied response uses the same `DENIED` form and denial reasons as an
+invocation response. Its completion repeats the denial. Before a usable
+response, cancellation or failure uses the same client-only `ABORTED` form and
+abort reasons defined for invocation completion. An invalid response also
+produces an aborted completion. After the client authenticates a terminal
+response, later cancellation does not change its completion result. Each
+signature uses its own request identifier and paired cryptographic context.
+
 ## Secret list
 
 The `SecretList` request contains only the method and client software
@@ -513,6 +592,11 @@ The response maps each available secret name to its metadata:
       "description": "GitHub API access",
       "type": "environment",
       "variables": ["GH_TOKEN"]
+    },
+    "release-signing": {
+      "description": "Release signing key",
+      "type": "ssh",
+      "public_key": "ssh-ed25519 AAAA..."
     }
   }
 }
@@ -566,6 +650,26 @@ description means that the resulting secret has no description.
 
 The `variables` map is nonempty. In `UPDATE`, omitted environment variables
 are retained. In `REPLACE`, omitted environment variables are removed.
+
+An SSH-secret upload has this form:
+
+```json
+{
+  "method": "SecretUpload",
+  "mode": "CREATE",
+  "secret": {
+    "name": "release-signing",
+    "description": "Release signing key",
+    "type": "ssh",
+    "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+  }
+}
+```
+
+`private_key` contains an unencrypted Ed25519 private key in OpenSSH format.
+It is required for every SSH-secret upload. In `UPDATE`, accepting the proposal
+replaces the existing private key. Description handling is the same for both
+secret types.
 
 ### Secret upload response and completion
 
@@ -657,7 +761,7 @@ This object occupies the same relay response position as a cryptographic
 response envelope, but it is not encrypted or authenticated. The relay can
 fabricate, replace, or suppress it. A client uses it only as diagnostic
 information. It must not change pairing keys, pairing state, rotation state,
-or secret-use results because of an unprotected report.
+or invocation results because of an unprotected report.
 
 The code set is extensible. `UNSUPPORTED_PROTOCOL_VERSION` indicates that the
 receiver cannot process the selected cryptosystem version. Other codes have no

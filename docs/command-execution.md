@@ -1,14 +1,14 @@
 # Agentknock command execution semantics
 
-This document explains how the Agentknock CLI selects and starts a command
-after the paired device approves secret use. It describes the operating-system
-mechanisms, the consistency properties they provide, and the limits of those
-properties.
+This document explains how the Agentknock CLI selects and starts a command,
+delivers environment values, and supports deferred operations such as Git
+signing. It describes the operating-system mechanisms, the consistency
+properties they provide, and the limits of those properties.
 
 The [Agentknock v1 client-device protocol](client-device-protocol.md) defines
 the command metadata sent to the device. The [Agentknock v1
-cryptosystem](cryptosystem.md) defines how Agentknock protects the request and
-the returned secret values.
+cryptosystem](cryptosystem.md) defines how Agentknock protects requests,
+responses, and returned secret values.
 
 ## Security model and scope
 
@@ -44,25 +44,30 @@ a sandbox or privilege boundary.
 
 1. Capture the working directory and executable search path.
 2. Select, open, inspect, and retain the top-level executable.
-3. Send the invocation and executable metadata for approval.
+3. Send the invocation, selected secrets, and executable metadata to the
+   device.
 4. Wait for an authenticated response and complete the protocol exchange.
-5. Revalidate the executable when a hash is available.
-6. Overlay the returned environment variables on the inherited environment.
-7. Check for a pending termination signal.
-8. Replace the Agentknock process with the command.
+5. If the response contains an SSH secret, start an invocation service for
+   deferred operations and add its Git settings to the command environment.
+6. Revalidate the executable when a hash is available.
+7. Overlay returned environment variables and Agentknock's Git settings on the
+   inherited environment.
+8. Check for a pending termination signal.
+9. Replace the Agentknock process with the command.
 
-Agentknock selects the executable before requesting secret use. Returned
-environment variables therefore cannot affect Agentknock's initial `PATH`
-search.
+Agentknock selects the executable before sending the invocation request.
+Returned environment variables therefore cannot affect Agentknock's initial
+`PATH` search.
 
 Agentknock does not invoke an implicit shell. It keeps the command and each
 argument as separate strings and passes them directly to the operating system.
 The mandatory `--` separator prevents Agentknock from interpreting command
 arguments as its own options.
 
-After a successful process replacement, Agentknock does not remain as a
-supervisor. The command retains the process ID and ordinary process
-relationships of the Agentknock invocation.
+After a successful process replacement, the command retains Agentknock's
+process ID and ordinary process relationships. When deferred operations are
+enabled, a separate invocation service remains until that process exits. The
+service does not supervise the command or determine its exit status.
 
 ## Atomicity boundaries
 
@@ -83,6 +88,7 @@ races:
 | Approval metadata to executable contents | Hash before the request and again before execution. | The file can change after the second hash observation. |
 | Approval wait to script execution | Rehash the captured script path immediately before `execve`. | The pathname or file can change after revalidation. |
 | Signal handling to process replacement | Block termination signals, check pending signals, then restore the caller's state. | A later signal follows the restored disposition as normal. |
+| Invocation to deferred helper | Keep the invocation token in a service tied to the command PID and check helper ancestry. | A capable same-user process remains inside the threat boundary. |
 
 An executable hash is an observation, not an execution handle. Revalidating a
 hash can detect a change, but it cannot make mutable bytes immutable or make
@@ -90,7 +96,7 @@ the check and execution one operation.
 
 ## Approval context
 
-The secret use request reports:
+The invocation request reports:
 
 - The original command string and structured arguments.
 - The captured working directory.
@@ -121,7 +127,7 @@ program self-inspection.
 
 ## Environment construction
 
-After an authenticated approval, Agentknock builds the command environment:
+After an authenticated response, Agentknock builds the command environment:
 
 1. Start with the complete inherited environment. Unrelated non-UTF-8 names
    and values remain byte-preserving operating-system strings.
@@ -129,7 +135,9 @@ After an authenticated approval, Agentknock builds the command environment:
    replaces an inherited value with the same name.
 3. Reject an empty returned name, a name containing `=` or NUL, or a value
    containing NUL.
-4. Produce at most one entry for each environment variable name.
+4. If an SSH secret enables deferred Git signing, add the Git configuration
+   entries described below.
+5. Produce at most one entry for each environment variable name.
 
 When multiple requested secrets provide the same environment variable, their
 values must match exactly. Agentknock rejects conflicting values. It never
@@ -143,9 +151,9 @@ influential variables is open-ended, and commands can legitimately require
 them. Sanitizing a small known set would provide incomplete protection while
 breaking valid uses.
 
-The approved command and its descendants control every value they receive.
-Users must approve secret use only for commands they trust to handle those
-values.
+The command and its descendants control every value they receive. Users must
+approve environment delivery and signing operations only for commands they
+trust to handle them.
 
 ## Linux implementation
 
@@ -153,12 +161,14 @@ The current command-execution implementation supports Linux. It requires:
 
 - Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
 - The `execveat` system call.
-- A mounted `/proc` file system with a usable `/proc/self/fd` view.
+- The `pidfd_open` system call for deferred operations.
+- A mounted `/proc` file system with usable file-descriptor and process-status
+  views.
 - UTF-8 command arguments, working-directory paths, and selected executable
   paths at the protocol boundary.
 
-Agentknock stops before requesting secret use when the host cannot provide a
-required facility.
+Agentknock stops before sending the invocation request when the host cannot
+provide a required facility.
 
 ### Working directory and search path
 
@@ -242,6 +252,57 @@ be a different execution object and could change path behavior, file
 attributes, capabilities, signatures, or security-policy treatment. It would
 also leave interpreters and runtime dependencies unpinned.
 
+### Invocation service and Git signing
+
+An invocation response containing an SSH secret includes its name and public
+key, not its private key. Agentknock starts a separate copy of its executable
+as an invocation service before replacing the launcher process. The launcher
+sends the service the invocation identifier, a fresh 32-byte invocation token,
+the SSH secret name and public key, the owner process ID, and output settings
+through the service's standard input. It does not pass a live HPKE context to
+the service.
+
+The service creates a mode-0700 temporary directory containing a Unix-domain
+socket and a symlink to `/proc/<service-pid>/exe`. The symlink lets Git invoke
+the same Agentknock binary as its signing helper without installing another
+executable or adding a directory to `PATH`. The directory and its entries are
+removed when the service exits normally; an abrupt service failure can leave
+them behind.
+
+The launcher adds two Git settings through `GIT_CONFIG_COUNT`:
+
+- `gpg.ssh.program` names the helper symlink.
+- `gpg.ssh.defaultKeyCommand` asks the same helper for the selected SSH public
+  key when Git has no configured `user.signingKey`.
+
+These settings affect Git processes in the command's environment. Agentknock
+does not set `gpg.format`, `commit.gpgSign`, `tag.gpgSign`, or
+`user.signingKey`; those remain under user and repository control.
+
+For an SSHSIG signing operation in the `git` namespace, the helper compares
+Git's requested key with the selected Agentknock public key. A match sends the
+exact signing payload supplied by Git to the invocation service. The service
+creates a new protected `GitSign` exchange containing the original invocation
+identifier and token, the SSH secret name, and those bytes. It writes an
+approved SSHSIG response to the signature file expected by Git. Every
+signature receives a separate device decision.
+
+If Git requests another key or invokes the configured program for another
+operation, the helper replaces itself with `ssh-keygen` from `PATH` and passes
+the original arguments unchanged.
+
+The service opens a pidfd for the owner process, whose PID remains stable when
+the launcher replaces itself with the command. It exits when that process
+exits. Before serving a helper connection, it reads the peer PID from the Unix
+socket and walks Linux parent-process records to require that the helper is a
+descendant of the owner. If the owner exits during a signing request, the
+service cancels the request and attempts a short aborted completion.
+
+These checks keep ordinary unrelated processes from accidentally using an
+invocation service. They are not a same-user security boundary. The security
+model described above still applies to the socket, process tree, invocation
+token, and service memory.
+
 ### Native executable replacement
 
 For a target classified as a binary, Agentknock makes the system call
@@ -319,9 +380,10 @@ Agentknock-owned descriptors use close-on-exec or are closed before process
 replacement. Agentknock does not close every inherited descriptor because
 applications can intentionally use descriptor inheritance as an interface.
 
-Keeping a supervisor would change process IDs, signals, job control, and exit
-status handling. Process replacement avoids those differences and is
-sufficient for environment-variable delivery.
+Keeping the launcher as a supervisor would change process IDs, signals, job
+control, and exit-status handling. Process replacement avoids those
+differences. The optional invocation service is independent of that lifecycle
+and communicates with helpers rather than supervising the command.
 
 ## macOS status
 
@@ -358,5 +420,8 @@ secrets.
 - [Linux `execveat(2)` manual page](https://man7.org/linux/man-pages/man2/execveat.2.html)
 - [Linux `faccessat2(2)` manual page](https://man7.org/linux/man-pages/man2/access.2.html)
 - [Linux `openat(2)` manual page](https://man7.org/linux/man-pages/man2/open.2.html)
+- [Linux `pidfd_open(2)` manual page](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)
 - [Linux `proc_pid_fd(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html)
+- [Linux `proc_pid_status(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
+- [Linux `unix(7)` manual page](https://man7.org/linux/man-pages/man7/unix.7.html)
 - [POSIX `exec` specification](https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html)
