@@ -68,10 +68,12 @@ bash verification/cryptosystem/verifpal/run.sh
 ```
 
 The Tamarin runner uses a global lock, one prover process at a time, a 384 MiB
-GHC heap ceiling, and a three-minute deadline per lemma. The Verifpal 8-session
-pairing case can also take several minutes. See the prover-specific reports for
-exact commands, expected-attack conventions, and full-output options. The
-Tamarin report also documents optional host-level cgroup isolation:
+GHC heap ceiling, and a three-minute deadline per lemma. The Verifpal runner
+uses one Nix build job, an 8 GiB per-process ceiling, and a 15-minute deadline
+per analysis; its 8-session pairing case can take several minutes. See the
+prover-specific reports for exact commands, expected-attack conventions, and
+full-output options. The Tamarin report also documents optional host-level
+cgroup isolation:
 
 - [`tamarin/README.md`](tamarin/README.md)
 - [`proverif/README.md`](proverif/README.md)
@@ -167,8 +169,8 @@ first-request replacement or completion forgery.
   [Tamarin manual](https://tamarin-prover.com/manual/master/book/001_introduction.html).
 - ProVerif 2.05 is supplied by the same pin; the upstream release and manual
   are linked from the [official ProVerif site](https://bblanche.gitlabpages.inria.fr/proverif/).
-- Verifpal 1.0.0 is built from source commit
-  `c9c7a6006a3629f5a10cde6d2d6e726f212e9e64`, corresponding to the signed
-  [v1.0.0 release](https://github.com/symbolicsoft/verifpal/releases/tag/v1.0.0).
+- Verifpal 1.3.2 is built from source commit
+  `11ea59e2e044e564052e97e7444d375fb3bf4d39`, corresponding to the verified
+  [v1.3.2 release](https://github.com/symbolicsoft/verifpal/releases/tag/v1.3.2).
   Its bounded-search limitations are described in the
-  [pinned upstream README](https://github.com/symbolicsoft/verifpal/blob/c9c7a6006a3629f5a10cde6d2d6e726f212e9e64/README.md).
+  [pinned upstream README](https://github.com/symbolicsoft/verifpal/blob/11ea59e2e044e564052e97e7444d375fb3bf4d39/README.md).

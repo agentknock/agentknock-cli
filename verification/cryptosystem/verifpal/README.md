@@ -11,10 +11,12 @@ The result is supporting evidence, not a complete proof of the specification.
 Verifpal deliberately performs a terminating, sound-but-incomplete search over
 a bounded number of replicated sessions. In particular, when its attack
 construction needs a whole term, it chooses only among terms computed by the
-protocol; it can miss an attack requiring a different term and cannot report
-where that restriction mattered. A `0` result therefore means only that this
-search found no attack. The unbounded and stateful claims are handled by the
-companion Tamarin and ProVerif models.
+protocol and can miss an attack requiring a different term. Verifpal 1.3.2
+stamps every holding query with its search envelope, such as
+`[search exhausted at 8 sessions]`; that makes the applied bound explicit but
+does not make the search complete or identify a missed attack. A `0` result
+therefore means only that this search found no attack. The unbounded and
+stateful claims are handled by the companion Tamarin and ProVerif models.
 
 Verifpal's `equivalence?` query checks symbolic term agreement between the
 named principals in these traces. It is not the observational-equivalence
@@ -22,17 +24,19 @@ notion supported by tools such as ProVerif or Tamarin.
 
 ## Reproduce the analysis
 
-The repository flake pins Verifpal 1.0.0 and its complete build inputs. Run:
+The repository flake pins Verifpal 1.3.2 and its complete build inputs. Run:
 
 ```sh
 ./verification/cryptosystem/verifpal/run.sh
 ```
 
-The runner builds the pinned binary, verifies its version, runs every model at
-1, 2, 4, and 8 sessions per principal, and compares every compact result code
-with [`RESULTS.md`](RESULTS.md). The 8-session pairing run can take several
-minutes. To inspect a full minimized attack narration for one model, use the
-same pinned binary directly, for example:
+The runner builds the pinned binary with one build job, applies an 8 GiB
+per-process memory ceiling, and verifies its version. It then checks every
+hand-written query at 1, 2, 4, and 8 sessions per principal, the generated
+query audit at 1 and 2 sessions, and the saturation point of each model against
+[`RESULTS.md`](RESULTS.md). The 8-session pairing run can take several minutes.
+To inspect a full minimized attack narration for one model, use the same pinned
+binary directly, for example:
 
 ```sh
 nix run path:$PWD/verification/cryptosystem#verifpal -- \
@@ -42,9 +46,9 @@ nix run path:$PWD/verification/cryptosystem#verifpal -- \
 
 The pin resolves as follows:
 
-- official release: `v1.0.0`;
-- annotated tag object: `57246b2db43d55545ee2c0f7413a38004104f272`;
-- source commit: `c9c7a6006a3629f5a10cde6d2d6e726f212e9e64`;
+- official release: `v1.3.2`;
+- annotated tag object: `7538231411fc73d119510250ef501c338905709c`;
+- source commit: `11ea59e2e044e564052e97e7444d375fb3bf4d39`;
 - source and Cargo dependency hashes: recorded in
   [`../flake.nix`](../flake.nix).
 
@@ -55,9 +59,9 @@ Claim IDs refer to the shared [`../CLAIMS.md`](../CLAIMS.md) ledger.
 | Model | Purpose and covered claims |
 | --- | --- |
 | `pairing_activation.vp` | Pairing base exchange, commitment check, collision-free SAS equality gate, and activation; expected pre-SAS attacks P04/P05 and bounded evidence for P06/P07 plus the activation instance of X01--X05. |
-| `paired_exchange.vp` | Request, exporter-derived response, and completion; bounded secrecy, non-injective authentication, agreement, mixup, and freshness evidence for X01--X05 and the cryptographic part of X07. |
-| `rotation.vp` | Candidate derivation, the checked ordinary-request adoption gate, and response confirmation; bounded evidence for the cryptographic parts of R02/R03/R06. |
-| `compromise_psk.vp` | Post-transcript PSK-only disclosure; bounded evidence for C02. |
+| `paired_exchange.vp` | Request, exporter-derived response, and completion; bounded secrecy, injective authentication, agreement, mixup, and freshness evidence for X01--X05 and the cryptographic part of X07. Its multi-session replay results expose the absent X06 slot state. |
+| `rotation.vp` | Candidate derivation, the checked ordinary-request adoption gate, and response confirmation; bounded secrecy and one-session agreement evidence for the cryptographic parts of R02/R03/R06, plus the expected multi-session replay boundary. |
+| `compromise_psk.vp` | Post-transcript PSK-only disclosure; bounded confidentiality evidence for C02. Its multi-session equivalence result has the same absent-slot qualification. |
 | `compromise_device_key.vp` | Later device-private-key disclosure; expected attacks demonstrating C03. |
 | `psk_holder_authority.vp` | Constructive compromised-holder traces for future request impersonation and competing rotation, C01. |
 | `negative_missing_request_id.vp` | Deliberately omits `request_id`; a two-session cross-feed demonstrates why X04/X05 require it. |
@@ -102,12 +106,16 @@ the displayed digits.
   endpoint-origin or non-repudiation proofs: either endpoint retaining a
   request context can construct context-consistent records in either
   direction.
-- Verifpal authentication is non-injective. A replay of an honestly sent
-  value is not a forgery, so it does not prove the one-slot, one-effect, or
-  idempotency rules in P08 or X06.
+- Verifpal 1.3.2 authentication is injective agreement. At two or more
+  sessions, replaying one honestly sent tuple into a second role instance
+  breaks authentication even though the attacker forged no cryptographic
+  value. This is useful evidence that the stateless cryptographic core alone
+  does not provide the one-slot, one-effect, or idempotency rules in P08, X06,
+  and R01.
 - A `freshness?` result says the symbolic term depends on a generated fresh
-  atom. It does not prove state uniqueness, response caching, or nonce-reuse
-  discipline by itself.
+  atom. It can hold even while an entire fresh tuple is replayed, and does not
+  prove state uniqueness, response caching, or nonce-reuse discipline by
+  itself.
 - Verifpal has no mutable protocol state or conditional equivalence query.
   Current/previous/candidate ordering, conditional adoption, overlap expiry,
   fixed terminal responses, retained per-request contexts, rotation
@@ -120,6 +128,24 @@ the displayed digits.
   fails. Verifpal cannot ask for candidate equivalence only on traces where
   adoption succeeded; the positive rotation model queries agreement after the
   gate, while Tamarin/ProVerif carry the conditional state claim.
+- `--auto-queries` was run over the six non-diagnostic models at one and two
+  sessions. It generated confidentiality queries for secret inputs,
+  authentication queries for received values used cryptographically, and
+  freshness queries for used wire values. It found the same two-session replay
+  boundary and the already advertised public, leaked, or pre-SAS values, but no
+  additional cryptographic confidentiality failure. Hand-written queries
+  remain authoritative because automatic queries do not generate equivalence,
+  unlinkability, or preconditioned properties.
+- `--saturate` stopped at two or three sessions for these models. It stops at
+  the first adjacent equal result code, at no more than four sessions, so this
+  is an inexpensive diagnostic rather than a proof of saturation. The fixed
+  1/2/4/8 matrix remains the stronger recorded bounded experiment.
+- The new `scenarios[]` peer-configuration axis was reviewed but is not added
+  to these models. The pairing model already exposes peer-key substitution and
+  checks the SAS gate directly; after activation, each model has a fixed peer
+  binding rather than a runtime peer parameter. Adding one would conflate the
+  cryptographic trace with binding lookup. Multiple-binding selection and
+  isolation are represented explicitly in the Tamarin state models instead.
 - Algorithms, exact lengths and parsing, X25519 validation details, concrete
   probabilities, storage behavior, side channels, and implementation
   conformance are the separate O01--O07 obligations, not conclusions of this
