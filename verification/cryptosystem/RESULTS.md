@@ -1,7 +1,7 @@
 # Agentknock v1 cryptosystem verification results
 
 Specification SHA-256:
-`9962cc73781d6e8fea371aef914a66c6f128ef8a832dec3d3eb2f6e08a56a096`.
+`ac86cb6cb2e4808fb8eea8358c6b4b4946d5cecc5fae806307e7b5c60dcc2d6f`.
 
 This report maps every ID in [`CLAIMS.md`](CLAIMS.md) to its strongest direct
 evidence and its qualification. “Proved” always means symbolically proved in
@@ -14,10 +14,11 @@ warning or precomputation exemption. Exact per-theory counts and the
 reproduction command are in [`tamarin/RESULTS.md`](tamarin/RESULTS.md).
 
 The recorded ProVerif 2.05 verdict vectors match
-[`proverif/RESULTS.md`](proverif/RESULTS.md). The recorded Verifpal 1.0.0 matrix
+[`proverif/RESULTS.md`](proverif/RESULTS.md). The recorded Verifpal 1.3.2 matrix
 matches [`verifpal/RESULTS.md`](verifpal/RESULTS.md) at 1, 2, 4, and 8 sessions
 per principal. Every attack verdict is classified as an advertised compromise
-or non-property, or as a deliberately weakened-model witness.
+or non-property, a deliberately weakened-model witness, or an expected replay
+through state deliberately absent from the Verifpal models.
 
 ## Pairing and activation
 
@@ -36,8 +37,8 @@ or non-property, or as a deliberately weakened-model witness.
 
 | ID | Disposition | Evidence and qualification |
 | --- | --- | --- |
-| X01 | Symbolic proof with explicit compromise boundary | Tamarin `X01_request_confidentiality_even_after_psk_disclosure` and `X01_request_authentication`, and ProVerif request secrecy/correspondence, prove relay secrecy and PSK-holder authentication. A PSK alone does not open a recorded KEM context. A pre-accept PSK disclosure or live-context disclosure is an explicit authentication exception; Verifpal adds bounded evidence. |
-| X02 | Symbolic proof of secrecy and context possession | Tamarin `X02_honest_response_confidentiality` and `X02_response_authenticates_context_possession_not_device_origin`, plus ProVerif and bounded Verifpal, cover the response. Tamarin's constructive client-context-holder trace confirms the advertised non-property: this is not device-origin proof or non-repudiation. |
+| X01 | Symbolic proof with explicit compromise boundary | Tamarin `X01_request_confidentiality_even_after_psk_disclosure` and `X01_request_authentication`, and ProVerif request secrecy/correspondence, prove relay secrecy and PSK-holder authentication. A PSK alone does not open a recorded KEM context. A pre-accept PSK disclosure or live-context disclosure is an explicit authentication exception. Verifpal adds bounded secrecy evidence; its expected two-session injective replay shows why request-slot state is also required. |
+| X02 | Symbolic proof of secrecy and context possession | Tamarin `X02_honest_response_confidentiality` and `X02_response_authenticates_context_possession_not_device_origin`, plus ProVerif, cover the response; Verifpal adds bounded secrecy evidence and the expected stateless replay boundary. Tamarin's constructive client-context-holder trace confirms the advertised non-property: this is not device-origin proof or non-repudiation. |
 | X03 | Symbolic proof with live-context boundary | Tamarin's X03 secrecy and authentication/order lemmas and ProVerif's completion queries bind completion to record 1 after record 0. The missing-record-sequence negative controls find the expected swap. A revealed live context permits completion forgery, exactly why the honest-live-state assumption is required. |
 | X04 | Symbolic proof with sensitivity controls | Tamarin `X04_accepted_request_matches_all_context_identifiers` and ProVerif's paired/two-version models bind version, device, client, and request identities. ProVerif `negative_missing_context_binding.pv` and `negative_missing_version_binding.pv`, plus Verifpal's multi-session missing-request-ID model, produce expected substitutions when components are removed. Fixed-width byte encoding remains O06. |
 | X05 | Symbolic proof with negative controls | Tamarin's two X05 separation lemmas and the ProVerif/Verifpal sensitivity models reject cross-version, device, client, request, and record use in the cryptographic model. Selecting and retaining the correct transport slot is represented by state and restrictions; concrete routing, parsing, and encodings remain O05/O06. |
@@ -50,11 +51,11 @@ or non-property, or as a deliberately weakened-model witness.
 | ID | Disposition | Evidence and qualification |
 | --- | --- | --- |
 | R01 | Conditional state-machine proof | Tamarin's three R01 lemmas prove derivation from one rotation context, repetition of one fixed encapsulation while pending, and no second client rotation before confirmation. The atomic replace-and-retain step is modeled; crash-safe realization is O05. |
-| R02 | Symbolic proof | Tamarin `R02_adoption_requires_candidate_authenticated_request` and ProVerif's candidate correspondences prove that adoption coincides with a normal request opening under the derived candidate. Verifpal supplies bounded independent evidence. |
+| R02 | Symbolic proof | Tamarin `R02_adoption_requires_candidate_authenticated_request` and ProVerif's candidate correspondences prove that adoption coincides with a normal request opening under the derived candidate. Verifpal supplies one-session agreement and bounded secrecy evidence; its expected multi-session replay cannot represent the adoption slot state. |
 | R03 | Symbolic cryptographic/state proof; parsing excluded | Tamarin `R03_no_bare_rotation_state_change` and the absence of any adoption rule without candidate-authenticated request cover absent, bare, or well-formed substituted encapsulations. Verifpal's pre-gate negative control shows substitution can change an uncommitted candidate and cause denial of service but not adoption. “Malformed” at the Base64/length/X25519/HPKE parsing layer is O06 and is not symbolically proved. |
 | R04 | Symbolic state proof | Tamarin `R04_current_psk_success_ignores_rotation_field` and ProVerif's current-first correspondence show that a current-PSK success leaves binding state unchanged regardless of the optional field. Exact ignore-before-decode behavior is a conformance obligation O06. |
 | R05 | Conditional state-machine proof | Tamarin's previous-generation lemmas prove ordinary overlap use is reachable, previous use cannot rotate, expiry is not extended, a second rotation retires the older generation, and a compromised previous PSK cannot install its attempted successor. The last result composes a checked-request gate established by the core rotation model and ProVerif with the old-versus-current generation invariant. The fixed deadline and correct clock/persistence are product/environment assumptions O03/O05. |
-| R06 | Composed symbolic proof | The active-attacker Tamarin R02 model and ProVerif establish the checked candidate/request and response hops; Tamarin's two focused R06 state lemmas then bind clearing to the matching pending encapsulation and adopted/already-current successor. Verifpal gives bounded evidence. Clear errors or mere relay delivery have no confirmation rule. |
+| R06 | Composed symbolic proof | The active-attacker Tamarin R02 model and ProVerif establish the checked candidate/request and response hops; Tamarin's two focused R06 state lemmas then bind clearing to the matching pending encapsulation and adopted/already-current successor. Verifpal gives one-session agreement and bounded secrecy evidence, while its multi-session replay demonstrates the need for that pending state. Clear errors or mere relay delivery have no confirmation rule. |
 | R07 | Conditional executability/idempotency result | Tamarin `R07_lost_confirmation_recovery_executable` witnesses adoption followed by another request whose current-PSK step succeeds with the same still-pending encapsulation and then confirms. The fixed pending value comes from R01 and durable state from O05. |
 | R08 | Conditional state-machine proof | Tamarin's client no-second-pending lemma, one-previous device state representation, `R08_second_rotation_replaces_previous_state`, and older-generation retirement lemma establish the two bounds. The no-second-unconfirmed rule is client-local: the device may accept a later independently authenticated rotation and then retains only the newer previous generation. These are properties of the specified serialized state machine, not of HPKE alone. |
 | R09 | Conditional state-machine proof plus executability | Tamarin's R09 lemmas cover no new acceptance after invalidation, retained completion/cache behavior, and one-step two-binding isolation. Rotation rules require active binding state; the separate activation model has no rotation transition. Arbitrary-sequence isolation is a manual induction over binding-local transitions. The invalidation trigger/application policy is deliberately outside the specification, and atomic per-binding state is O05. |
@@ -63,7 +64,7 @@ or non-property, or as a deliberately weakened-model witness.
 
 | ID | Disposition | Evidence and qualification |
 | --- | --- | --- |
-| C01 | Expected attacks witnessed | Tamarin's PSK impersonation and competing-rotation exists-traces, ProVerif `psk_compromise.pv`, and Verifpal `psk_holder_authority.vp` construct future request and rotation authority after current-PSK disclosure. |
+| C01 | Expected attacks witnessed | Tamarin's PSK impersonation and competing-rotation exists-traces, ProVerif `psk_compromise.pv`, and the one-session Verifpal `psk_holder_authority.vp` executions construct future request and rotation authority after current-PSK disclosure. Verifpal's multi-session equivalence failures are stateless cross-session replays, not additional compromise power. |
 | C02 | Symbolic proof with structural extension | The recorded **request** is queried directly in Tamarin `C02_recorded_request_survives_psk_only_disclosure`, ProVerif, and Verifpal. For recorded **responses and completions**, the conclusion follows structurally from the uncompromised request-context secrecy assumptions and the X02/X03 secrecy lemmas; no separate C02-labeled end-to-end query claims more. Device-key or sender-context compromise remains an exception. |
 | C03 | Expected attacks witnessed for one successor; longer lineage manual | Tamarin's end-to-end theory, ProVerif `device_key_compromise.pv`, and Verifpal `compromise_device_key.vp` recover the initial PSK, one mechanically modeled successor, and traffic in both generations after delayed `skD` disclosure. An arbitrary recorded successor chain follows by repeating the same reconstruction step; that extension is a manual induction, not an unbounded mechanized lineage proof. |
 | C04 | Expected fork/race witnessed; conditional one-winner invariant | Tamarin's rollback/clone theories construct two distinct successors and a race from one cloned valid state, prove at most one distinct fork candidate is adopted by the modeled device lineage, and confirm that an adoption corresponds to an authenticated fork request. Clone identity is deliberately local metadata: it is absent from the wire, so the device cannot attribute a request to a particular copy. Rotation is not compromise recovery and clone detection is not provided. |
