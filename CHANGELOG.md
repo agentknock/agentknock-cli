@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/agentknock/agentknock-cli/compare/v0.1.4...v0.2.0) - 2026-08-27
+
+### Added
+
+- support RSA keys for Git SSH signing
+- [**breaking**] add SSH secret support and Git signing
+
+### Fixed
+
+- allow execution with closed standard streams
+
 ## [0.1.4](https://github.com/agentknock/agentknock-cli/compare/v0.1.3...v0.1.4) - 2026-08-24
 
 ### Other
