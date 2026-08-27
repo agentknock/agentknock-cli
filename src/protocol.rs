@@ -10,11 +10,12 @@ const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Serialize)]
 pub(crate) enum Method {
-    SecretUse,
+    Invocation,
     PairingFinish,
     PairingRemove,
     SecretList,
     SecretUpload,
+    GitSign,
 }
 
 pub(crate) fn encode<T>(

@@ -67,6 +67,18 @@ async fn lists_secret_metadata_without_secret_values() {
                                 "type": "environment",
                                 "variables": ["CF_API_TOKEN", "CF_ACCOUNT_ID"],
                             },
+                            "production-ssh": {
+                                "description": "Production host access",
+                                "type": "ssh",
+                                "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample user@host",
+                            },
+                            "future": {
+                                "description": "A future secret type",
+                                "type": "future_type",
+                                "future_metadata": {"value": true},
+                                "variables": {"different": "shape"},
+                                "public_key": 42,
+                            },
                         },
                     }),
                 ),
@@ -133,6 +145,15 @@ async fn lists_secret_metadata_without_secret_values() {
                     "description": "GitHub API access",
                     "type": "environment",
                     "variables": ["GH_TOKEN"],
+                },
+                "production-ssh": {
+                    "description": "Production host access",
+                    "type": "ssh",
+                    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample user@host",
+                },
+                "future": {
+                    "description": "A future secret type",
+                    "type": "future_type",
                 },
             },
         })

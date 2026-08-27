@@ -22,16 +22,18 @@ use crate::{
     websocket::{self, RelayExchange},
 };
 
-/// Describes a request to use one or more secrets.
+const INVOCATION_TOKEN_LENGTH: usize = 32;
+
+/// Describes an invocation request that selects one or more secrets.
 ///
-/// The device uses this metadata to decide whether to approve the request. The
-/// client that constructs it is responsible for reporting the operation and
-/// launcher information accurately.
+/// The device uses this metadata to decide how to answer the request. The client
+/// that constructs it is responsible for reporting the operation and launcher
+/// information accurately.
 pub struct SecretUseRequest<'a> {
     /// The unique names of the secrets requested together.
     pub secrets: &'a BTreeSet<String>,
 
-    /// The operation that will receive or use the approved secret material.
+    /// The operation that will receive or use the selected secrets.
     pub operation: SecretUseOperation<'a>,
 
     /// An optional explanation shown with the request.
@@ -67,10 +69,10 @@ pub enum StreamKind {
     Unknown,
 }
 
-/// An operation for which secret use can be requested.
+/// A command operation described by an invocation request.
 #[non_exhaustive]
 pub enum SecretUseOperation<'a> {
-    /// Executes a program with approved secret material in its environment.
+    /// Executes a program with selected secrets available to it.
     Exec {
         /// The executable name or path supplied by the caller.
         command: &'a str,
@@ -112,7 +114,7 @@ pub enum ExecutableMode {
     Script,
 }
 
-/// Secret material returned for an approved use request.
+/// Secret material and related authorization returned for an invocation.
 ///
 /// This type doesn't implement [`Debug`](std::fmt::Debug) because it contains
 /// secret values. Use [`SecretUseOutput::environment_variable_names`] to
@@ -120,9 +122,28 @@ pub enum ExecutableMode {
 /// [`SecretUseOutput::into_environment`].
 pub struct SecretUseOutput {
     environment: BTreeMap<String, String>,
+    ssh: Option<SshSecretUse>,
+    invocation: SecretUseInvocation,
 }
 
-/// A stage reported while a secret use request is running.
+/// An SSH secret made available to a command invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshSecretUse {
+    name: String,
+    public_key: String,
+}
+
+/// Identifies and authenticates operations that belong to one command invocation.
+///
+/// Treat the token as secret. Child processes don't receive it directly; an
+/// invocation service can retain it and perform deferred operations for them.
+#[derive(Clone)]
+pub struct SecretUseInvocation {
+    id: String,
+    token: [u8; INVOCATION_TOKEN_LENGTH],
+}
+
+/// A stage reported while an invocation request is running.
 ///
 /// A completed exchange reports `Preparing`, `WaitingForDelivery`, optionally
 /// one or more `WaitingForResponse` updates, `Completing`, and `Completed`, in
@@ -156,12 +177,51 @@ impl SecretUseOutput {
         self.environment.keys().map(String::as_str)
     }
 
+    /// Returns one approved environment variable value by name.
+    pub fn environment_variable(&self, name: &str) -> Option<&str> {
+        self.environment.get(name).map(String::as_str)
+    }
+
+    /// Returns the SSH secret available to the invocation, if one was requested.
+    pub fn ssh(&self) -> Option<&SshSecretUse> {
+        self.ssh.as_ref()
+    }
+
+    /// Returns the authorization for operations that belong to this invocation.
+    pub fn invocation(&self) -> &SecretUseInvocation {
+        &self.invocation
+    }
+
     /// Consumes the output and returns its environment variables and values.
     ///
     /// The map is keyed by environment variable name and ordered
     /// lexicographically.
     pub fn into_environment(self) -> BTreeMap<String, String> {
         self.environment
+    }
+}
+
+impl SshSecretUse {
+    /// Returns the secret name requested by the client.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the SSH public key in OpenSSH format.
+    pub fn public_key(&self) -> &str {
+        &self.public_key
+    }
+}
+
+impl SecretUseInvocation {
+    /// Returns the request identifier for the initial invocation request.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the authorization token for related operations.
+    pub fn token(&self) -> &[u8; 32] {
+        &self.token
     }
 }
 
@@ -214,11 +274,11 @@ pub enum RequestError {
     #[error(transparent)]
     Other(#[from] io::Error),
 
-    /// The device denied a secret use request.
+    /// The device denied an authorization request.
     #[error("request denied ({reason}): {message}")]
     Denied {
         /// The device's denial category.
-        reason: SecretUseDenialReason,
+        reason: DenialReason,
         /// Human-readable context supplied by the device.
         message: String,
     },
@@ -241,10 +301,10 @@ impl RequestError {
     }
 }
 
-/// The reason that the device denied a secret use request.
+/// The reason that the device denied an authorization request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SecretUseDenialReason {
+pub enum DenialReason {
     /// A user explicitly denied the request.
     UserDenied,
 
@@ -258,7 +318,7 @@ pub enum SecretUseDenialReason {
     Other,
 }
 
-impl fmt::Display for SecretUseDenialReason {
+impl fmt::Display for DenialReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::UserDenied => "USER_DENIED",
@@ -270,15 +330,17 @@ impl fmt::Display for SecretUseDenialReason {
 }
 
 impl Client {
-    /// Requests secret use and returns the approved environment values.
+    /// Requests selected secrets for an invocation.
     ///
     /// The authenticated response must contain exactly the requested secret
-    /// names. If multiple secrets provide the same environment variable, their
-    /// values must be identical. Otherwise, the method sends an aborted
-    /// completion and returns an error.
+    /// names. Environment values are returned directly. An SSH secret returns
+    /// its public key and authorization for related operations. If multiple
+    /// secrets provide the same environment variable, their values must be
+    /// identical. The response can contain at most one SSH secret. Otherwise,
+    /// the method sends an aborted completion and returns an error.
     ///
     /// The `progress` callback receives lifecycle updates synchronously and
-    /// should return promptly. If `cancellation` resolves before approval is
+    /// should return promptly. If `cancellation` resolves before a response is
     /// returned, Agentknock sends a best-effort aborted completion when the
     /// request was sent and returns [`RequestError::Interrupted`]. Cancellation
     /// after a response prevents approved values from being returned. Pass
@@ -346,6 +408,13 @@ impl Client {
         })?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
+        let request_id = Ulid::generate();
+        let mut invocation_token = [0_u8; INVOCATION_TOKEN_LENGTH];
+        getrandom::fill(&mut invocation_token).map_err(RequestError::other)?;
+        let invocation = SecretUseInvocation {
+            id: request_id.to_string(),
+            token: invocation_token,
+        };
         let operation = match request.operation {
             SecretUseOperation::Exec {
                 command,
@@ -357,7 +426,7 @@ impl Client {
                 stdin,
                 stdout,
                 stderr,
-            } => SecretUseOperationMessage::Exec {
+            } => InvocationOperationMessage::Exec {
                 command,
                 arguments,
                 working_directory,
@@ -369,18 +438,20 @@ impl Client {
                 stderr: stderr.into(),
             },
         };
-        let request_payload = SecretUseRequestPayload {
-            method: Method::SecretUse,
+        let request_payload = InvocationRequestPayload {
+            method: Method::Invocation,
             secrets: request.secrets,
             reason: request.reason,
             operation,
             launcher_chain: request.launcher_chain,
+            invocation_token: BASE64_STANDARD.encode(invocation_token),
         };
 
         message_exchange(
             self,
             &pairing_path,
             &pairing,
+            invocation,
             &request_payload,
             cancellation.as_mut(),
             &mut progress,
@@ -393,7 +464,8 @@ async fn message_exchange<C, P>(
     client: &Client,
     pairing_path: &Path,
     pairing: &Pairing,
-    request_payload: &SecretUseRequestPayload<'_>,
+    invocation: SecretUseInvocation,
+    request_payload: &InvocationRequestPayload<'_>,
     mut cancellation: Pin<&mut C>,
     progress: &mut P,
 ) -> Result<SecretUseOutput, RequestError>
@@ -401,7 +473,10 @@ where
     C: Future<Output = ()> + ?Sized,
     P: FnMut(SecretUseProgress),
 {
-    let request_id = Ulid::generate();
+    let request_id = invocation
+        .id
+        .parse::<Ulid>()
+        .expect("a generated invocation identifier is a ULID");
     let plaintext = client
         .encode(request_payload)
         .map_err(RequestError::other)?;
@@ -449,7 +524,7 @@ where
     if let Some(rotation_key) = pairing.rotation_key() {
         clear_rotation_key(pairing_path, rotation_key)?;
     }
-    let result: SecretUseResult = match protocol::decode_response(&plaintext)
+    let result: InvocationResult = match protocol::decode_response(&plaintext)
         .map_err(RequestError::other)?
     {
         Response::Message(result) => result,
@@ -465,40 +540,40 @@ where
         }
     };
     let (completion_result, exchange_result) = match result {
-        SecretUseResult::Approved {
+        InvocationResult::Approved {
             secrets: Some(secrets),
-        } => match secret_use_output_from_secrets(secrets, request_payload.secrets) {
+        } => match secret_use_output_from_secrets(secrets, request_payload.secrets, invocation) {
             Ok(secret_use_output) => (
-                SecretUseResult::Approved { secrets: None },
+                InvocationResult::Approved { secrets: None },
                 Ok(secret_use_output),
             ),
             Err(error) => (
-                SecretUseResult::Aborted {
-                    reason: SecretUseAbortReason::InvalidResponse,
+                InvocationResult::Aborted {
+                    reason: InvocationAbortReason::InvalidResponse,
                     message: error.to_string(),
                 },
                 Err(error.into()),
             ),
         },
-        SecretUseResult::Approved { secrets: None } => (
-            SecretUseResult::Aborted {
-                reason: SecretUseAbortReason::InvalidResponse,
+        InvocationResult::Approved { secrets: None } => (
+            InvocationResult::Aborted {
+                reason: InvocationAbortReason::InvalidResponse,
                 message: "approved response doesn't contain secrets".into(),
             },
             Err(RequestError::other(
                 "approved response doesn't contain secrets",
             )),
         ),
-        SecretUseResult::Denied { reason, message } => (
-            SecretUseResult::Denied {
+        InvocationResult::Denied { reason, message } => (
+            InvocationResult::Denied {
                 reason,
                 message: message.clone(),
             },
             Err(RequestError::Denied { reason, message }),
         ),
-        SecretUseResult::Aborted { .. } => (
-            SecretUseResult::Aborted {
-                reason: SecretUseAbortReason::InvalidResponse,
+        InvocationResult::Aborted { .. } => (
+            InvocationResult::Aborted {
+                reason: InvocationAbortReason::InvalidResponse,
                 message: "received an ABORTED result in a response".into(),
             },
             Err(RequestError::other(
@@ -533,10 +608,12 @@ where
 fn secret_use_output_from_secrets(
     secrets: BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>,
     requested_secrets: &BTreeSet<String>,
+    invocation: SecretUseInvocation,
 ) -> io::Result<SecretUseOutput> {
     let mut environment = BTreeMap::new();
+    let mut ssh = None;
     let received_secrets = secrets.keys().cloned().collect::<BTreeSet<_>>();
-    for secret in secrets.into_values() {
+    for (name, secret) in secrets {
         match secret.contents {
             SecretContentsMessage::Environment { variables } => {
                 for (name, variable) in variables {
@@ -550,6 +627,19 @@ fn secret_use_output_from_secrets(
                     environment.insert(name, variable.value);
                 }
             }
+            SecretContentsMessage::Ssh { public_key } => {
+                if public_key.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "approved SSH secret {name:?} has an empty public key"
+                    )));
+                }
+                if ssh.is_some() {
+                    return Err(io::Error::other(
+                        "approved response contains more than one SSH secret",
+                    ));
+                }
+                ssh = Some(SshSecretUse { name, public_key });
+            }
         }
     }
     if &received_secrets != requested_secrets {
@@ -559,26 +649,30 @@ fn secret_use_output_from_secrets(
             requested_secrets.iter().collect::<Vec<_>>()
         )));
     }
-    Ok(SecretUseOutput { environment })
+    Ok(SecretUseOutput {
+        environment,
+        ssh,
+        invocation,
+    })
 }
 
-fn abort_reason(error: &websocket::Error) -> SecretUseAbortReason {
+fn abort_reason(error: &websocket::Error) -> InvocationAbortReason {
     match error {
-        websocket::Error::RetriesExhausted { .. } => SecretUseAbortReason::TimedOut,
+        websocket::Error::RetriesExhausted { .. } => InvocationAbortReason::TimedOut,
         websocket::Error::UnexpectedStatus(status) if (400..500).contains(status) => {
-            SecretUseAbortReason::ClientError
+            InvocationAbortReason::ClientError
         }
-        _ => SecretUseAbortReason::InvalidResponse,
+        _ => InvocationAbortReason::InvalidResponse,
     }
 }
 
 fn seal_aborted(
     client: &Client,
     session: &mut Session,
-    reason: SecretUseAbortReason,
+    reason: InvocationAbortReason,
     message: String,
 ) -> Option<crypto::Completion> {
-    let Ok(plaintext) = client.encode(&SecretUseResult::Aborted { reason, message }) else {
+    let Ok(plaintext) = client.encode(&InvocationResult::Aborted { reason, message }) else {
         return None;
     };
     session.seal_completion(&plaintext).ok()
@@ -588,7 +682,7 @@ async fn complete_cancelled(client: &Client, session: &mut Session, relay: &mut 
     let Some(completion) = seal_aborted(
         client,
         session,
-        SecretUseAbortReason::Cancelled,
+        InvocationAbortReason::Cancelled,
         RequestError::Interrupted.to_string(),
     ) else {
         return;
@@ -617,18 +711,19 @@ impl From<websocket::Error> for RequestError {
 }
 
 #[derive(Serialize)]
-struct SecretUseRequestPayload<'a> {
+struct InvocationRequestPayload<'a> {
     method: Method,
     secrets: &'a BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
-    operation: SecretUseOperationMessage<'a>,
+    operation: InvocationOperationMessage<'a>,
     launcher_chain: &'a [String],
+    invocation_token: String,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum SecretUseOperationMessage<'a> {
+enum InvocationOperationMessage<'a> {
     Exec {
         command: &'a str,
         arguments: &'a [String],
@@ -669,25 +764,25 @@ impl From<StreamKind> for StreamKindMessage {
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
-enum SecretUseResult {
+enum InvocationResult {
     Approved {
         #[serde(skip_serializing_if = "Option::is_none")]
         secrets:
             Option<BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>>,
     },
     Denied {
-        reason: SecretUseDenialReason,
+        reason: DenialReason,
         message: String,
     },
     Aborted {
-        reason: SecretUseAbortReason,
+        reason: InvocationAbortReason,
         message: String,
     },
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum SecretUseAbortReason {
+enum InvocationAbortReason {
     Cancelled,
     TimedOut,
     InvalidResponse,
@@ -710,7 +805,8 @@ mod tests {
         ]);
         let requested = BTreeSet::from(["first".into(), "second".into()]);
 
-        let secret_use_output = secret_use_output_from_secrets(secrets, &requested).unwrap();
+        let secret_use_output =
+            secret_use_output_from_secrets(secrets, &requested, invocation()).unwrap();
 
         assert_eq!(
             secret_use_output.environment,
@@ -729,7 +825,7 @@ mod tests {
         ]);
         let requested = BTreeSet::from(["first".into(), "second".into()]);
 
-        let error = secret_use_output_from_secrets(secrets, &requested)
+        let error = secret_use_output_from_secrets(secrets, &requested, invocation())
             .err()
             .expect("conflicting values should fail");
         assert_eq!(
@@ -743,12 +839,48 @@ mod tests {
         let secrets = BTreeMap::from([("other".into(), environment_secret([("TOKEN", "value")]))]);
         let requested = BTreeSet::from(["requested".into()]);
 
-        let error = secret_use_output_from_secrets(secrets, &requested)
+        let error = secret_use_output_from_secrets(secrets, &requested, invocation())
             .err()
             .expect("a different secret set should fail");
         assert_eq!(
             error.to_string(),
             "approved response contains secrets [\"other\"], expected [\"requested\"]"
+        );
+    }
+
+    #[test]
+    fn combines_environment_values_with_one_ssh_secret() {
+        let secrets = BTreeMap::from([
+            (
+                "environment".into(),
+                environment_secret([("TOKEN", "value")]),
+            ),
+            ("ssh".into(), ssh_secret("ssh-ed25519 AAAA test")),
+        ]);
+        let requested = BTreeSet::from(["environment".into(), "ssh".into()]);
+
+        let output = secret_use_output_from_secrets(secrets, &requested, invocation()).unwrap();
+
+        assert_eq!(output.environment_variable("TOKEN"), Some("value"));
+        assert_eq!(output.ssh().unwrap().name(), "ssh");
+        assert_eq!(output.ssh().unwrap().public_key(), "ssh-ed25519 AAAA test");
+    }
+
+    #[test]
+    fn rejects_more_than_one_ssh_secret() {
+        let secrets = BTreeMap::from([
+            ("first".into(), ssh_secret("ssh-ed25519 AAAA first")),
+            ("second".into(), ssh_secret("ssh-ed25519 BBBB second")),
+        ]);
+        let requested = BTreeSet::from(["first".into(), "second".into()]);
+
+        let error = secret_use_output_from_secrets(secrets, &requested, invocation())
+            .err()
+            .expect("multiple SSH secrets should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "approved response contains more than one SSH secret"
         );
     }
 
@@ -770,6 +902,22 @@ mod tests {
                     })
                     .collect(),
             },
+        }
+    }
+
+    fn ssh_secret(public_key: &str) -> SecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
+        SecretMessage {
+            description: None,
+            contents: SecretContentsMessage::Ssh {
+                public_key: public_key.into(),
+            },
+        }
+    }
+
+    fn invocation() -> SecretUseInvocation {
+        SecretUseInvocation {
+            id: "01K00000000000000000000000".into(),
+            token: [0x42; INVOCATION_TOKEN_LENGTH],
         }
     }
 }

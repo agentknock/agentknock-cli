@@ -464,8 +464,8 @@ traffic and unprotected error reports.
 
 End-to-end security comes from the client-device cryptosystem. A client must
 not treat an `ack`, `receipt`, `state`, or relay `error` frame as proof of a
-device decision. Only an authenticated client-device response can authorize a
-secret use or a pairing-state change.
+device decision. Only an authenticated client-device response establishes the
+result of an invocation, another paired operation, or a pairing-state change.
 
 ## References
 

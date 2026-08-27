@@ -11,6 +11,7 @@
 mod client;
 mod config;
 mod crypto;
+mod git_sign;
 mod pairing;
 mod protocol;
 mod proxy;
@@ -20,12 +21,13 @@ mod websocket;
 
 pub use client::{ApplicationInfo, Client, PairingStatus};
 pub use config::ConfigurationError;
+pub use git_sign::{GitSignProgress, GitSignRequest};
 pub use pairing::{PairingProgress, PairingRemoveError, PairingSas};
 pub use secret_use::{
-    ExecutableMode, RequestError, SecretUseDenialReason, SecretUseOperation, SecretUseOutput,
-    SecretUseProgress, SecretUseRequest, StreamKind,
+    DenialReason, ExecutableMode, RequestError, SecretUseInvocation, SecretUseOperation,
+    SecretUseOutput, SecretUseProgress, SecretUseRequest, SshSecretUse, StreamKind,
 };
 pub use secrets::{
-    EnvironmentSecret, Secret, SecretListProgress, SecretUploadError, SecretUploadMode,
+    Secret, SecretListProgress, SecretUpload, SecretUploadError, SecretUploadMode,
     SecretUploadProgress, Secrets,
 };

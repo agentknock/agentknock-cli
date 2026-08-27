@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    env, fs,
+    fs,
     fs::OpenOptions,
     future::Future,
     os::unix::fs::OpenOptionsExt,
@@ -52,7 +52,7 @@ pub const PROTOCOL_VERSION_INFO: [u8; 16] = *b"agentknock-v1\0\0\0";
 const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
 
 pub struct TestHome {
-    path: PathBuf,
+    directory: tempfile::TempDir,
     pub device_private_key: <Kem as KemTrait>::PrivateKey,
     pub device_public_key: <Kem as KemTrait>::PublicKey,
 }
@@ -67,8 +67,8 @@ impl TestHome {
     }
 
     fn new(pending: bool) -> Self {
-        let path = env::temp_dir().join(format!("agentknock-test-{}", Ulid::generate()));
-        let config_dir = path.join(".agentknock");
+        let directory = tempfile::tempdir().unwrap();
+        let config_dir = directory.path().join(".agentknock");
         fs::create_dir_all(&config_dir).unwrap();
         let (device_private_key, device_public_key) = Kem::gen_keypair();
         let mut pairing = json!({
@@ -94,35 +94,28 @@ impl TestHome {
         serde_json::to_writer_pretty(&mut file, &pairing).unwrap();
 
         Self {
-            path,
+            directory,
             device_private_key,
             device_public_key,
         }
     }
 
     pub fn empty() -> Self {
-        let path = env::temp_dir().join(format!("agentknock-test-{}", Ulid::generate()));
-        fs::create_dir(&path).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let (device_private_key, device_public_key) = Kem::gen_keypair();
         Self {
-            path,
+            directory,
             device_private_key,
             device_public_key,
         }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.directory.path()
     }
 
     pub fn pairing_path(&self) -> PathBuf {
-        self.path.join(".agentknock/pairing.json")
-    }
-}
-
-impl Drop for TestHome {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        self.directory.path().join(".agentknock/pairing.json")
     }
 }
 

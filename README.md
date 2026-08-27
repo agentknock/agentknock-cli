@@ -4,8 +4,9 @@ Developer secrets on your phone, provided only to approved commands.
 
 [Agentknock](https://agentknock.dev/) lets command-line tools use secrets
 without storing long-lived credentials in agent configuration or project
-files. A paired mobile device authorizes each request and sends the requested
-secrets to the command.
+files. A paired mobile device authorizes each use. It can return environment
+values or perform operations such as Git signing without releasing a private
+key.
 
 > [!WARNING]
 > Agentknock is an early preview. This documentation describes the intended
@@ -204,6 +205,26 @@ return the secrets before it starts the command. If the request is still
 waiting after 30 seconds, Agentknock writes a progress update with the elapsed
 time to standard error every 30 seconds. Press Ctrl-C to cancel the request.
 
+### Sign Git commits and tags
+
+An SSH secret keeps its private key on the paired device. When Git requests a
+signature while running a command through Agentknock, Agentknock sends Git's
+exact signing payload to the device so it can show the commit or tag message
+for a separate decision.
+
+Git must use SSH signing and request a signature. For example:
+
+```sh
+agentknock exec -s git-signing -- \
+  git -c gpg.format=ssh commit -S -m "Describe the change"
+```
+
+A command can select at most one SSH secret. If Git has no configured
+`user.signingKey`, Agentknock offers the selected SSH key as the default. If
+Git explicitly selects another key, signing proceeds through the ordinary
+`ssh-keygen` command instead. Agentknock does not change `gpg.format`, signing
+policy, or the configured signing key.
+
 ### Use a network proxy
 
 Agentknock uses `HTTPS_PROXY` for its secure WebSocket connection to the relay
@@ -233,15 +254,16 @@ agentknock secret list
 ```
 
 The command writes a JSON object to standard output. It maps each secret name
-to its type, description, and the environment variable names that it provides.
-It never includes secret values. Progress and errors go to standard error, so
-you can process or redirect the JSON separately.
+to its type, description, and type-specific public metadata, such as
+environment variable names or an SSH public key. It never includes secret
+values. Progress and errors go to standard error, so you can process or
+redirect the JSON separately.
 
-### Upload an environment secret
+### Upload secrets
 
-Agentknock can migrate existing environment variables to the mobile app. It
-reads values from the sources that you specify; the values do not appear in
-the command arguments.
+Agentknock can migrate existing environment variables and SSH private keys to
+the mobile app. It reads values from the sources that you specify; the values
+do not appear in the command arguments.
 
 To migrate a variable from the current environment:
 
@@ -273,6 +295,17 @@ You can repeat and combine `--from-env`, `--from-env-file`, `--from-file`, and
 `--from-prompt`. Use `--from-env-file -` to read dotenv data from standard
 input, or `--from-file NAME=-` to read one value from standard input.
 
+To upload an unencrypted Ed25519 key in OpenSSH private-key format:
+
+```sh
+agentknock secret upload git-signing \
+  --description "Git signing key" \
+  --from-ssh-key ~/.ssh/id_ed25519
+```
+
+Use `--from-ssh-key -` to read the key from standard input. An SSH-key source
+cannot be combined with environment-variable sources.
+
 An upload is a proposal, not an immediate change to the secrets on the mobile
 device. The command finishes after the mobile app confirms receipt of the
 proposal. Review and accept the proposal in the mobile app before the secret
@@ -290,9 +323,9 @@ Use `--replace` to propose a complete replacement. Values that you don't
 provide are removed if you accept the proposal. When you propose a new secret,
 you can change its name before you accept it in the mobile app.
 
-Uploading does not modify or delete the source environment variables or files.
-After you accept the proposal and verify the secret, remove old local copies
-that you no longer need.
+Uploading does not modify or delete source environment variables, private
+keys, or files. After you accept the proposal and verify the secret, remove
+old local copies that you no longer need.
 
 ## Security
 
@@ -312,10 +345,10 @@ detects substitution by the relay and lets the relay remain outside the trust
 boundary. Reject the pairing if you cannot confirm the complete code.
 
 Agentknock never writes delivered secret values to disk. On Linux, it opens a
-native executable before requesting secret use and executes that same
-filesystem object after approval. This prevents a path, symlink, or file
-replacement during the wait from selecting a different top-level native
-executable.
+native executable before asking the device to prepare the selected secrets and
+executes that same filesystem object after approval. This prevents a path,
+symlink, or file replacement during the wait from selecting a different
+top-level native executable.
 
 Agentknock is not a sandbox or privilege boundary. The approved command
 controls the secrets that it receives and can print them, write them to disk,
