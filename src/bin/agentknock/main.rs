@@ -317,9 +317,8 @@ struct SecretUploadCommand {
 
     /// Read an SSH private key from a file.
     ///
-    /// The device currently accepts unencrypted Ed25519 keys in OpenSSH private-key format. Use
-    /// `-` to read the key from standard input. This option can't be combined with an environment
-    /// variable source.
+    /// The key must be unencrypted and use OpenSSH private-key format. Use `-` to read the key
+    /// from standard input. This option can't be combined with an environment variable source.
     #[arg(
         long,
         value_name = "PATH",

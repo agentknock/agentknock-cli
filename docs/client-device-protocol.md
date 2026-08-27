@@ -556,7 +556,9 @@ An approved response contains an ASCII-armored SSHSIG signature:
 ```
 
 The signature covers the decoded `message` bytes with namespace `git` and the
-SSH key named by `secret`. The approval completion omits the signature:
+SSH key named by `secret`. An RSA key uses `rsa-sha2-512` or `rsa-sha2-256` as
+the SSH signature algorithm, not the legacy RSA-SHA1 `ssh-rsa` signature
+algorithm. The approval completion omits the signature:
 
 ```json
 {
@@ -666,10 +668,11 @@ An SSH-secret upload has this form:
 }
 ```
 
-`private_key` contains an unencrypted Ed25519 private key in OpenSSH format.
-It is required for every SSH-secret upload. In `UPDATE`, accepting the proposal
-replaces the existing private key. Description handling is the same for both
-secret types.
+`private_key` contains an unencrypted SSH private key in OpenSSH format. The
+key algorithm is encoded by that format and does not have a separate JSON
+member. It is required for every SSH-secret upload. In `UPDATE`, accepting the
+proposal replaces the existing private key. Description handling is the same
+for both secret types.
 
 ### Secret upload response and completion
 
