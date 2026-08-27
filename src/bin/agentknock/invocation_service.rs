@@ -746,4 +746,15 @@ mod tests {
         assert!(parse_git_sign_arguments(&arguments("git")).is_ok());
         assert!(parse_git_sign_arguments(&arguments("file")).is_err());
     }
+
+    #[test]
+    fn matches_rsa_public_keys_independently_of_comments() {
+        assert!(
+            signing_key_matches(
+                "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB example@client",
+                "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB example@device",
+            )
+            .unwrap()
+        );
+    }
 }

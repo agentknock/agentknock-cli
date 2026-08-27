@@ -39,7 +39,16 @@ fn approved_environment(secret: &str, variables: serde_json::Map<String, Value>)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signs_a_git_commit_with_an_ssh_secret() {
+async fn signs_a_git_commit_with_an_ed25519_secret() {
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signs_a_git_commit_with_an_rsa_secret() {
+    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"]).await;
+}
+
+async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&str]) {
     let home = TestHome::active();
     let repository = home.path().join("repository");
     let temporary_directory = home.path().join("temporary files");
@@ -54,9 +63,11 @@ async fn signs_a_git_commit_with_an_ssh_secret() {
         .current_dir(&repository));
 
     let private_key = home.path().join("signing-key");
-    run(Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-        .arg(&private_key));
+    let mut keygen = Command::new("ssh-keygen");
+    keygen.args(["-q", "-t", key_type]);
+    keygen.args(key_options);
+    keygen.args(["-N", "", "-f"]).arg(&private_key);
+    run(&mut keygen);
     let public_key = fs::read_to_string(private_key.with_extension("pub"))
         .unwrap()
         .trim()

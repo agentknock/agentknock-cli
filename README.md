@@ -295,7 +295,7 @@ You can repeat and combine `--from-env`, `--from-env-file`, `--from-file`, and
 `--from-prompt`. Use `--from-env-file -` to read dotenv data from standard
 input, or `--from-file NAME=-` to read one value from standard input.
 
-To upload an unencrypted Ed25519 key in OpenSSH private-key format:
+To upload an unencrypted SSH private key in OpenSSH private-key format:
 
 ```sh
 agentknock secret upload git-signing \
