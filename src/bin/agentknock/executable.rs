@@ -327,13 +327,7 @@ fn open_at(directory: RawFd, path: &Path, flags: libc::c_int) -> io::Result<Owne
         return Err(io::Error::last_os_error());
     }
     // SAFETY: openat returned a newly owned descriptor.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    if descriptor.as_raw_fd() < 3 {
-        return Err(io::Error::other(
-            "an internal file descriptor replaced a standard stream",
-        ));
-    }
-    Ok(descriptor)
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
 fn require_regular_file(descriptor: &OwnedFd) -> io::Result<()> {
