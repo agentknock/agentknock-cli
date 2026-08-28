@@ -484,7 +484,7 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(RequestError::other)?;
-    let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
+    let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
 
     progress(SecretUseProgress::WaitingForDelivery);
     let response = match tokio::select! {

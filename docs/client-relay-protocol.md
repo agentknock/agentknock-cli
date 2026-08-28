@@ -85,6 +85,20 @@ The relay URL uses `wss`. Clients perform normal WebSocket upgrade over TLS,
 including certificate-chain and hostname validation. Version 1 does not
 negotiate a WebSocket subprotocol.
 
+Each upgrade request includes a `User-Agent` field. Its value uses HTTP product
+tokens, with the embedding application before the Agentknock library:
+
+```http
+User-Agent: example-app/1.2.3 agentknock/0.2.0
+```
+
+If the application and library products are identical, the client sends that
+product once. If the application name or version is not a valid product token,
+the client sends only the Agentknock library product. The field does not include
+platform, architecture, client identity, or other host-specific information.
+The relay treats it as diagnostic metadata, not authentication or a protocol
+capability declaration.
+
 ### Initial-pairing connection
 
 A new client connects to:
@@ -472,3 +486,4 @@ result of an invocation, another paired operation, or a pairing-state change.
 - [Agentknock v1 client-device protocol](client-device-protocol.md)
 - [Agentknock v1 cryptosystem](cryptosystem.md)
 - [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455.html)
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html)

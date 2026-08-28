@@ -7,7 +7,10 @@ use std::{
 };
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use http::{HeaderValue, Uri, header::AUTHORIZATION};
+use http::{
+    HeaderValue, Uri,
+    header::{AUTHORIZATION, USER_AGENT},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
@@ -16,9 +19,11 @@ use tokio_websockets::{
     ClientBuilder, Connector, Limits, MaybeTlsStream, Message, WebSocketStream, upgrade,
 };
 
-use crate::{config::Pairing, proxy};
+use crate::{ApplicationInfo, Client, config::Pairing, proxy};
 
 const RELAY_URL: &str = "wss://relay.agentknock.dev";
+const LIBRARY_PRODUCT_NAME: &str = env!("CARGO_PKG_NAME");
+const LIBRARY_PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(all(feature = "integration-tests", debug_assertions))]
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
 const MAXIMUM_FRAME_SIZE: usize = 256 * 1024;
@@ -52,6 +57,7 @@ pub(crate) struct RelayExchange {
     proxy: proxy::Config,
     connection_kind: ConnectionKind,
     authorization: HeaderValue,
+    user_agent: HeaderValue,
     client_id: String,
     request_id: String,
     socket: Option<Socket>,
@@ -66,6 +72,44 @@ enum ConnectionKind {
     Client,
 }
 
+fn user_agent(application: &ApplicationInfo) -> HeaderValue {
+    let library = product(LIBRARY_PRODUCT_NAME, LIBRARY_PRODUCT_VERSION)
+        .expect("the Cargo package name and version are valid HTTP product tokens");
+    let value = match product(application.name(), application.version()) {
+        Some(application) if application != library => format!("{application} {library}"),
+        _ => library,
+    };
+    HeaderValue::from_str(&value).expect("validated HTTP product tokens form a header value")
+}
+
+fn product(name: &str, version: &str) -> Option<String> {
+    (is_product_token(name) && is_product_token(version)).then(|| format!("{name}/{version}"))
+}
+
+fn is_product_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 struct OutgoingMessage {
     encoded: String,
     sent: bool,
@@ -75,12 +119,14 @@ struct OutgoingMessage {
 
 impl RelayExchange {
     pub(crate) fn pairing(
+        client: &Client,
         address_id: &str,
         client_id: &str,
         client_token: &str,
     ) -> Result<Self, Error> {
         let path = format!("/v1/address/{address_id}/request/{client_id}");
         Self::new(
+            client,
             path,
             ConnectionKind::Pairing,
             client_id,
@@ -89,13 +135,18 @@ impl RelayExchange {
         )
     }
 
-    pub(crate) fn authenticated(pairing: &Pairing, request_id: &str) -> Result<Self, Error> {
+    pub(crate) fn authenticated(
+        client: &Client,
+        pairing: &Pairing,
+        request_id: &str,
+    ) -> Result<Self, Error> {
         let path = format!(
             "/v1/device/{}/client/{}",
             pairing.device_id(),
             pairing.client_id(),
         );
         Self::new(
+            client,
             path,
             ConnectionKind::Client,
             &pairing.client_id(),
@@ -105,6 +156,7 @@ impl RelayExchange {
     }
 
     fn new(
+        client: &Client,
         path: String,
         connection_kind: ConnectionKind,
         client_id: &str,
@@ -114,6 +166,7 @@ impl RelayExchange {
         let relay_url = relay_url()?;
         let authorization = HeaderValue::from_str(&format!("Bearer {client_token}"))
             .map_err(|_| Error::InvalidClientToken)?;
+        let user_agent = user_agent(client.application_info());
 
         let url = format!("{}{path}", relay_url.trim_end_matches('/'));
         let uri = url
@@ -126,6 +179,7 @@ impl RelayExchange {
             proxy,
             connection_kind,
             authorization,
+            user_agent,
             client_id: client_id.to_owned(),
             request_id: request_id.to_owned(),
             socket: None,
@@ -425,7 +479,8 @@ impl RelayExchange {
         loop {
             let builder = ClientBuilder::from_uri(self.uri.clone())
                 .limits(Limits::default().max_payload_len(Some(MAXIMUM_FRAME_SIZE)))
-                .add_header(AUTHORIZATION, self.authorization.clone())?;
+                .add_header(AUTHORIZATION, self.authorization.clone())?
+                .add_header(USER_AGENT, self.user_agent.clone())?;
             let connect = async {
                 let stream = self.proxy.connect(&self.uri).await?;
                 let host = self.uri.host().ok_or(proxy::ConnectionError::MissingHost)?;
@@ -978,6 +1033,7 @@ pub(crate) enum Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::ApplicationInfo;
     use serde::Deserialize;
     use serde_json::json;
 
@@ -993,6 +1049,26 @@ mod tests {
     fn installs_rustls_crypto_provider() {
         super::ensure_rustls_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn identifies_the_application_and_library_in_the_user_agent() {
+        let application = ApplicationInfo::new("example-app", "1.2.3");
+
+        assert_eq!(
+            super::user_agent(&application),
+            format!("example-app/1.2.3 agentknock/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn avoids_duplicate_or_invalid_user_agent_products() {
+        let agentknock = ApplicationInfo::new("agentknock", env!("CARGO_PKG_VERSION"));
+        let invalid = ApplicationInfo::new("example app", "1.2.3");
+        let expected = format!("agentknock/{}", env!("CARGO_PKG_VERSION"));
+
+        assert_eq!(super::user_agent(&agentknock), expected);
+        assert_eq!(super::user_agent(&invalid), expected);
     }
 
     #[cfg(all(feature = "integration-tests", debug_assertions))]

@@ -172,6 +172,10 @@ async fn starts_and_finishes_pairing_over_websockets() {
             .unwrap()
             .to_owned();
         assert_eq!(BASE64_URL_SAFE.decode(&client_token).unwrap().len(), 32);
+        assert_eq!(
+            upgrade.headers()[http::header::USER_AGENT],
+            format!("agentknock/{}", env!("CARGO_PKG_VERSION"))
+        );
 
         let request_frame = receive_json(&mut socket).await;
         assert_eq!(request_frame["client_id"], client_id);
@@ -309,6 +313,10 @@ async fn starts_and_finishes_pairing_over_websockets() {
         assert_eq!(
             upgrade.headers()[http::header::AUTHORIZATION],
             format!("Bearer {client_token}")
+        );
+        assert_eq!(
+            upgrade.headers()[http::header::USER_AGENT],
+            format!("agentknock/{}", env!("CARGO_PKG_VERSION"))
         );
         let finish_request = receive_json(&mut socket).await;
         let finish_request_id = finish_request["request_id"].as_str().unwrap().to_owned();
