@@ -2,6 +2,7 @@
 compile_error!("the agentknock CLI currently supports Linux only");
 
 mod executable;
+mod git_repository;
 mod invocation_service;
 
 use std::{

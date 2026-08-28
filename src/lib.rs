@@ -21,7 +21,10 @@ mod websocket;
 
 pub use client::{ApplicationInfo, Client, PairingStatus};
 pub use config::ConfigurationError;
-pub use git_sign::{GitSignProgress, GitSignRequest};
+pub use git_sign::{
+    GitSignChangeStatus, GitSignChangedPath, GitSignHead, GitSignProgress, GitSignRepository,
+    GitSignRequest,
+};
 pub use pairing::{PairingProgress, PairingRemoveError, PairingSas};
 pub use secret_use::{
     DenialReason, ExecutableMode, RequestError, SecretUseInvocation, SecretUseOperation,

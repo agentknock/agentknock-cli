@@ -55,11 +55,42 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
     fs::create_dir(&repository).unwrap();
     fs::create_dir(&temporary_directory).unwrap();
     run(Command::new("git")
-        .args(["init", "--quiet"])
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&repository));
+    run(Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://user:token@example.com/agentknock/example.git",
+        ])
         .current_dir(&repository));
     fs::write(repository.join("example.txt"), "example\n").unwrap();
     run(Command::new("git")
         .args(["add", "example.txt"])
+        .current_dir(&repository));
+    run(Command::new("git")
+        .args([
+            "-c",
+            "user.name=Agentknock Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Base commit",
+        ])
+        .current_dir(&repository));
+    run(Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .current_dir(&repository));
+    run(Command::new("git")
+        .args(["branch", "--set-upstream-to=origin/main", "main"])
+        .current_dir(&repository));
+    fs::write(repository.join("example.txt"), "changed\n").unwrap();
+    fs::write(repository.join("new.txt"), "new\n").unwrap();
+    run(Command::new("git")
+        .args(["add", "example.txt", "new.txt"])
         .current_dir(&repository));
 
     let private_key = home.path().join("signing-key");
@@ -76,6 +107,7 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
     let device_private_key = home.device_private_key.clone();
     let server_private_key = private_key.clone();
     let server_public_key = public_key.clone();
+    let server_repository = repository.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
         let request = receive_json(&mut socket).await;
@@ -148,6 +180,25 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
         assert_eq!(plaintext["invocation_token"], invocation_token);
         assert_eq!(plaintext["secret"], "git-signing");
         assert!(plaintext.get("namespace").is_none());
+        assert_eq!(
+            plaintext["repository"]["remote"],
+            "example.com/agentknock/example"
+        );
+        assert_eq!(
+            plaintext["repository"]["worktree"],
+            server_repository.to_str().unwrap()
+        );
+        assert_eq!(plaintext["repository"]["head"]["type"], "BRANCH");
+        assert_eq!(plaintext["repository"]["head"]["name"], "main");
+        assert_eq!(plaintext["repository"]["head"]["upstream"], "origin/main");
+        assert_eq!(plaintext["repository"]["changed_path_count"], 2);
+        assert_eq!(
+            plaintext["repository"]["changed_paths"],
+            json!([
+                {"status": "MODIFIED", "path": "example.txt"},
+                {"status": "ADDED", "path": "new.txt"},
+            ])
+        );
         let data = BASE64_STANDARD
             .decode(plaintext["message"].as_str().unwrap())
             .unwrap();

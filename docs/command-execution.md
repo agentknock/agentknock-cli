@@ -283,9 +283,13 @@ For an SSHSIG signing operation in the `git` namespace, the helper compares
 Git's requested key with the selected Agentknock public key. A match sends the
 exact signing payload supplied by Git to the invocation service. The service
 creates a new protected `GitSign` exchange containing the original invocation
-identifier and token, the SSH secret name, and those bytes. It writes an
-approved SSHSIG response to the signature file expected by Git. Every
-signature receives a separate device decision.
+identifier and token, the SSH secret name, and those bytes. When Git invokes
+the helper directly, the helper also uses that Git executable to collect
+advisory repository, branch, and changed-path context. The changed paths come
+from the tree and first parent named by the signing payload, not from mutable
+index or worktree state. Failure to collect this context does not prevent
+signing. The service writes an approved SSHSIG response to the signature file
+expected by Git. Every signature receives a separate device decision.
 
 If Git requests another key or invokes the configured program for another
 operation, the helper replaces itself with `ssh-keygen` from `PATH` and passes

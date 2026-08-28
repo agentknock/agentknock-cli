@@ -531,7 +531,21 @@ the invocation does not approve later signatures.
   "invocation_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
   "invocation_token": "base64 invocation token",
   "secret": "release-signing",
-  "message": "base64 Git signing payload"
+  "message": "base64 Git signing payload",
+  "repository": {
+    "remote": "github.com/example/project",
+    "worktree": "/home/example/project",
+    "head": {
+      "type": "BRANCH",
+      "name": "main",
+      "upstream": "origin/main"
+    },
+    "changed_path_count": 2,
+    "changed_paths": [
+      {"status": "MODIFIED", "path": "src/main.rs"},
+      {"status": "ADDED", "path": "tests/example.rs"}
+    ]
+  }
 }
 ```
 
@@ -543,6 +557,27 @@ program to sign. The SSHSIG namespace is fixed to `git` and is not transmitted.
 
 The device rejects the request unless the invocation identifier, token, and
 secret are consistent with one another.
+
+`repository` is optional advisory context. Its members are independently
+optional:
+
+- `remote` identifies a configured remote without its scheme, user name,
+  password, query, fragment, or trailing `.git`.
+- `worktree` is the absolute local worktree path.
+- `head` is either `{"type":"BRANCH","name":"..."}` with an optional
+  `upstream`, or `{"type":"DETACHED"}`.
+- `changed_path_count` counts paths changed between the signed commit's tree
+  and its first parent's tree. A root commit is compared with the empty tree.
+- `changed_paths` is the complete path list when the count is at most 50 and
+  every path can be represented safely as text. It is otherwise absent, not a
+  truncated list. Each status is `ADDED`, `DELETED`, `MODIFIED`, or
+  `TYPE_CHANGED`.
+
+The changed-path summary comes from the tree and parent identifiers in the
+exact `message`, not from the index, worktree, or current `HEAD`. Repository
+context can be unavailable, stale, or controlled by the repository and must
+not be treated as signed content. In particular, an absent `changed_paths`
+member does not mean that no paths changed.
 
 ### Git signing response and completion
 

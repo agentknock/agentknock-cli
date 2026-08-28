@@ -19,7 +19,8 @@ use std::{
 };
 
 use agentknock::{
-    ApplicationInfo, Client, GitSignProgress, GitSignRequest, SecretUseInvocation, SshSecretUse,
+    ApplicationInfo, Client, GitSignProgress, GitSignRepository, GitSignRequest,
+    SecretUseInvocation, SshSecretUse,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,8 @@ use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     time::{Instant, sleep},
 };
+
+use crate::git_repository::Repository;
 
 const INTERNAL_ARGUMENT: &str = "__invocation-service";
 const GIT_SIGN_HELPER_NAME: &str = "git-sign";
@@ -57,7 +60,12 @@ enum StartupResponse {
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum HelperRequest {
     PublicKey,
-    Sign { public_key: String, message: String },
+    Sign {
+        public_key: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repository: Option<Repository>,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -386,6 +394,7 @@ async fn handle_connection(
         HelperRequest::Sign {
             public_key,
             message,
+            repository,
         } => {
             let result = validate_signing_key(&public_key, &context.public_key).and_then(|()| {
                 BASE64_STANDARD
@@ -393,9 +402,12 @@ async fn handle_connection(
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             });
             let result = match result {
-                Ok(data) => request_git_signature(context, owner, &data)
-                    .await
-                    .map(|signature| HelperResponse::Signature { signature }),
+                Ok(data) => {
+                    let repository = repository.map(GitSignRepository::from);
+                    request_git_signature(context, owner, &data, repository.as_ref())
+                        .await
+                        .map(|signature| HelperResponse::Signature { signature })
+                }
                 Err(error) => Err(error),
             };
             match result {
@@ -415,6 +427,7 @@ async fn request_git_signature(
     context: &ServiceContext,
     owner: &tokio::io::unix::AsyncFd<OwnedFd>,
     data: &[u8],
+    repository: Option<&GitSignRepository>,
 ) -> io::Result<String> {
     let current_progress = Rc::new(Cell::new(None));
     let observed_progress = Rc::clone(&current_progress);
@@ -424,6 +437,7 @@ async fn request_git_signature(
             invocation_token: &context.invocation_token,
             secret: &context.secret,
             message: data,
+            repository,
         },
         async {
             let _ = wait_for_process(owner).await;
@@ -574,11 +588,13 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
         return exec_ssh_keygen(&arguments[1..]);
     }
     let data = fs::read(&signing.data_file)?;
+    let repository = Repository::collect(&data);
     let response = call_service(
         runtime_directory,
         &HelperRequest::Sign {
             public_key: requested_key,
             message: BASE64_STANDARD.encode(data),
+            repository,
         },
     )?;
     let HelperResponse::Signature { signature } = response else {

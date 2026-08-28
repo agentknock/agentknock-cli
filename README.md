@@ -210,7 +210,8 @@ time to standard error every 30 seconds. Press Ctrl-C to cancel the request.
 An SSH secret keeps its private key on the paired device. When Git requests a
 signature while running a command through Agentknock, Agentknock sends Git's
 exact signing payload to the device so it can show the commit or tag message
-for a separate decision.
+for a separate decision. For commits, it also sends available repository,
+branch, and changed-path context to help identify the requested signature.
 
 Git must use SSH signing and request a signature. For example:
 
