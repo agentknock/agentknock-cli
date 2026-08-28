@@ -115,6 +115,7 @@ impl Client {
         let client_token = generate_client_token()?;
         let address_id = derive_address_id(address).map_err(RequestError::other)?;
         let mut relay = RelayExchange::pairing(
+            self,
             &address_id.to_string(),
             &request_id.to_string(),
             &client_token,
@@ -215,7 +216,7 @@ impl Client {
         let request = session
             .seal_request(&plaintext)
             .map_err(RequestError::other)?;
-        let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
+        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
         progress(PairingProgress::WaitingForDelivery);
         let response = tokio::select! {
             biased;
@@ -366,7 +367,7 @@ where
     let request = session
         .seal_request(&plaintext)
         .map_err(RequestError::other)?;
-    let mut relay = RelayExchange::authenticated(pairing, &request_id.to_string())?;
+    let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
     progress(PairingProgress::WaitingForDelivery);
     let response = tokio::select! {
         biased;

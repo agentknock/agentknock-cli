@@ -220,7 +220,7 @@ impl Client {
         let request = session
             .seal_request(&plaintext)
             .map_err(RequestError::other)?;
-        let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
+        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
         progress(SecretListProgress::WaitingForDelivery);
         let response = tokio::select! {
@@ -324,7 +324,7 @@ impl Client {
         let request = session
             .seal_request(&plaintext)
             .map_err(RequestError::other)?;
-        let mut relay = RelayExchange::authenticated(&pairing, &request_id.to_string())?;
+        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
         progress(SecretUploadProgress::WaitingForDelivery);
         let response = tokio::select! {

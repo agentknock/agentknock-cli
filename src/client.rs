@@ -139,6 +139,10 @@ impl Client {
             .ok_or(ConfigurationError::HomeNotSet)
     }
 
+    pub(crate) fn application_info(&self) -> &ApplicationInfo {
+        &self.application_info
+    }
+
     pub(crate) fn pairing_path(&self) -> Result<PathBuf, ConfigurationError> {
         Ok(self.state_directory()?.join("pairing.json"))
     }
