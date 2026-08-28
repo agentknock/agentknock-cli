@@ -1,6 +1,5 @@
 use std::{
     ffi::OsStr,
-    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -74,7 +73,7 @@ impl Repository {
 fn parent_git() -> Option<PathBuf> {
     // SAFETY: getppid has no preconditions.
     let parent = unsafe { libc::getppid() };
-    let executable = fs::read_link(format!("/proc/{parent}/exe")).ok()?;
+    let executable = crate::process_info::executable_path(parent).ok()?;
     (executable.file_name() == Some(OsStr::new("git"))).then_some(executable)
 }
 

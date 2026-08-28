@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::{
     fs,
@@ -52,10 +52,13 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
 
     let mut unauthorized = UnixStream::connect(Path::new(runtime_directory).join("service.sock"))
         .expect("connect from a process outside the invocation");
-    unauthorized
-        .write_all(br#"{"operation":"public_key"}"#)
-        .unwrap();
-    unauthorized.shutdown(std::net::Shutdown::Write).unwrap();
+    if let Err(error) = unauthorized.write_all(br#"{"operation":"public_key"}"#) {
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        ));
+    }
+    let _ = unauthorized.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
     if let Err(error) = unauthorized.read_to_end(&mut response) {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);

@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod support;
 
@@ -185,8 +185,8 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
             "example.com/agentknock/example"
         );
         assert_eq!(
-            plaintext["repository"]["worktree"],
-            server_repository.to_str().unwrap()
+            fs::canonicalize(plaintext["repository"]["worktree"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(&server_repository).unwrap()
         );
         assert_eq!(plaintext["repository"]["head"]["type"], "BRANCH");
         assert_eq!(plaintext["repository"]["head"]["name"], "main");
@@ -335,6 +335,13 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
+        assert_eq!(plaintext["operation"]["stdout"], "PIPE");
+        assert_eq!(plaintext["operation"]["stderr"], "PIPE");
+        assert!(
+            plaintext["launcher_chain"]
+                .as_array()
+                .is_some_and(|launchers| !launchers.is_empty())
+        );
         let executable_path = plaintext["operation"]["executable_path"].as_str().unwrap();
         let executable_hash = BASE64_STANDARD
             .decode(plaintext["operation"]["executable_hash"].as_str().unwrap())
@@ -465,7 +472,11 @@ async fn reports_and_executes_a_shebang_script() {
     let script_contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n";
     fs::write(&script, script_contents).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    let expected_path = script.to_str().unwrap().to_owned();
+    let expected_path = fs::canonicalize(&script)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     let expected_hash = BASE64_STANDARD.encode(Sha256::digest(script_contents));
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
@@ -544,14 +555,13 @@ async fn reports_and_executes_a_shebang_script() {
     server.await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn executes_the_selected_native_file_after_its_path_is_replaced() {
+async fn replace_selected_native_file_after_approval() -> std::process::Output {
     let home = TestHome::active();
     let selected_path = home.path().join("selected-native");
     let replacement_path = home.path().join("replacement-native");
     fs::copy(std::env::current_exe().unwrap(), &selected_path).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_agentknock"), &replacement_path).unwrap();
-    let server_selected_path = selected_path.clone();
+    let server_selected_path = fs::canonicalize(&selected_path).unwrap();
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
@@ -629,6 +639,14 @@ async fn executes_the_selected_native_file_after_its_path_is_replaced() {
         .output()
         .unwrap();
 
+    server.await.unwrap();
+    output
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executes_the_selected_native_file_after_its_path_is_replaced() {
+    let output = replace_selected_native_file_after_approval().await;
     assert!(
         output.status.success(),
         "{}",
@@ -639,7 +657,15 @@ async fn executes_the_selected_native_file_after_its_path_is_replaced() {
             .unwrap()
             .contains("PINNED_EXECUTABLE=selected")
     );
-    server.await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_the_selected_native_file_after_its_path_is_replaced() {
+    let output = replace_selected_native_file_after_approval().await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("selected command changed"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

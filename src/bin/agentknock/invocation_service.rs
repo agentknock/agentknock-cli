@@ -6,16 +6,18 @@ use std::{
     io::{self, Read as _, Write as _},
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
-        unix::{
-            fs::{PermissionsExt as _, symlink},
-            net::UnixStream,
-            process::CommandExt as _,
-        },
+        unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
     rc::Rc,
     time::Duration,
+};
+
+#[cfg(target_os = "macos")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use agentknock::{
@@ -88,11 +90,20 @@ struct ServiceContext {
 }
 
 struct PreparedService {
-    owner: tokio::io::unix::AsyncFd<OwnedFd>,
+    owner: ProcessMonitor,
     _runtime_directory: tempfile::TempDir,
     listener: tokio::net::UnixListener,
     runtime_directory: String,
     context: ServiceContext,
+}
+
+#[cfg(target_os = "linux")]
+type ProcessMonitor = tokio::io::unix::AsyncFd<OwnedFd>;
+
+#[cfg(target_os = "macos")]
+struct ProcessMonitor {
+    exited: Arc<AtomicBool>,
+    notification: Arc<tokio::sync::Notify>,
 }
 
 /// A running invocation service.
@@ -183,7 +194,11 @@ impl InvocationService {
         quiet: bool,
         verbose: bool,
     ) -> io::Result<Self> {
-        let mut process = Command::new("/proc/self/exe")
+        #[cfg(target_os = "linux")]
+        let executable = "/proc/self/exe";
+        #[cfg(target_os = "macos")]
+        let executable = std::env::current_exe()?;
+        let mut process = Command::new(executable)
             .arg(INTERNAL_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -311,11 +326,8 @@ fn prepare() -> io::Result<PreparedService> {
             "invocation token isn't 32 bytes",
         )
     })?;
-    let owner = tokio::io::unix::AsyncFd::new(open_process(request.owner_pid)?)?;
-    let runtime_directory = tempfile::Builder::new()
-        .prefix("agentknock-invocation-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()?;
+    let owner = open_process(request.owner_pid)?;
+    let runtime_directory = runtime_directory()?;
     let socket_path = runtime_directory.path().join(SOCKET_NAME);
     let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
@@ -325,8 +337,7 @@ fn prepare() -> io::Result<PreparedService> {
     } else {
         GIT_SIGN_HELPER_NAME
     });
-    let executable = format!("/proc/{}/exe", std::process::id());
-    symlink(executable, helper_path)?;
+    install_helper(&helper_path)?;
     let path = runtime_directory
         .path()
         .to_str()
@@ -359,6 +370,22 @@ fn prepare() -> io::Result<PreparedService> {
     })
 }
 
+fn runtime_directory() -> io::Result<tempfile::TempDir> {
+    let mut directory = tempfile::Builder::new();
+    directory
+        .prefix("agentknock-invocation-")
+        .permissions(fs::Permissions::from_mode(0o700));
+
+    #[cfg(target_os = "linux")]
+    return directory.tempdir();
+
+    // macOS limits Unix socket paths to 104 bytes. Its per-user temporary
+    // directory can already approach that limit before our directory and
+    // socket names are appended.
+    #[cfg(target_os = "macos")]
+    return directory.tempdir_in("/tmp");
+}
+
 async fn serve(service: PreparedService) -> io::Result<()> {
     loop {
         let connection = tokio::select! {
@@ -372,7 +399,7 @@ async fn serve(service: PreparedService) -> io::Result<()> {
 async fn handle_connection(
     mut connection: tokio::net::UnixStream,
     context: &ServiceContext,
-    owner: &tokio::io::unix::AsyncFd<OwnedFd>,
+    owner: &ProcessMonitor,
 ) -> io::Result<()> {
     let peer_pid = connection
         .peer_cred()?
@@ -425,7 +452,7 @@ async fn handle_connection(
 
 async fn request_git_signature(
     context: &ServiceContext,
-    owner: &tokio::io::unix::AsyncFd<OwnedFd>,
+    owner: &ProcessMonitor,
     data: &[u8],
     repository: Option<&GitSignRepository>,
 ) -> io::Result<String> {
@@ -493,7 +520,8 @@ fn write_response(response: &StartupResponse) -> io::Result<()> {
     Ok(())
 }
 
-fn open_process(pid: libc::pid_t) -> io::Result<OwnedFd> {
+#[cfg(target_os = "linux")]
+fn open_process(pid: libc::pid_t) -> io::Result<ProcessMonitor> {
     // SAFETY: pidfd_open doesn't retain any userspace pointers. A successful
     // call returns a newly owned close-on-exec descriptor.
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -501,7 +529,73 @@ fn open_process(pid: libc::pid_t) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: pidfd_open returned a newly owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) };
+    tokio::io::unix::AsyncFd::new(descriptor)
+}
+
+#[cfg(target_os = "macos")]
+fn open_process(pid: libc::pid_t) -> io::Result<ProcessMonitor> {
+    // SAFETY: kqueue has no preconditions and returns a newly owned descriptor.
+    let descriptor = unsafe { libc::kqueue() };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: kqueue returned a newly owned descriptor.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let event = libc::kevent {
+        ident: pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: event points to one initialized registration. No output is requested.
+    if unsafe {
+        libc::kevent(
+            descriptor.as_raw_fd(),
+            &event,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let exited = Arc::new(AtomicBool::new(false));
+    let notification = Arc::new(tokio::sync::Notify::new());
+    let thread_exited = Arc::clone(&exited);
+    let thread_notification = Arc::clone(&notification);
+    std::thread::Builder::new()
+        .name("agentknock-process-monitor".to_owned())
+        .spawn(move || {
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+            loop {
+                // SAFETY: event is writable for one returned event. A null timeout waits
+                // until the registered process exits or the call is interrupted.
+                let result = unsafe {
+                    libc::kevent(
+                        descriptor.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if result == 1 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+            thread_exited.store(true, Ordering::Release);
+            thread_notification.notify_waiters();
+        })?;
+    Ok(ProcessMonitor {
+        exited,
+        notification,
+    })
 }
 
 fn require_descendant(mut process: libc::pid_t, owner: libc::pid_t) -> io::Result<()> {
@@ -509,14 +603,7 @@ fn require_descendant(mut process: libc::pid_t, owner: libc::pid_t) -> io::Resul
         if process == owner {
             return Ok(());
         }
-        let status = fs::read_to_string(format!("/proc/{process}/status"))?;
-        let parent = status
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:"))
-            .ok_or_else(|| io::Error::other("invocation helper has no parent process"))?
-            .trim()
-            .parse::<libc::pid_t>()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let parent = crate::process_info::parent_id(process)?;
         if parent == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -527,7 +614,8 @@ fn require_descendant(mut process: libc::pid_t, owner: libc::pid_t) -> io::Resul
     }
 }
 
-async fn wait_for_process(process: &tokio::io::unix::AsyncFd<OwnedFd>) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+async fn wait_for_process(process: &ProcessMonitor) -> io::Result<()> {
     loop {
         let mut ready = process.readable().await?;
         let mut event = libc::pollfd {
@@ -549,6 +637,32 @@ async fn wait_for_process(process: &tokio::io::unix::AsyncFd<OwnedFd>) -> io::Re
         }
         ready.clear_ready();
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_process(process: &ProcessMonitor) -> io::Result<()> {
+    loop {
+        if process.exited.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let notified = process.notification.notified();
+        if process.exited.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        notified.await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_helper(path: &Path) -> io::Result<()> {
+    let executable = format!("/proc/{}/exe", std::process::id());
+    std::os::unix::fs::symlink(executable, path)
+}
+
+#[cfg(target_os = "macos")]
+fn install_helper(path: &Path) -> io::Result<()> {
+    fs::copy(std::env::current_exe()?, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {

@@ -4,6 +4,7 @@ set -eu
 
 repository_root=$(unset CDPATH; cd -- "$(dirname "$0")/.." && pwd)
 test_dir=$(mktemp -d)
+host_os=$(uname -s)
 
 cleanup() {
 	rm -rf "$test_dir"
@@ -27,7 +28,11 @@ mkdir -p "$fake_bin" "$fixture_dir"
 printf '#!/bin/sh\nprintf "fixture agentknock\\n"\n' > "$fixture_dir/agentknock"
 chmod 0755 "$fixture_dir/agentknock"
 tar -czf "$test_dir/release.tar.gz" -C "$fixture_dir" agentknock
-fixture_hash_line=$(sha256sum "$test_dir/release.tar.gz")
+if command -v sha256sum >/dev/null 2>&1; then
+	fixture_hash_line=$(sha256sum "$test_dir/release.tar.gz")
+else
+	fixture_hash_line=$(shasum -a 256 "$test_dir/release.tar.gz")
+fi
 fixture_hash=${fixture_hash_line%% *}
 
 cat > "$fake_bin/uname" <<'EOF'
@@ -121,7 +126,11 @@ export TEST_TARGET=x86_64-unknown-linux-musl
 run_installer_from_stdin "$home" "$test_dir/x86-output"
 cmp "$fixture_dir/agentknock" "$home/.local/bin/agentknock" || \
 	fail 'the x86-64 binary was not installed intact'
-[ "$(stat -c %a "$home/.local/bin/agentknock")" = 755 ] || \
+case "$host_os" in
+	Darwin) installed_mode=$(stat -f %Lp "$home/.local/bin/agentknock") ;;
+	*) installed_mode=$(stat -c %a "$home/.local/bin/agentknock") ;;
+esac
+[ "$installed_mode" = 755 ] || \
 	fail 'the installed binary does not have mode 0755'
 assert_contains "$test_dir/x86-output" 'Installed Agentknock v1.2.3'
 
@@ -132,11 +141,20 @@ run_installer "$home" "$test_dir/arm-output"
 cmp "$fixture_dir/agentknock" "$home/.local/bin/agentknock" || \
 	fail 'the ARM64 binary was not installed intact'
 
+home=$test_dir/macos-home
+export TEST_OS=Darwin
+export TEST_ARCHITECTURE=arm64
+export TEST_TARGET=aarch64-apple-darwin
+run_installer "$home" "$test_dir/macos-output"
+cmp "$fixture_dir/agentknock" "$home/.local/bin/agentknock" || \
+	fail 'the macOS binary was not installed intact'
+
 home=$test_dir/checksum-home
 mkdir -p "$home/.local/bin"
 printf 'existing binary\n' > "$home/.local/bin/agentknock"
 export TEST_ARCHITECTURE=x86_64
 export TEST_TARGET=x86_64-unknown-linux-musl
+unset TEST_OS
 export TEST_HASH=0000000000000000000000000000000000000000000000000000000000000000
 if run_installer "$home" "$test_dir/checksum-output"; then
 	fail 'a bad archive checksum was accepted'

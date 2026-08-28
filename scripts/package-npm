@@ -27,20 +27,19 @@ version=$(awk '
 	exit 1
 }
 
-install -D -m 0755 "$repository_root/npm/agentknock.js" \
-	"$staging_dir/agentknock.js"
-install -D -m 0644 "$repository_root/npm/package.json" \
-	"$staging_dir/package.json"
-install -D -m 0644 "$repository_root/README.md" "$staging_dir/README.md"
-install -D -m 0644 "$repository_root/LICENSE-APACHE" \
-	"$staging_dir/LICENSE-APACHE"
-install -D -m 0644 "$repository_root/LICENSE-MIT" \
-	"$staging_dir/LICENSE-MIT"
+install -m 0755 "$repository_root/npm/agentknock.js" "$staging_dir/agentknock.js"
+install -m 0644 "$repository_root/npm/package.json" "$staging_dir/package.json"
+install -m 0644 "$repository_root/README.md" "$staging_dir/README.md"
+install -m 0644 "$repository_root/LICENSE-APACHE" "$staging_dir/LICENSE-APACHE"
+install -m 0644 "$repository_root/LICENSE-MIT" "$staging_dir/LICENSE-MIT"
 
 npm pkg set "version=$version" --prefix "$staging_dir"
 npm pkg delete private --prefix "$staging_dir"
 
-for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+for target in \
+	x86_64-unknown-linux-musl \
+	aarch64-unknown-linux-musl \
+	aarch64-apple-darwin; do
 	archive=agentknock-$target.tar.gz
 	(
 		cd "$dist_dir"
@@ -51,8 +50,8 @@ for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
 	mkdir -p "$extract_dir"
 	tar --extract --gzip --file="$dist_dir/$archive" \
 		--directory="$extract_dir" agentknock
-	install -D -m 0755 "$extract_dir/agentknock" \
-		"$staging_dir/bin/agentknock-$target"
+	mkdir -p "$staging_dir/bin"
+	install -m 0755 "$extract_dir/agentknock" "$staging_dir/bin/agentknock-$target"
 done
 rm -rf -- "$staging_dir/extract"
 

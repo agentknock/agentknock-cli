@@ -16,6 +16,16 @@ download() {
 		--output "$2" "$1"
 }
 
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1"
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1"
+	else
+		fail 'required command not found: sha256sum or shasum'
+	fi
+}
+
 cleanup() {
 	if [ -n "${staged_binary:-}" ]; then
 		rm -f "$staged_binary" || :
@@ -28,7 +38,7 @@ cleanup() {
 main() {
 	[ "$#" -eq 0 ] || fail "this installer does not accept arguments"
 
-	for command in chmod curl mkdir mktemp mv rm sha256sum tar uname; do
+	for command in chmod curl mkdir mktemp mv rm tar uname; do
 		need_command "$command"
 	done
 
@@ -38,19 +48,17 @@ main() {
 	esac
 
 	os=$(uname -s)
-	[ "$os" = Linux ] || fail "unsupported operating system: $os"
-
 	architecture=$(uname -m)
-	case "$architecture" in
-		x86_64 | x86-64 | amd64)
-			target=x86_64-unknown-linux-musl
-			;;
-		aarch64 | arm64)
-			target=aarch64-unknown-linux-musl
-			;;
-		*)
-			fail "unsupported Linux architecture: $architecture"
-			;;
+	case "$os/$architecture" in
+		Linux/x86_64 | Linux/x86-64 | Linux/amd64)
+			target=x86_64-unknown-linux-musl ;;
+		Linux/aarch64 | Linux/arm64)
+			target=aarch64-unknown-linux-musl ;;
+		Darwin/arm64 | Darwin/aarch64)
+			target=aarch64-apple-darwin ;;
+		Darwin/*) fail "unsupported macOS architecture: $architecture" ;;
+		Linux/*) fail "unsupported Linux architecture: $architecture" ;;
+		*) fail "unsupported operating system: $os" ;;
 	esac
 
 	repository_url=https://github.com/agentknock/agentknock-cli
@@ -100,7 +108,7 @@ main() {
 	[ "$expected_name" = "$archive_name" ] || \
 		fail 'the release checksum names an unexpected file'
 
-	actual_hash_line=$(sha256sum "$archive_path") || \
+	actual_hash_line=$(sha256 "$archive_path") || \
 		fail "could not calculate the checksum of $archive_name"
 	actual_hash=${actual_hash_line%% *}
 	[ "$actual_hash" = "$expected_hash" ] || \

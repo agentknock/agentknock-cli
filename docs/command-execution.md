@@ -33,10 +33,10 @@ protection, or strong guarantees against active local compromise. A normal
 path lookup followed by `execve` would often have similar practical security
 on a compromised host.
 
-Agentknock uses the Linux facilities described here because they are available
-at modest complexity. Failure instead of an implicit fallback keeps the
-behavior and reported metadata predictable; it does not turn the launcher into
-a sandbox or privilege boundary.
+Agentknock uses the Linux and macOS facilities described here because they are
+available at modest complexity. Failure instead of an implicit fallback keeps
+the behavior and reported metadata predictable; it does not turn the launcher
+into a sandbox or privilege boundary.
 
 ## Common execution semantics
 
@@ -49,7 +49,7 @@ a sandbox or privilege boundary.
 4. Wait for an authenticated response and complete the protocol exchange.
 5. If the response contains an SSH secret, start an invocation service for
    deferred operations and add its Git settings to the command environment.
-6. Revalidate the executable when a hash is available.
+6. Revalidate the selected executable, including its hash when available.
 7. Overlay returned environment variables and Agentknock's Git settings on the
    inherited environment.
 8. Check for a pending termination signal.
@@ -78,13 +78,13 @@ client can therefore exit, receive a signal, or encounter an execution error
 after the device has returned a result. A protocol completion confirms the
 client result; it does not prove that the command started.
 
-The Linux implementation uses individual kernel operations to narrow specific
-races:
+The implementations use individual operating-system operations to narrow
+specific races:
 
 | Boundary | Mechanism | Remaining limitation |
 | --- | --- | --- |
 | Path lookup to selected object | Open the candidate and retain its file descriptor. | The opened file's contents can still change. |
-| Approval wait to native execution | Execute the retained descriptor with `execveat`. | Loaders, libraries, plugins, and other dependencies are not retained. |
+| Approval wait to native execution | On Linux, execute the retained descriptor. On macOS, require the retained object to remain at the captured path immediately before path execution. | macOS has a final path race. Loaders, libraries, plugins, and other dependencies are not retained on either platform. |
 | Approval metadata to executable contents | Hash before the request and again before execution. | The file can change after the second hash observation. |
 | Approval wait to script execution | Rehash the captured script path immediately before `execve`. | The pathname or file can change after revalidation. |
 | Signal handling to process replacement | Block termination signals, check pending signals, then restore the caller's state. | A later signal follows the restored disposition as normal. |
@@ -108,10 +108,10 @@ The invocation request reports:
 - The requested secret names and optional reason.
 
 Agentknock reports a standard stream as a terminal, null device, pipe, socket,
-regular file, or unknown connection. On Linux, it reads launcher paths from
-`/proc`, up to four ancestors, and orders them from the oldest reported
-ancestor to the direct launcher. Missing, inaccessible, or non-UTF-8 process
-information shortens the chain.
+regular file, or unknown connection. It reads launcher paths from the platform
+process interface, up to four ancestors, and orders them from the oldest
+reported ancestor to the direct launcher. Missing, inaccessible, or non-UTF-8
+process information shortens the chain.
 
 This information helps a person or automated policy evaluate a request, but it
 is entirely client-reported. It is not attestation, and a modified client can
@@ -155,20 +155,23 @@ The command and its descendants control every value they receive. Users must
 approve environment delivery and signing operations only for commands they
 trust to handle them.
 
+## Platform implementations
+
+Agentknock supports x86-64 and ARM64 Linux 5.8 or later, and ARM64 macOS 15 or
+later. Both implementations require UTF-8 command arguments, working-directory
+paths, and selected executable paths at the protocol boundary. Agentknock
+stops before sending the invocation request when the host cannot provide a
+required facility.
+
 ## Linux implementation
 
-The current command-execution implementation supports Linux. It requires:
+The Linux implementation requires:
 
 - Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
 - The `execveat` system call.
 - The `pidfd_open` system call for deferred operations.
 - A mounted `/proc` file system with usable file-descriptor and process-status
   views.
-- UTF-8 command arguments, working-directory paths, and selected executable
-  paths at the protocol boundary.
-
-Agentknock stops before sending the invocation request when the host cannot
-provide a required facility.
 
 ### Working directory and search path
 
@@ -389,17 +392,64 @@ control, and exit-status handling. Process replacement avoids those
 differences. The optional invocation service is independent of that lifecycle
 and communicates with helpers rather than supervising the command.
 
-## macOS status
+## macOS implementation
 
-Agentknock does not currently implement command execution on macOS. A future
-implementation belongs in this document because the execution model, approval
-context, environment behavior, and security scope should remain common across
-platforms.
+The macOS implementation supports Apple Silicon on macOS 15 or later. It uses
+the common execution sequence, approval context, environment construction, Git
+signing behavior, and signal handling described above. The differences from
+Linux follow from macOS not providing a public equivalent of `execveat` or
+`fexecve`.
 
-The macOS section must document the mechanisms it actually uses and the races
-that remain. It does not need to reproduce Linux system calls or claim stronger
-consistency than macOS can provide. Keeping both implementations here makes
-platform differences visible instead of hiding them behind a general claim.
+### Selection and inspection
+
+Agentknock opens the current directory with `O_SEARCH | O_CLOEXEC` and each
+candidate with `O_EXEC | O_CLOEXEC`. Opening the candidate checks execute
+access. Agentknock requires a regular file and retains both the candidate
+descriptor and the absolute path returned by `fcntl` with `F_GETPATH`.
+
+Relative command paths and relative `PATH` entries are resolved from the
+retained current-directory descriptor. Absolute paths and `PATH` searches
+otherwise follow the common behavior described for Linux. Symbolic links are
+followed during selection.
+
+To inspect the executable, Agentknock opens the captured path for reading and
+requires its device and inode numbers to match the retained descriptor. When
+the object is readable, Agentknock calculates its SHA-256 digest and detects a
+shebang as on Linux. An execute-only object has no reported hash and is treated
+as a binary.
+
+Immediately before execution, Agentknock opens the captured path again with
+`O_EXEC` and requires the device and inode numbers to match the retained
+descriptor. If a hash was reported, it also reopens the path for reading,
+checks the object identity, and recalculates the hash. A missing path, changed
+identity, unreadable previously hashed file, or hash mismatch stops execution.
+
+### Process replacement
+
+Agentknock calls `execve` with the captured absolute path for both binaries and
+scripts. It does not repeat the `PATH` search and does not invoke an implicit
+shell. Normal kernel shebang processing applies to scripts.
+
+The path can be replaced after the final identity and hash checks but before
+`execve` resolves it. macOS does not expose a public descriptor-based execution
+operation that would close this race. The retained descriptor and checks catch
+changes observed before the final call; they do not make path execution
+atomic. This is weaker than Linux descriptor execution for native binaries and
+similar to the Linux script path.
+
+### Invocation service
+
+The invocation service copies its current Agentknock executable into its
+private mode-0700 temporary directory as the Git signing helper. This avoids a
+dependency on `/proc`, which macOS does not provide. The copied helper contains
+no secret data; the invocation token and SSH metadata remain in service memory.
+
+The service registers the owner PID with `kqueue` using `EVFILT_PROC` and
+`NOTE_EXIT`, and exits when that process exits. It obtains a helper's peer PID
+from the Unix-domain socket and uses the macOS process-information interface
+to require that the helper descends from the owner. These are the macOS
+counterparts of the Linux pidfd and `/proc` checks and have the same
+best-effort, same-user security scope.
 
 ## Limits
 
@@ -408,6 +458,7 @@ Agentknock does not provide:
 - Immutable executable bytes.
 - Remote attestation of a path, owner, hash, or file contents.
 - Stable pathname execution for shebang scripts.
+- Atomic pathname execution on macOS.
 - Pinning of interpreters, libraries, plugins, configuration, or descendants.
 - Isolation from inherited or returned environment data.
 - A sandbox, privilege boundary, or `sudo`-like authorization boundary.
@@ -428,4 +479,8 @@ secrets.
 - [Linux `proc_pid_fd(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html)
 - [Linux `proc_pid_status(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
 - [Linux `unix(7)` manual page](https://man7.org/linux/man-pages/man7/unix.7.html)
+- [macOS `execve(2)` manual page](https://keith.github.io/xcode-man-pages/execve.2.html)
+- [macOS `fcntl(2)` manual page](https://keith.github.io/xcode-man-pages/fcntl.2.html)
+- [macOS `kqueue(2)` manual page](https://keith.github.io/xcode-man-pages/kqueue.2.html)
+- [Apple `libproc` interface](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.h)
 - [POSIX `exec` specification](https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html)

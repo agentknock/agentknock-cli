@@ -35,7 +35,10 @@ package=agentknock-$version.tgz
 npm install --ignore-scripts --no-audit --no-fund --prefix "$test_dir" \
 	"$dist_dir/$package"
 
-for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+for target in \
+	x86_64-unknown-linux-musl \
+	aarch64-unknown-linux-musl \
+	aarch64-apple-darwin; do
 	test -x "$test_dir/node_modules/agentknock/bin/agentknock-$target"
 done
 

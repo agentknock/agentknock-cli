@@ -13,6 +13,9 @@ use std::{
     ptr,
 };
 
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
+
 use agentknock::{ExecutableMode, SecretUseOutput};
 use sha2::{Digest as _, Sha256};
 
@@ -25,6 +28,7 @@ pub struct SelectedExecutable {
     path: String,
     hash: Option<[u8; HASH_LENGTH]>,
     mode: ExecutableMode,
+    #[cfg(target_os = "linux")]
     script_path: Option<PathBuf>,
     working_directory: String,
 }
@@ -129,6 +133,7 @@ impl SelectedExecutable {
             path,
             hash,
             mode,
+            #[cfg(target_os = "linux")]
             script_path: shebang.then(|| candidate.to_owned()),
             working_directory,
         })
@@ -158,6 +163,8 @@ impl SelectedExecutable {
         signal_state: &SignalState,
         blocked_signals: BlockedSignals,
     ) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        self.verify_path_identity()?;
         self.verify_hash()?;
         let arguments = c_arguments(&self.command, arguments)?;
         let environment = c_environment(secret_use_output, additional_environment)?;
@@ -171,18 +178,29 @@ impl SelectedExecutable {
 
         let argument_pointers = c_pointers(&arguments);
         let environment_pointers = c_pointers(&environment);
-        let result = match self.mode {
+        let result = self.exec(&argument_pointers, &environment_pointers)?;
+        debug_assert_eq!(result, -1);
+        Err(io::Error::last_os_error())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exec(
+        &self,
+        arguments: &[*const libc::c_char],
+        environment: &[*const libc::c_char],
+    ) -> io::Result<libc::c_long> {
+        Ok(match self.mode {
             ExecutableMode::Binary => {
                 let empty_path = c"";
-                // SAFETY: The descriptor stays open for the call; all pointer arrays are
+                // SAFETY: The descriptor stays open for the call; both pointer arrays are
                 // NUL-terminated and point to live C strings.
                 unsafe {
                     libc::syscall(
                         libc::SYS_execveat,
                         self.descriptor.as_raw_fd(),
                         empty_path.as_ptr(),
-                        argument_pointers.as_ptr(),
-                        environment_pointers.as_ptr(),
+                        arguments.as_ptr(),
+                        environment.as_ptr(),
                         libc::AT_EMPTY_PATH,
                     )
                 }
@@ -193,25 +211,32 @@ impl SelectedExecutable {
                         .as_deref()
                         .expect("a shebang script has a captured path"),
                 )?;
-                // SAFETY: The path and pointer arrays are NUL-terminated and remain live
-                // for the call.
-                unsafe {
-                    libc::execve(
-                        path.as_ptr(),
-                        argument_pointers.as_ptr(),
-                        environment_pointers.as_ptr(),
-                    ) as libc::c_long
-                }
+                // SAFETY: The path and pointer arrays remain live for the call.
+                (unsafe { libc::execve(path.as_ptr(), arguments.as_ptr(), environment.as_ptr()) })
+                    as libc::c_long
             }
-        };
-        debug_assert_eq!(result, -1);
-        Err(io::Error::last_os_error())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exec(
+        &self,
+        arguments: &[*const libc::c_char],
+        environment: &[*const libc::c_char],
+    ) -> io::Result<libc::c_long> {
+        let path = path_c_string(Path::new(&self.path))?;
+        // SAFETY: The path and pointer arrays remain live for the call.
+        Ok(
+            (unsafe { libc::execve(path.as_ptr(), arguments.as_ptr(), environment.as_ptr()) })
+                as libc::c_long,
+        )
     }
 
     fn verify_hash(&self) -> io::Result<()> {
         let Some(expected) = self.hash else {
             return Ok(());
         };
+        #[cfg(target_os = "linux")]
         let actual = match self.mode {
             ExecutableMode::Binary => read_selected_file(&self.descriptor)?.map(|(hash, _)| hash),
             ExecutableMode::Script => Some(hash_path(
@@ -220,6 +245,8 @@ impl SelectedExecutable {
                     .expect("a shebang script has a captured path"),
             )?),
         };
+        #[cfg(target_os = "macos")]
+        let actual = read_selected_file(&self.descriptor)?.map(|(hash, _)| hash);
         let Some(actual) = actual else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -233,6 +260,17 @@ impl SelectedExecutable {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_path_identity(&self) -> io::Result<()> {
+        let current = open_candidate(libc::AT_FDCWD, Path::new(&self.path))?;
+        require_same_file(self.descriptor.as_raw_fd(), current.as_raw_fd()).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                "the selected command changed while Agentknock waited for the device",
+            )
+        })
     }
 }
 
@@ -309,15 +347,19 @@ impl Drop for BlockedSignals {
 }
 
 fn open_directory(path: &Path) -> io::Result<OwnedFd> {
-    open_at(
-        libc::AT_FDCWD,
-        path,
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-    )
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_SEARCH | libc::O_CLOEXEC;
+    open_at(libc::AT_FDCWD, path, flags)
 }
 
 fn open_candidate(directory: RawFd, path: &Path) -> io::Result<OwnedFd> {
-    open_at(directory, path, libc::O_PATH | libc::O_CLOEXEC)
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_EXEC | libc::O_CLOEXEC;
+    open_at(directory, path, flags)
 }
 
 fn open_at(directory: RawFd, path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
@@ -345,6 +387,12 @@ fn require_regular_file(descriptor: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn require_effective_execute_access(_descriptor: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn require_effective_execute_access(descriptor: &OwnedFd) -> io::Result<()> {
     let empty_path = c"";
     // SAFETY: The descriptor and empty-path C string are valid for the syscall.
@@ -378,15 +426,21 @@ fn inspect_selected_file(descriptor: &OwnedFd) -> io::Result<(Option<[u8; HASH_L
 }
 
 fn read_selected_file(descriptor: &OwnedFd) -> io::Result<Option<([u8; HASH_LENGTH], bool)>> {
+    #[cfg(target_os = "linux")]
     let path = descriptor_proc_path(descriptor);
+    #[cfg(target_os = "macos")]
+    let path = descriptor_path(descriptor, "selected executable")?;
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
+    require_same_file(descriptor.as_raw_fd(), file.as_raw_fd())?;
     Ok(Some(hash_file(file)?))
 }
 
+#[cfg(target_os = "linux")]
 fn hash_path(path: &Path) -> io::Result<[u8; HASH_LENGTH]> {
     File::open(path).and_then(|file| hash_file(file).map(|(hash, _)| hash))
 }
@@ -415,22 +469,73 @@ fn hash_file(mut file: File) -> io::Result<([u8; HASH_LENGTH], bool)> {
 }
 
 fn descriptor_path(descriptor: &OwnedFd, description: &str) -> io::Result<String> {
-    let path = std::fs::read_link(descriptor_proc_path(descriptor)).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("can't read {description} through /proc/self/fd: {error}"),
-        )
-    })?;
-    path.into_os_string().into_string().map_err(|path| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{description} isn't valid UTF-8: {path:?}"),
-        )
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::fs::read_link(descriptor_proc_path(descriptor)).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("can't read {description} through /proc/self/fd: {error}"),
+            )
+        })?;
+        path.into_os_string().into_string().map_err(|path| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{description} isn't valid UTF-8: {path:?}"),
+            )
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut path = vec![0_u8; libc::PATH_MAX as usize];
+        // SAFETY: path is a writable PATH_MAX-sized buffer, as required by F_GETPATH.
+        if unsafe {
+            libc::fcntl(
+                descriptor.as_raw_fd(),
+                libc::F_GETPATH,
+                path.as_mut_ptr().cast::<libc::c_char>(),
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: F_GETPATH wrote a NUL-terminated path on success.
+        let path = unsafe { CStr::from_ptr(path.as_ptr().cast()) };
+        String::from_utf8(path.to_bytes().to_vec()).map_err(|path| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{description} isn't valid UTF-8: {:?}", path.into_bytes()),
+            )
+        })
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn descriptor_proc_path(descriptor: &OwnedFd) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn require_same_file(left: RawFd, right: RawFd) -> io::Result<()> {
+    fn status(descriptor: RawFd) -> io::Result<libc::stat> {
+        let mut status = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: status is a valid output pointer and fstat does not retain it.
+        if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstat initialized status on success.
+        Ok(unsafe { status.assume_init() })
+    }
+
+    let left = status(left)?;
+    let right = status(right)?;
+    if left.st_dev == right.st_dev && left.st_ino == right.st_ino {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the selected command changed while Agentknock inspected it",
+        ))
+    }
 }
 
 fn default_search_path() -> io::Result<OsString> {
@@ -587,12 +692,19 @@ fn signal_is_member(set: &libc::sigset_t, signal: libc::c_int) -> io::Result<boo
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt as _};
+    use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt as _, path::Path};
 
     use sha2::{Digest as _, Sha256};
 
     use super::SelectedExecutable;
     use agentknock::ExecutableMode;
+
+    fn assert_same_path(actual: &str, expected: &Path) {
+        assert_eq!(
+            fs::canonicalize(actual).unwrap(),
+            fs::canonicalize(expected).unwrap()
+        );
+    }
 
     #[test]
     fn selects_and_hashes_a_shebang_script() {
@@ -615,7 +727,7 @@ mod tests {
             executable.hash().copied(),
             Some(Sha256::digest(b"#!/bin/sh\necho selected\n").into())
         );
-        assert_eq!(executable.path(), script.to_str().unwrap());
+        assert_same_path(executable.path(), &script);
     }
 
     #[test]
@@ -658,7 +770,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(executable.path(), selected.to_str().unwrap());
+        assert_same_path(executable.path(), &selected);
     }
 
     #[test]
@@ -677,7 +789,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(executable.path(), selected.to_str().unwrap());
+        assert_same_path(executable.path(), &selected);
     }
 
     #[test]

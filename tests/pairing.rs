@@ -266,6 +266,11 @@ async fn starts_and_finishes_pairing_over_websockets() {
         assert!(plaintext.get("cli_version").is_none());
         assert_eq!(plaintext["platform"], std::env::consts::OS);
         assert_eq!(plaintext["architecture"], std::env::consts::ARCH);
+        assert!(
+            plaintext["os_version"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty())
+        );
         assert!(plaintext.get("client_secret").is_none());
         let expected_commitment = {
             let hkdf = Hkdf::<Sha256>::new(Some(b"agentknock-v1"), &client_secret);
