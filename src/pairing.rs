@@ -1,4 +1,7 @@
-use std::{fmt, fs, future::Future, io, path::Path, pin::Pin};
+use std::{fmt, future::Future, io, path::Path, pin::Pin};
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 use base64::{
     Engine as _,
@@ -136,8 +139,8 @@ impl Client {
         let contents = PairingMetadata {
             platform: std::env::consts::OS,
             architecture: std::env::consts::ARCH,
-            hostname: read_trimmed("/etc/hostname"),
-            machine_id: read_trimmed("/etc/machine-id"),
+            hostname: hostname(),
+            machine_id: machine_id(),
             os_version: os_version(),
         };
         let application_plaintext = self.encode(&contents).map_err(RequestError::other)?;
@@ -494,12 +497,24 @@ struct PairingMetadata {
     os_version: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     let contents = fs::read_to_string(path).ok()?;
     let contents = contents.trim();
     (!contents.is_empty()).then(|| contents.to_owned())
 }
 
+#[cfg(target_os = "linux")]
+fn hostname() -> Option<String> {
+    read_trimmed("/etc/hostname")
+}
+
+#[cfg(target_os = "linux")]
+fn machine_id() -> Option<String> {
+    read_trimmed("/etc/machine-id")
+}
+
+#[cfg(target_os = "linux")]
 fn os_version() -> Option<String> {
     fs::read_to_string("/etc/os-release")
         .ok()?
@@ -508,6 +523,61 @@ fn os_version() -> Option<String> {
         .map(|value| value.trim_matches('"'))
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+#[cfg(target_os = "macos")]
+fn hostname() -> Option<String> {
+    sysctl_string(c"kern.hostname")
+}
+
+#[cfg(target_os = "macos")]
+fn machine_id() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn os_version() -> Option<String> {
+    sysctl_string(c"kern.osproductversion").map(|version| format!("macOS {version}"))
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
+    let mut length = 0;
+    // SAFETY: A null output buffer asks sysctlbyname for the required length.
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == -1
+        || length == 0
+    {
+        return None;
+    }
+    let mut value = vec![0_u8; length];
+    // SAFETY: value is writable for the length supplied to sysctlbyname.
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == -1
+    {
+        return None;
+    }
+    value.truncate(length);
+    if value.last() == Some(&0) {
+        value.pop();
+    }
+    String::from_utf8(value)
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn generate_client_token() -> io::Result<String> {

@@ -1,9 +1,10 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("the agentknock CLI currently supports Linux only");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("the agentknock CLI currently supports Linux and macOS only");
 
 mod executable;
 mod git_repository;
 mod invocation_service;
+mod process_info;
 
 use std::{
     cell::Cell,
@@ -31,10 +32,7 @@ use executable::{SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
 use thiserror::Error;
 
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
-#[cfg(target_os = "linux")]
 const MAX_LAUNCHER_DEPTH: usize = 4;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -1902,25 +1900,37 @@ fn standard_stream_kind(file_descriptor: u8, terminal: bool) -> StreamKind {
         return StreamKind::Terminal;
     }
 
-    let Ok(metadata) = std::fs::metadata(format!("/proc/self/fd/{file_descriptor}")) else {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: status is a valid output pointer and fstat does not retain it.
+    if unsafe { libc::fstat(file_descriptor.into(), status.as_mut_ptr()) } == -1 {
         return StreamKind::Unknown;
-    };
-    let file_type = metadata.file_type();
+    }
+    // SAFETY: fstat initialized status on success.
+    let status = unsafe { status.assume_init() };
+    let file_type = status.st_mode & libc::S_IFMT;
 
-    if file_type.is_fifo() {
+    if file_type == libc::S_IFIFO {
         StreamKind::Pipe
-    } else if file_type.is_socket() {
+    } else if file_type == libc::S_IFSOCK {
         StreamKind::Socket
-    } else if file_type.is_file() {
+    } else if file_type == libc::S_IFREG {
         StreamKind::RegularFile
-    } else if file_type.is_char_device()
-        && std::fs::metadata("/dev/null")
-            .is_ok_and(|null_device| metadata.rdev() == null_device.rdev())
-    {
+    } else if file_type == libc::S_IFCHR && is_null_device(status.st_rdev) {
         StreamKind::NullDevice
     } else {
         StreamKind::Unknown
     }
+}
+
+fn is_null_device(device: libc::dev_t) -> bool {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let path = c"/dev/null";
+    // SAFETY: path and status are valid for the duration of stat.
+    if unsafe { libc::stat(path.as_ptr(), status.as_mut_ptr()) } == -1 {
+        return false;
+    }
+    // SAFETY: stat initialized status on success.
+    unsafe { status.assume_init() }.st_rdev == device
 }
 
 fn launcher_chain() -> Vec<String> {
@@ -1928,17 +1938,13 @@ fn launcher_chain() -> Vec<String> {
     let mut process_id = std::process::id();
 
     for _ in 0..MAX_LAUNCHER_DEPTH {
-        let status = match std::fs::read_to_string(format!("/proc/{process_id}/status")) {
-            Ok(status) => status,
-            Err(_) => break,
-        };
-        let Some(parent_id) = parent_id(&status) else {
+        let Ok(parent_id) = process_info::parent_id(process_id as libc::pid_t) else {
             break;
         };
         if parent_id <= 1 {
             break;
         }
-        let executable = match std::fs::read_link(format!("/proc/{parent_id}/exe")) {
+        let executable = match process_info::executable_path(parent_id) {
             Ok(executable) => executable,
             Err(_) => break,
         };
@@ -1946,20 +1952,11 @@ fn launcher_chain() -> Vec<String> {
             break;
         };
         launchers.push(executable.to_owned());
-        process_id = parent_id;
+        process_id = parent_id as u32;
     }
 
     launchers.reverse();
     launchers
-}
-
-fn parent_id(status: &str) -> Option<u32> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))?
-        .trim()
-        .parse()
-        .ok()
 }
 
 fn progress_message(progress: SecretUseProgress) -> &'static str {
@@ -1991,9 +1988,6 @@ mod tests {
         Cli, EnvironmentSecretInput, Operation, OutputMode, SecretUploadCommand, VariableFile,
         exec_is_missing_separator, format_elapsed_time, progress_message, progress_report,
     };
-
-    #[cfg(target_os = "linux")]
-    use super::parent_id;
 
     #[test]
     fn parses_exec_command() {
@@ -2043,13 +2037,6 @@ mod tests {
                 OutputMode::Normal,
             )
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parses_parent_id_from_proc_status() {
-        assert_eq!(parent_id("Name:\tbash\nPPid:\t1234\n"), Some(1234));
-        assert_eq!(parent_id("Name:\tbash\n"), None);
     }
 
     #[test]

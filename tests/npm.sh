@@ -12,17 +12,17 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-install -D -m 0755 "$repository_root/npm/agentknock.js" \
-	"$package_dir/agentknock.js"
-install -D -m 0644 "$repository_root/npm/package.json" \
-	"$package_dir/package.json"
-install -D -m 0644 "$repository_root/README.md" "$package_dir/README.md"
-install -D -m 0644 "$repository_root/LICENSE-APACHE" \
-	"$package_dir/LICENSE-APACHE"
-install -D -m 0644 "$repository_root/LICENSE-MIT" \
-	"$package_dir/LICENSE-MIT"
+mkdir -p "$package_dir"
+install -m 0755 "$repository_root/npm/agentknock.js" "$package_dir/agentknock.js"
+install -m 0644 "$repository_root/npm/package.json" "$package_dir/package.json"
+install -m 0644 "$repository_root/README.md" "$package_dir/README.md"
+install -m 0644 "$repository_root/LICENSE-APACHE" "$package_dir/LICENSE-APACHE"
+install -m 0644 "$repository_root/LICENSE-MIT" "$package_dir/LICENSE-MIT"
 
-for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+for target in \
+	x86_64-unknown-linux-musl \
+	aarch64-unknown-linux-musl \
+	aarch64-apple-darwin; do
 	mkdir -p "$package_dir/bin"
 	# Keep the variables literal in the generated fixture script.
 	# shellcheck disable=SC2016

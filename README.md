@@ -127,11 +127,13 @@ gh attestation verify "$archive" --repo "$repository" \
   --signer-workflow agentknock/agentknock-cli/.github/workflows/ci.yml
 ```
 
-Use `aarch64-unknown-linux-musl` as `target` for an ARM64 Linux system. Release
-verification confirms that the downloaded archive is part of the immutable
-release. Build-provenance verification confirms that the Agentknock release
-workflow built that archive from the identified source revision. Neither
-verification determines whether the source code itself is safe.
+Use `aarch64-unknown-linux-musl` as `target` for an ARM64 Linux system or
+`aarch64-apple-darwin` for an Apple Silicon Mac. On macOS, replace the
+`sha256sum` command with `shasum -a 256 --check`. Release verification confirms
+that the downloaded archive is part of the immutable release.
+Build-provenance verification confirms that the Agentknock release workflow
+built that archive from the identified source revision. Neither verification
+determines whether the source code itself is safe.
 
 The pinned Nix build can independently reproduce the release archive. On a
 system with Nix installed, check out the release and compare the resulting
@@ -345,11 +347,11 @@ intend to trust, including when multiple pairing requests are pending. It also
 detects substitution by the relay and lets the relay remain outside the trust
 boundary. Reject the pairing if you cannot confirm the complete code.
 
-Agentknock never writes delivered secret values to disk. On Linux, it opens a
-native executable before asking the device to prepare the selected secrets and
-executes that same filesystem object after approval. This prevents a path,
-symlink, or file replacement during the wait from selecting a different
-top-level native executable.
+Agentknock never writes delivered secret values to disk. It opens the selected
+executable before asking the device to prepare the secrets, reports its path
+and hash when available, and revalidates it after approval. Linux executes a
+retained native executable directly. macOS must execute its path and therefore
+has a small final pathname race after revalidation.
 
 Agentknock is not a sandbox or privilege boundary. The approved command
 controls the secrets that it receives and can print them, write them to disk,
@@ -374,13 +376,16 @@ Agentknock supports these client platforms:
 | --- | --- |
 | x86-64 Linux | `agentknock-x86_64-unknown-linux-musl.tar.gz` |
 | ARM64 Linux | `agentknock-aarch64-unknown-linux-musl.tar.gz` |
+| Apple Silicon macOS | `agentknock-aarch64-apple-darwin.tar.gz` |
 
-The archives contain a statically linked musl binary and the license files.
-The binary does not require a system C library. Command execution requires
-Linux 5.8 or later and a mounted `/proc` file system.
+Each archive contains the Agentknock binary and license files. The Linux
+archives contain a statically linked musl binary and do not require a system C
+library. Linux command execution requires Linux 5.8 or later and a mounted
+`/proc` file system. The macOS archive requires Apple Silicon and macOS 15 or
+later.
 
 Agentknock supports WSL2 through its Linux environment. Use the archive that
-matches the WSL2 architecture. Native Windows and macOS clients are not
+matches the WSL2 architecture. Native Windows clients and Intel Macs are not
 supported.
 
 ## Documentation
@@ -391,8 +396,8 @@ supported.
   interface used by clients.
 - [Cryptosystem](docs/cryptosystem.md) defines the end-to-end cryptographic
   construction and threat model.
-- [Command execution](docs/command-execution.md) defines how the Linux CLI
-  selects, inspects, and starts an approved command.
+- [Command execution](docs/command-execution.md) defines how the CLI selects,
+  inspects, and starts an approved command.
 
 The [Rust API documentation](https://docs.rs/agentknock) describes the
 unstable interface for embedding Agentknock in applications. Direct library

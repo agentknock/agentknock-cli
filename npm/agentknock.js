@@ -22,6 +22,8 @@ const target = (() => {
       return "x86_64-unknown-linux-musl";
     case "linux/arm64":
       return "aarch64-unknown-linux-musl";
+    case "darwin/arm64":
+      return "aarch64-apple-darwin";
     default:
       fail(`This package does not support ${process.platform}/${process.arch}.`);
   }

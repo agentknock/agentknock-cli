@@ -7,8 +7,18 @@
     { nixpkgs, ... }:
     let
       targets = {
-        aarch64-linux = "aarch64-unknown-linux-musl";
-        x86_64-linux = "x86_64-unknown-linux-musl";
+        aarch64-darwin = {
+          rust = "aarch64-apple-darwin";
+          static = false;
+        };
+        aarch64-linux = {
+          rust = "aarch64-unknown-linux-musl";
+          static = true;
+        };
+        x86_64-linux = {
+          rust = "x86_64-unknown-linux-musl";
+          static = true;
+        };
       };
       manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
       source = nixpkgs.lib.fileset.toSource {
@@ -24,9 +34,9 @@
         system: target:
         let
           pkgs = import nixpkgs { inherit system; };
-          staticPkgs = pkgs.pkgsStatic;
+          buildPkgs = if target.static then pkgs.pkgsStatic else pkgs;
 
-          agentknock = staticPkgs.rustPlatform.buildRustPackage {
+          agentknock = buildPkgs.rustPlatform.buildRustPackage {
             pname = "agentknock";
             inherit (manifest.package) version;
             src = source;
@@ -39,16 +49,15 @@
             doCheck = false;
 
             nativeBuildInputs = [
-              pkgs.binutils
               pkgs.cmake
               pkgs.perl
-            ];
+            ] ++ pkgs.lib.optional target.static pkgs.binutils;
 
             LC_ALL = "C";
             SOURCE_DATE_EPOCH = "1";
             TZ = "UTC";
 
-            postFixup = ''
+            postFixup = pkgs.lib.optionalString target.static ''
               if ${pkgs.binutils}/bin/readelf --program-headers "$out/bin/agentknock" \
                 | grep --quiet INTERP; then
                 echo "agentknock contains a dynamic interpreter" >&2
@@ -74,7 +83,7 @@
           };
 
           dist =
-            pkgs.runCommand "agentknock-${manifest.package.version}-${target}-dist"
+            pkgs.runCommand "agentknock-${manifest.package.version}-${target.rust}-dist"
               {
                 LC_ALL = "C";
                 SOURCE_DATE_EPOCH = "1";
@@ -86,7 +95,7 @@
                 ];
               }
               ''
-                archive="agentknock-${target}.tar.gz"
+                archive="agentknock-${target.rust}.tar.gz"
                 staging_dir=$(mktemp --directory)
 
                 install -D --mode=0755 ${agentknock}/bin/agentknock "$staging_dir/agentknock"
