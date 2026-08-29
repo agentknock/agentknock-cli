@@ -6,10 +6,11 @@ use std::{
     io::{self, Read as _},
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
+        fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
         unix::ffi::{OsStrExt as _, OsStringExt as _},
     },
     path::{Path, PathBuf},
+    process::ChildStdout,
     ptr,
 };
 
@@ -31,6 +32,26 @@ pub struct SelectedExecutable {
     #[cfg(target_os = "linux")]
     script_path: Option<PathBuf>,
     working_directory: String,
+}
+
+pub struct CommandEnvironment {
+    secret_use_output: SecretUseOutput,
+    additional: BTreeMap<OsString, OsString>,
+    removed: Vec<OsString>,
+}
+
+impl CommandEnvironment {
+    pub fn new(
+        secret_use_output: SecretUseOutput,
+        additional: BTreeMap<OsString, OsString>,
+        removed: Vec<OsString>,
+    ) -> Self {
+        Self {
+            secret_use_output,
+            additional,
+            removed,
+        }
+    }
 }
 
 pub struct SignalState {
@@ -158,9 +179,8 @@ impl SelectedExecutable {
     pub fn execute(
         self,
         arguments: &[String],
-        secret_use_output: SecretUseOutput,
-        additional_environment: BTreeMap<OsString, OsString>,
-        removed_environment: Vec<OsString>,
+        environment: CommandEnvironment,
+        stdin: Option<ChildStdout>,
         signal_state: &SignalState,
         blocked_signals: BlockedSignals,
     ) -> io::Result<()> {
@@ -168,16 +188,15 @@ impl SelectedExecutable {
         self.verify_path_identity()?;
         self.verify_hash()?;
         let arguments = c_arguments(&self.command, arguments)?;
-        let environment = c_environment(
-            secret_use_output,
-            additional_environment,
-            removed_environment,
-        )?;
+        let environment = c_environment(environment)?;
         if blocked_signals.interrupted()? {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "SIGINT or SIGTERM was received after approval",
             ));
+        }
+        if let Some(stdin) = stdin {
+            install_standard_input(stdin)?;
         }
         signal_state.restore_for_exec(blocked_signals)?;
 
@@ -277,6 +296,25 @@ impl SelectedExecutable {
             )
         })
     }
+}
+
+fn install_standard_input(stdin: ChildStdout) -> io::Result<()> {
+    let source = stdin.into_raw_fd();
+    if source == libc::STDIN_FILENO {
+        return Ok(());
+    }
+    // SAFETY: source is an owned, live pipe descriptor and dup2 atomically
+    // replaces the process's standard-input descriptor.
+    if unsafe { libc::dup2(source, libc::STDIN_FILENO) } == -1 {
+        let error = io::Error::last_os_error();
+        // SAFETY: ownership of source was transferred from stdin above.
+        let _ = unsafe { libc::close(source) };
+        return Err(error);
+    }
+    // SAFETY: dup2 copied source to standard input, and ownership of source was
+    // transferred from stdin above.
+    let _ = unsafe { libc::close(source) };
+    Ok(())
 }
 
 impl SignalState {
@@ -586,11 +624,12 @@ fn c_arguments(command: &str, arguments: &[String]) -> io::Result<Vec<CString>> 
         .collect()
 }
 
-fn c_environment(
-    secret_use_output: SecretUseOutput,
-    additional_environment: BTreeMap<OsString, OsString>,
-    removed_environment: Vec<OsString>,
-) -> io::Result<Vec<CString>> {
+fn c_environment(changes: CommandEnvironment) -> io::Result<Vec<CString>> {
+    let CommandEnvironment {
+        secret_use_output,
+        additional,
+        removed,
+    } = changes;
     let mut environment = env::vars_os().collect::<BTreeMap<_, _>>();
     for (name, value) in secret_use_output.into_environment() {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
@@ -607,8 +646,8 @@ fn c_environment(
         }
         environment.insert(OsString::from(name), OsString::from(value));
     }
-    environment.extend(additional_environment);
-    for name in removed_environment {
+    environment.extend(additional);
+    for name in removed {
         environment.remove(&name);
     }
 

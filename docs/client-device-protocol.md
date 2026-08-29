@@ -376,7 +376,22 @@ An `exec` request has this plaintext shape:
 ```json
 {
   "method": "Invocation",
-  "secrets": ["cloudflare", "github"],
+  "secrets": {
+    "cloudflare": {
+      "environment": {
+        "omit": ["CLOUDFLARE_ACCOUNT_ID"]
+      }
+    },
+    "github": {
+      "environment": {
+        "only": ["GH_HOST", "GH_TOKEN"],
+        "rename": {
+          "GH_HOST": "GITHUB_HOST"
+        },
+        "stdin": "GH_TOKEN"
+      }
+    }
+  },
   "reason": "Publish the release",
   "operation": {
     "type": "exec",
@@ -395,11 +410,34 @@ An `exec` request has this plaintext shape:
 }
 ```
 
-The `secrets` array is nonempty, sorted lexicographically, and contains no
-duplicates or empty names. The optional `reason` is untrusted text supplied by
-the client. The `invocation_token` is a fresh 32-byte random value. The device
-associates it with the request identifier and selected secrets for later
-operations belonging to this invocation.
+The `secrets` object is nonempty, and each member name is nonempty. Each member
+name identifies one requested secret, and its object configures delivery for
+that secret. An empty object requests the secret without modifying its normal
+delivery.
+
+For an environment secret, the optional `environment` object has these
+members:
+
+- `only` lists the stored variable names to return. When it is absent, all
+  variables are eligible.
+- `omit` lists stored variable names not to return. `only` and `omit` cannot
+  both be present for one secret.
+- `rename` maps stored variable names to the names that the client gives the
+  command. Renaming is client-side: the response continues to use stored
+  names.
+- `stdin` names one stored variable that the client sends to the command's
+  standard input instead of its environment. At most one requested secret can
+  specify `stdin`.
+
+Every present array is nonempty and contains unique names. A source named by
+`rename` or `stdin` must be selected by `only` when `only` is present, and it
+must not be in `omit`. A source cannot be both renamed and sent to standard
+input. Environment options are invalid for other secret types.
+
+The optional `reason` is untrusted text supplied by the client. The
+`invocation_token` is a fresh 32-byte random value. The device associates it
+with the request identifier and selected secrets for later operations
+belonging to this invocation.
 
 For an `exec` operation:
 
@@ -438,6 +476,9 @@ An approval response contains the requested secret contents:
       "description": "GitHub API access",
       "type": "environment",
       "variables": {
+        "GH_HOST": {
+          "value": "github.com"
+        },
         "GH_TOKEN": {
           "value": "secret value"
         }
@@ -452,11 +493,17 @@ An approval response contains the requested secret contents:
 }
 ```
 
-The `secrets` map contains exactly the names in the request. If more than one
-secret provides the same environment variable, every provided value must be
-identical. The client rejects the response and does not start the operation if
-either condition fails. A client invocation supports at most one SSH secret
-and rejects a response containing more than one.
+The `secrets` map contains exactly the names in the request. An environment
+secret contains exactly the variables selected by `only`, when present, and
+none named by `omit`. It contains every source named by `rename` or `stdin`.
+The client removes the `stdin` value from the command environment and applies
+`rename` to the remaining values. It sends the exact stdin value, without an
+added newline, and then closes the input stream.
+
+If more than one delivered value has the same final environment name, every
+value must be identical. The client rejects the response and does not start
+the operation if any of these conditions fail. A client invocation supports
+at most one SSH secret and rejects a response containing more than one.
 
 The approval completion omits secret contents:
 

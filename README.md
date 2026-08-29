@@ -214,6 +214,55 @@ return the secrets before it starts the command. If the request is still
 waiting after 30 seconds, Agentknock writes a progress update with the elapsed
 time to standard error every 30 seconds. Press Ctrl-C to cancel the request.
 
+#### Control environment-variable delivery
+
+By default, an environment secret provides all its variables under their
+stored names. Delivery controls name both the secret and its stored variable,
+so they remain unambiguous when a command uses multiple secrets.
+
+Use `--only-env` to select a subset, or `--omit-env` to exclude variables:
+
+```sh
+agentknock -s github \
+  --only-env github GH_TOKEN \
+  -- gh issue list
+
+agentknock -s development \
+  --omit-env development DEBUG_TOKEN \
+  -- ./run-development-server
+```
+
+Repeat either option for more variables. You cannot combine `--only-env` and
+`--omit-env` for the same secret.
+
+Use `--rename-env` to give a selected variable a different name in the command
+environment:
+
+```sh
+agentknock -s github \
+  --only-env github GH_TOKEN \
+  --rename-env github GH_TOKEN GITHUB_TOKEN \
+  -- ./command-expecting-github-token
+```
+
+Use `--stdin` to send one stored variable to the command's standard input:
+
+```sh
+agentknock -s service-password \
+  --only-env service-password PASSWORD \
+  --stdin service-password PASSWORD \
+  -- ./command-reading-a-password
+```
+
+Agentknock sends the exact value without adding a newline, closes the input,
+and does not add that variable to the command environment. Other variables
+from the secret remain in the environment unless you restrict them with
+`--only-env`. One command can receive at most one value on standard input.
+
+Agentknock applies these controls separately to each secret before it combines
+their environment values. If multiple values have the same final name, their
+values must match.
+
 ### Use SSH keys
 
 An SSH secret keeps its private key on the paired device. Agentknock makes the

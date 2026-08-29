@@ -6,8 +6,7 @@ use std::{
     fs,
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
-    os::unix::fs::PermissionsExt as _,
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
     process::Child,
     process::{Command, Stdio},
@@ -950,7 +949,10 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &request);
         assert_eq!(plaintext["method"], "Invocation");
-        assert_eq!(plaintext["secrets"], json!(["cloudflare", "github"]));
+        assert_eq!(
+            plaintext["secrets"],
+            json!({"cloudflare": {}, "github": {}})
+        );
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
@@ -1079,6 +1081,154 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
             .lines()
             .any(|line| line == "AGENTKNOCK_EXEC_TEST=secret")
     );
+    assert_eq!(output.stderr, b"");
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selects_renames_omits_and_pipes_environment_values() {
+    let home = TestHome::active();
+    let device_private_key = home.device_private_key.clone();
+    let input_value = "x".repeat(128 * 1024);
+    let server_input_value = input_value.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let frame = receive_json(&mut socket).await;
+        let client_id = frame["client_id"].as_str().unwrap().to_owned();
+        let request_id = frame["request_id"].as_str().unwrap().to_owned();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, &request_id, &frame["payload"]);
+        assert_eq!(
+            plaintext["secrets"],
+            json!({
+                "cloudflare": {
+                    "environment": {
+                        "omit": ["CF_UNUSED"],
+                    },
+                },
+                "github": {
+                    "environment": {
+                        "only": ["GH_INPUT", "GH_TOKEN"],
+                        "rename": {"GH_TOKEN": "API_TOKEN"},
+                        "stdin": "GH_INPUT",
+                    },
+                },
+            })
+        );
+        assert_eq!(plaintext["operation"]["stdin"], "PIPE");
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "response",
+                "payload": encrypt_response(
+                    &context,
+                    &key,
+                    &json!({
+                        "result": "APPROVED",
+                        "secrets": {
+                            "cloudflare": {
+                                "description": null,
+                                "type": "environment",
+                                "variables": {
+                                    "CF_VISIBLE": {"value": "visible"},
+                                },
+                            },
+                            "github": {
+                                "description": null,
+                                "type": "environment",
+                                "variables": {
+                                    "GH_INPUT": {"value": server_input_value},
+                                    "GH_TOKEN": {"value": "renamed"},
+                                },
+                            },
+                        },
+                    }),
+                ),
+            }),
+        )
+        .await;
+
+        let response_ack = receive_json(&mut socket).await;
+        assert_eq!(response_ack["type"], "ack");
+        assert_eq!(response_ack["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        let completion_plaintext = open_completion(&mut context, &completion["payload"]);
+        assert_eq!(completion_plaintext["result"], "APPROVED");
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack",
+                "client_id": client_id,
+                "request_id": request_id,
+                "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args([
+            "-s",
+            "github",
+            "-s",
+            "cloudflare",
+            "--only-env",
+            "github",
+            "GH_TOKEN",
+            "--only-env",
+            "github",
+            "GH_INPUT",
+            "--rename-env",
+            "github",
+            "GH_TOKEN",
+            "API_TOKEN",
+            "--stdin",
+            "github",
+            "GH_INPUT",
+            "--omit-env",
+            "cloudflare",
+            "CF_UNUSED",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s|%s|' \"$API_TOKEN\" \"$CF_VISIBLE\"; test -z \"${GH_INPUT+x}\"; cat",
+        ]);
+    // SAFETY: the hook calls only the async-signal-safe close function before
+    // exec. This exercises delivery when descriptor zero is initially free.
+    unsafe {
+        command.pre_exec(|| {
+            let _ = libc::close(libc::STDIN_FILENO);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected_output = b"renamed|visible|".to_vec();
+    expected_output.extend_from_slice(input_value.as_bytes());
+    assert_eq!(output.stdout, expected_output);
     assert_eq!(output.stderr, b"");
     server.await.unwrap();
 }

@@ -28,8 +28,9 @@ pub use git_sign::{
 };
 pub use pairing::{PairingProgress, PairingRemoveError, PairingSas};
 pub use secret_use::{
-    DenialReason, ExecutableMode, RequestError, SecretUseInvocation, SecretUseOperation,
-    SecretUseOutput, SecretUseProgress, SecretUseRequest, SshSecretUse, StreamKind,
+    DenialReason, EnvironmentVariableOptions, ExecutableMode, RequestError, SecretUseInvocation,
+    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseProgress, SecretUseRequest,
+    SshSecretUse, StreamKind,
 };
 pub use secrets::{
     Secret, SecretListProgress, SecretUpload, SecretUploadError, SecretUploadMode,

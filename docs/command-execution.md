@@ -47,12 +47,13 @@ into a sandbox or privilege boundary.
 3. Send the invocation, selected secrets, and executable metadata to the
    device.
 4. Wait for an authenticated response and complete the protocol exchange.
-5. If the response contains an SSH secret, start an invocation service for
-   deferred SSH operations and add its agent socket and Git settings to the
-   command environment.
+5. If the response contains an SSH secret or a value selected for standard
+   input, start an invocation service. The service provides deferred SSH
+   operations, standard-input delivery, or both.
 6. Revalidate the selected executable, including its hash when available.
-7. Overlay returned environment variables and Agentknock's Git settings on the
-   inherited environment.
+7. Apply the requested environment-variable routing, then overlay the returned
+   environment variables and Agentknock's Git settings on the inherited
+   environment.
 8. Check for a pending termination signal.
 9. Replace the Agentknock process with the command.
 
@@ -107,6 +108,8 @@ The invocation request reports:
 - The connection type of standard input, output, and error.
 - A bounded chain of launcher executable paths.
 - The requested secret names and optional reason.
+- Environment-variable selection, omission, renaming, and standard-input
+  routing requested for each secret.
 
 Agentknock reports a standard stream as a terminal, null device, pipe, socket,
 regular file, or unknown connection. It reads launcher paths from the platform
@@ -132,23 +135,27 @@ After an authenticated response, Agentknock builds the command environment:
 
 1. Start with the complete inherited environment. Unrelated non-UTF-8 names
    and values remain byte-preserving operating-system strings.
-2. Overlay each environment variable returned by the device. A returned value
-   replaces an inherited value with the same name.
-3. Reject an empty returned name, a name containing `=` or NUL, or a value
+2. Verify that the response follows the selection and omission requested for
+   each secret.
+3. Remove the selected standard-input value, if any, and apply requested
+   renames to the remaining variables.
+4. Overlay each remaining environment variable. A returned value replaces an
+   inherited value with the same final name.
+5. Reject an empty returned name, a name containing `=` or NUL, or a value
    containing NUL.
-4. If an SSH secret enables deferred operations, add the Git configuration
+6. If an SSH secret enables deferred operations, add the Git configuration
    entries described below unless `--no-git-sign` is set. Unless
    `--no-ssh-agent` is set, replace `SSH_AUTH_SOCK` with an invocation-scoped
    agent. Unless SSH passthrough is disabled, that agent also routes requests
    to the previous agent.
-5. With `--no-ssh-agent`, remove `SSH_AUTH_SOCK` after applying all inherited
+7. With `--no-ssh-agent`, remove `SSH_AUTH_SOCK` after applying all inherited
    and returned environment variables.
-6. Produce at most one entry for each environment variable name.
+8. Produce at most one entry for each environment variable name.
 
-When multiple requested secrets provide the same environment variable, their
+When multiple delivered values have the same final environment name, their
 values must match exactly. Agentknock rejects conflicting values. It never
-prints or writes a returned value, although verbose output can list variable
-names.
+prints a returned value, although verbose output can list variable names and
+identify the value routed to standard input.
 
 Agentknock does not remove control variables such as `PATH`, `LD_PRELOAD`,
 `BASH_ENV`, `NODE_OPTIONS`, `PYTHONPATH`, or Git configuration. Unlike `sudo`,
@@ -261,19 +268,29 @@ be a different execution object and could change path behavior, file
 attributes, capabilities, signatures, or security-policy treatment. It would
 also leave interpreters and runtime dependencies unpinned.
 
-### Invocation service and SSH operations
+### Invocation service, standard input, and SSH operations
+
+When deferred SSH operations or standard-input delivery is needed, Agentknock
+starts a separate copy of its executable as an invocation service before
+replacing the launcher process. The launcher sends the service its startup
+data through a private pipe. This includes the invocation identifier, a fresh
+32-byte invocation token, the owner process ID, output settings, and the
+requested standard-input value or SSH information when applicable. It does
+not pass a live HPKE context to the service.
+
+For standard-input delivery, the service writes the exact UTF-8 value to a
+second pipe without adding a newline, then closes the pipe. The launcher
+replaces its standard-input descriptor with the read end immediately before
+process replacement. The value is not added to the command environment. A
+dedicated writer thread permits values larger than the operating system's pipe
+buffer without delaying service startup or SSH operations.
 
 An invocation response containing an SSH secret includes its name and public
-key, not its private key. When SSH-agent or Git-signing access is enabled,
-Agentknock starts a separate copy of its executable as an invocation service
-before replacing the launcher process. The launcher sends the service the
-invocation identifier, a fresh 32-byte invocation token, the SSH secret name
-and public key, the optional upstream SSH agent socket, the SSH passthrough
-policy, the owner process ID, and output settings through the service's
-standard input. It does not pass a live HPKE context to the service.
+key, not its private key.
 
-The service creates a mode-0700 temporary directory. Unless `--no-git-sign` is
-set, the directory contains `service.sock` and a helper executable.
+For SSH operations, the service creates a mode-0700 temporary directory.
+Unless `--no-git-sign` is set, the directory contains `service.sock` and a
+helper executable.
 `service.sock` is the private protocol used by the Git signing helper. The
 directory contains `agent.sock`, which implements the SSH agent protocol, when
 it is provided to the command or needed for Git signing passthrough. On Linux,

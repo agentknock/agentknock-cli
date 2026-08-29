@@ -44,8 +44,10 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
             "owner_pid": owner.0.id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "ssh_agent": true,
             "git_signing": true,
             "ssh_passthrough": true,
@@ -179,8 +181,10 @@ fn exposes_the_selected_key_through_ssh_auth_sock() {
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "upstream_agent_socket": BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
             "ssh_agent": true,
             "git_signing": true,
@@ -217,8 +221,10 @@ fn does_not_create_an_ssh_agent_when_unused() {
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "ssh_agent": false,
             "git_signing": true,
             "ssh_passthrough": false,
@@ -242,8 +248,10 @@ fn does_not_create_git_signing_endpoints_when_disabled() {
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "ssh_agent": true,
             "git_signing": false,
             "ssh_passthrough": true,
@@ -267,8 +275,10 @@ fn serves_agent_and_helper_connections_concurrently() {
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "ssh_agent": true,
             "git_signing": true,
             "ssh_passthrough": true,
@@ -313,8 +323,8 @@ fn reports_a_malformed_startup_request() {
         .unwrap()
         .write_all(b"not json")
         .unwrap();
-    let response: Value =
-        serde_json::from_reader(service.0.stdout.take().unwrap()).expect("startup error response");
+    let response = read_startup_response(&mut service.0.stdout.take().unwrap())
+        .expect("startup error response");
     assert_eq!(response["status"], "error");
     assert!(
         response["message"]
@@ -323,6 +333,73 @@ fn reports_a_malformed_startup_request() {
             .contains("invalid invocation service startup request")
     );
     assert!(!service.0.wait().unwrap().success());
+}
+
+#[test]
+fn streams_standard_input_without_an_ssh_runtime_directory() {
+    let mut service = ChildGuard(start_service());
+    serde_json::to_writer(
+        service.0.stdin.take().unwrap(),
+        &json!({
+            "owner_pid": std::process::id(),
+            "invocation_id": "01K00000000000000000000000",
+            "invocation_token": STARTUP,
+            "stdin": "exact input",
+            "ssh_agent": false,
+            "git_signing": false,
+            "ssh_passthrough": false,
+            "quiet": false,
+            "verbose": false,
+        }),
+    )
+    .unwrap();
+    let mut output = service.0.stdout.take().unwrap();
+    let response = read_startup_response(&mut output).unwrap();
+    assert_eq!(response, json!({"status": "ready"}));
+
+    let mut stdin = Vec::new();
+    output.read_to_end(&mut stdin).unwrap();
+    assert_eq!(stdin, b"exact input");
+}
+
+#[test]
+fn serves_ssh_while_streaming_large_standard_input() {
+    let expected = "x".repeat(1024 * 1024);
+    let mut service = ChildGuard(start_service());
+    serde_json::to_writer(
+        service.0.stdin.take().unwrap(),
+        &json!({
+            "owner_pid": std::process::id(),
+            "invocation_id": "01K00000000000000000000000",
+            "invocation_token": STARTUP,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
+            "stdin": expected,
+            "ssh_agent": true,
+            "git_signing": false,
+            "ssh_passthrough": false,
+            "quiet": false,
+            "verbose": false,
+        }),
+    )
+    .unwrap();
+    let mut output = service.0.stdout.take().unwrap();
+    let response = read_startup_response(&mut output).unwrap();
+    assert_eq!(response["status"], "ready", "{response}");
+
+    let agent_socket =
+        Path::new(response["runtime_directory"].as_str().unwrap()).join("agent.sock");
+    let mut agent = UnixStream::connect(agent_socket).unwrap();
+    agent
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(request_identities(&mut agent)[0], 12);
+
+    let mut stdin = String::new();
+    output.read_to_string(&mut stdin).unwrap();
+    assert_eq!(stdin, expected);
 }
 
 #[test]
@@ -372,8 +449,10 @@ fn checks_git_signing_key_passthrough(ssh_agent: bool, ssh_passthrough: bool) {
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "upstream_agent_socket": BASE64_STANDARD.encode(agent_socket.as_os_str().as_bytes()),
             "ssh_agent": ssh_agent,
             "git_signing": true,
@@ -469,8 +548,10 @@ fn start_ready_service(mut command: Command) -> (ChildGuard, PathBuf) {
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
-            "secret": "test-ssh",
-            "public_key": PUBLIC_KEY,
+            "ssh": {
+                "secret": "test-ssh",
+                "public_key": PUBLIC_KEY,
+            },
             "ssh_agent": true,
             "git_signing": true,
             "ssh_passthrough": true,
@@ -494,7 +575,19 @@ fn run(command: &mut Command) {
 
 fn send_startup(service: &mut Child, request: &Value) -> Value {
     serde_json::to_writer(service.stdin.take().unwrap(), request).unwrap();
-    serde_json::from_reader(service.stdout.take().unwrap()).expect("startup response")
+    read_startup_response(&mut service.stdout.take().unwrap()).expect("startup response")
+}
+
+fn read_startup_response(input: &mut impl std::io::Read) -> serde_json::Result<Value> {
+    let mut length = [0_u8; 4];
+    input
+        .read_exact(&mut length)
+        .map_err(serde_json::Error::io)?;
+    let mut encoded = vec![0_u8; u32::from_be_bytes(length) as usize];
+    input
+        .read_exact(&mut encoded)
+        .map_err(serde_json::Error::io)?;
+    serde_json::from_slice(&encoded)
 }
 
 fn wait_for_exit(process: &mut Child) {
