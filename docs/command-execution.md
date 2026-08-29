@@ -272,7 +272,12 @@ sockets and a symlink to `/proc/<service-pid>/exe`. `agent.sock` implements the
 SSH agent protocol. `service.sock` is the private protocol used by the Git
 signing helper. The symlink lets Git invoke the same Agentknock binary as its
 signing helper without installing another executable or adding a directory to
-`PATH`. The directory and its entries are removed when the service exits
+`PATH`. On Linux, Agentknock canonicalizes `XDG_RUNTIME_DIR` and uses it only
+when it identifies an absolute, mode-0700 directory owned by the effective
+user. Every ancestor must be owned by root or the effective user, and an
+ancestor writable by other users must have sticky-directory protection. If
+validation or directory creation fails, Agentknock uses the system temporary
+directory. The directory and its entries are removed when the service exits
 normally; an abrupt service failure can leave them behind.
 
 The launcher sets `SSH_AUTH_SOCK` to `agent.sock`, replacing any inherited or
