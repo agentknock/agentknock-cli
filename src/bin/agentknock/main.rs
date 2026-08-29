@@ -63,10 +63,10 @@ enum Command {
     /// standard input, output, and error are connected. If the response contains environment
     /// variables, Agentknock adds them to the command's environment. Returned values replace
     /// existing values with the same names. An Ed25519 or RSA SSH secret is available through a
-    /// temporary SSH agent for remote authentication. Keys from an existing SSH agent remain
-    /// available unless you use `--no-ssh-passthrough`. SSH secrets can sign Git commits and tags
-    /// when Git uses SSH signing. The device makes a separate decision for each use of the selected
-    /// key. Agentknock then replaces itself with the command.
+    /// temporary SSH agent for remote authentication unless you use `--no-ssh-agent`. Keys from an
+    /// existing SSH agent remain available unless you use `--no-ssh-passthrough`. SSH secrets can
+    /// sign Git commits and tags when Git uses SSH signing. The device makes a separate decision
+    /// for each use of the selected key. Agentknock then replaces itself with the command.
     ///
     /// Specify each secret with a separate `--secret` option. The `--` separator is required;
     /// Agentknock treats everything after it as the command and its arguments. Agentknock doesn't
@@ -158,6 +158,13 @@ struct ExecCommand {
     /// private key files or another explicitly configured SSH agent.
     #[arg(long)]
     no_ssh_passthrough: bool,
+
+    /// Do not provide an SSH agent to the command.
+    ///
+    /// Agentknock removes `SSH_AUTH_SOCK` instead of installing its temporary SSH agent. Git
+    /// signing with the selected SSH secret remains available.
+    #[arg(long)]
+    no_ssh_agent: bool,
 
     /// Suppress Agentknock status and command-launch messages.
     ///
@@ -381,6 +388,7 @@ enum Operation {
     Exec {
         secrets: BTreeSet<String>,
         reason: Option<String>,
+        ssh_agent: bool,
         ssh_passthrough: bool,
         command: Vec<String>,
     },
@@ -561,6 +569,7 @@ impl Cli {
                     Operation::Exec {
                         secrets: command.secrets.into_iter().collect(),
                         reason: command.reason,
+                        ssh_agent: !command.no_ssh_agent,
                         ssh_passthrough: !command.no_ssh_passthrough,
                         command: command.command,
                     },
@@ -684,6 +693,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
         Operation::Exec {
             secrets,
             reason,
+            ssh_agent,
             ssh_passthrough,
             command,
         } => {
@@ -729,6 +739,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                         secret_use_output.invocation(),
                         ssh,
                         upstream_agent_socket.as_deref(),
+                        ssh_agent,
                         ssh_passthrough,
                         output == OutputMode::Quiet,
                         output == OutputMode::Verbose,
@@ -746,6 +757,11 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                     .environment(git_config_count.as_deref())
                     .map_err(CommandError::ExecInvocationService)?,
                 None => BTreeMap::new(),
+            };
+            let removed_environment = if ssh_agent {
+                Vec::new()
+            } else {
+                vec![OsString::from("SSH_AUTH_SOCK")]
             };
             let blocked_signals = signal_state
                 .block_interrupts()
@@ -767,6 +783,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                     arguments,
                     secret_use_output,
                     additional_environment,
+                    removed_environment,
                     &signal_state,
                     blocked_signals,
                 )
@@ -2026,6 +2043,7 @@ mod tests {
             "--reason",
             "needed by the deployment agent",
             "--no-ssh-passthrough",
+            "--no-ssh-agent",
             "--",
             "sh",
             "-c",
@@ -2039,6 +2057,7 @@ mod tests {
                 Operation::Exec {
                     secrets: BTreeSet::from(["cf-wrangler".into(), "gh-token".into()]),
                     reason: Some("needed by the deployment agent".into()),
+                    ssh_agent: false,
                     ssh_passthrough: false,
                     command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
                         .map(String::from)
@@ -2059,6 +2078,7 @@ mod tests {
                 Operation::Exec {
                     secrets: BTreeSet::from(["github".into()]),
                     reason: None,
+                    ssh_agent: true,
                     ssh_passthrough: true,
                     command: vec!["true".into()],
                 },
@@ -2353,6 +2373,7 @@ mod tests {
                     "doesn't invoke a shell",
                     "Repeat this option",
                     "passing other SSH keys through",
+                    "Do not provide an SSH agent",
                     "doesn't suppress output from the command",
                 ],
             ),

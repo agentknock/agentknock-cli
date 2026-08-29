@@ -55,25 +55,66 @@ impl Drop for ChildGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticates_ssh_and_pushes_git_with_an_ed25519_secret() {
-    uses_an_ssh_secret("ed25519", &[], true, true).await;
+    uses_an_ssh_secret("ed25519", &[], SshCommandTest::GitPush).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticates_ssh_with_an_rsa_secret() {
-    uses_an_ssh_secret("rsa", &["-b", "3072"], false, true).await;
+    uses_an_ssh_secret(
+        "rsa",
+        &["-b", "3072"],
+        SshCommandTest::Authenticate {
+            ssh_agent: true,
+            ssh_passthrough: true,
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disables_ssh_key_passthrough() {
-    uses_an_ssh_secret("ed25519", &[], false, false).await;
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::Authenticate {
+            ssh_agent: true,
+            ssh_passthrough: false,
+        },
+    )
+    .await;
 }
 
-async fn uses_an_ssh_secret(
-    key_type: &str,
-    key_options: &[&str],
-    push_git: bool,
-    ssh_passthrough: bool,
-) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removes_the_ssh_agent_from_the_command() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::Authenticate {
+            ssh_agent: false,
+            ssh_passthrough: true,
+        },
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum SshCommandTest {
+    Authenticate {
+        ssh_agent: bool,
+        ssh_passthrough: bool,
+    },
+    GitPush,
+}
+
+async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshCommandTest) {
+    let push_git = matches!(test, SshCommandTest::GitPush);
+    let (ssh_agent, ssh_passthrough) = match test {
+        SshCommandTest::Authenticate {
+            ssh_agent,
+            ssh_passthrough,
+        } => (ssh_agent, ssh_passthrough),
+        SshCommandTest::GitPush => (true, true),
+    };
     let home = TestHome::active();
     let private_key = home.path().join("ssh-key");
     run(Command::new("ssh-keygen")
@@ -217,6 +258,10 @@ async fn uses_an_ssh_secret(
             .await;
             drop(socket);
 
+            if !ssh_agent {
+                continue;
+            }
+
             let (_, mut socket) = accept(&listener).await;
             let request = receive_json(&mut socket).await;
             let client_id = request["client_id"].as_str().unwrap().to_owned();
@@ -294,6 +339,9 @@ async fn uses_an_ssh_secret(
     if !ssh_passthrough {
         command.arg("--no-ssh-passthrough");
     }
+    if !ssh_agent {
+        command.arg("--no-ssh-agent");
+    }
     command.arg("--");
     if push_git {
         command
@@ -316,7 +364,8 @@ async fn uses_an_ssh_secret(
             .env(
                 "AGENTKNOCK_TEST_SSH_PASSTHROUGH",
                 ssh_passthrough.to_string(),
-            );
+            )
+            .env("AGENTKNOCK_TEST_SSH_AGENT", ssh_agent.to_string());
     }
     let output = command.output().unwrap();
     assert!(
@@ -398,20 +447,29 @@ async fn uses_an_ssh_secret(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ed25519_secret() {
-    signs_a_git_commit_with_an_ssh_secret("ed25519", &[]).await;
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_rsa_secret() {
-    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"]).await;
+    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"], true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ecdsa_secret() {
-    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"]).await;
+    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"], true).await;
 }
 
-async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&str]) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signs_a_git_commit_without_providing_an_ssh_agent() {
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], false).await;
+}
+
+async fn signs_a_git_commit_with_an_ssh_secret(
+    key_type: &str,
+    key_options: &[&str],
+    ssh_agent: bool,
+) {
     let home = TestHome::active();
     let repository = home.path().join("repository");
     let temporary_directory = home.path().join("temporary files");
@@ -630,11 +688,17 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
     })
     .await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
         .env("HOME", home.path())
         .env("TMPDIR", temporary_directory)
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "git-signing", "--", "git", "-C"])
+        .args(["exec", "-s", "git-signing"]);
+    if !ssh_agent {
+        command.arg("--no-ssh-agent");
+    }
+    let output = command
+        .args(["--", "git", "-C"])
         .arg(&repository)
         .args([
             "-c",
@@ -1285,6 +1349,12 @@ fn authenticates_with_configured_ssh_passthrough_probe() {
     let selected_key = std::env::var_os("AGENTKNOCK_TEST_SELECTED_KEY").unwrap();
     let upstream_key = std::env::var_os("AGENTKNOCK_TEST_UPSTREAM_KEY").unwrap();
     let ssh_passthrough = std::env::var("AGENTKNOCK_TEST_SSH_PASSTHROUGH").unwrap() == "true";
+    let ssh_agent = std::env::var("AGENTKNOCK_TEST_SSH_AGENT").unwrap() == "true";
+
+    if !ssh_agent {
+        assert!(std::env::var_os("SSH_AUTH_SOCK").is_none());
+        return;
+    }
 
     let authenticate = |key, expected| {
         Command::new("ssh")

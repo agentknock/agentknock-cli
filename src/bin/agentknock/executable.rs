@@ -160,6 +160,7 @@ impl SelectedExecutable {
         arguments: &[String],
         secret_use_output: SecretUseOutput,
         additional_environment: BTreeMap<OsString, OsString>,
+        removed_environment: Vec<OsString>,
         signal_state: &SignalState,
         blocked_signals: BlockedSignals,
     ) -> io::Result<()> {
@@ -167,7 +168,11 @@ impl SelectedExecutable {
         self.verify_path_identity()?;
         self.verify_hash()?;
         let arguments = c_arguments(&self.command, arguments)?;
-        let environment = c_environment(secret_use_output, additional_environment)?;
+        let environment = c_environment(
+            secret_use_output,
+            additional_environment,
+            removed_environment,
+        )?;
         if blocked_signals.interrupted()? {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -584,6 +589,7 @@ fn c_arguments(command: &str, arguments: &[String]) -> io::Result<Vec<CString>> 
 fn c_environment(
     secret_use_output: SecretUseOutput,
     additional_environment: BTreeMap<OsString, OsString>,
+    removed_environment: Vec<OsString>,
 ) -> io::Result<Vec<CString>> {
     let mut environment = env::vars_os().collect::<BTreeMap<_, _>>();
     for (name, value) in secret_use_output.into_environment() {
@@ -602,6 +608,9 @@ fn c_environment(
         environment.insert(OsString::from(name), OsString::from(value));
     }
     environment.extend(additional_environment);
+    for name in removed_environment {
+        environment.remove(&name);
+    }
 
     environment
         .into_iter()
