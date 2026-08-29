@@ -137,8 +137,9 @@ After an authenticated response, Agentknock builds the command environment:
 3. Reject an empty returned name, a name containing `=` or NUL, or a value
    containing NUL.
 4. If an SSH secret enables deferred operations, replace `SSH_AUTH_SOCK` with
-   an invocation-scoped agent that also routes requests to the previous agent,
-   and add the Git configuration entries described below.
+   an invocation-scoped agent, and add the Git configuration entries described
+   below. Unless SSH passthrough is disabled, the agent also routes requests to
+   the previous agent.
 5. Produce at most one entry for each environment variable name.
 
 When multiple requested secrets provide the same environment variable, their
@@ -263,9 +264,9 @@ An invocation response containing an SSH secret includes its name and public
 key, not its private key. Agentknock starts a separate copy of its executable
 as an invocation service before replacing the launcher process. The launcher
 sends the service the invocation identifier, a fresh 32-byte invocation token,
-the SSH secret name and public key, the upstream SSH agent socket, the owner
-process ID, and output settings through the service's standard input. It does
-not pass a live HPKE context to the service.
+the SSH secret name and public key, the optional upstream SSH agent socket, the
+SSH passthrough policy, the owner process ID, and output settings through the
+service's standard input. It does not pass a live HPKE context to the service.
 
 The service creates a mode-0700 temporary directory containing two Unix-domain
 sockets and a symlink to `/proc/<service-pid>/exe`. `agent.sock` implements the
@@ -285,6 +286,11 @@ device-returned value. The service uses that previous value as an optional
 upstream agent. For every client connection, it lazily opens one corresponding
 upstream connection and preserves it for the lifetime of the client
 connection.
+
+With `--no-ssh-passthrough`, the launcher does not give the previous socket to
+the service. The temporary agent does not expose identities from the previous
+agent. It continues to expose the selected Agentknock key when that key type
+supports SSH authentication.
 
 For a supported key, the agent lists the selected public key first, followed
 by identities reported by the upstream agent in their original order. It
@@ -344,11 +350,21 @@ index or worktree state. Failure to collect this context does not prevent
 signing. The service writes an approved SSHSIG response to the signature file
 expected by Git. Every signature receives a separate device decision.
 
-If Git requests another key or invokes the configured program for another
-operation, the helper replaces itself with `ssh-keygen` from `PATH` and passes
-the original arguments unchanged. The system command can use a key file
-directly. It also inherits `agent.sock`; requests for another agent key follow
-the same upstream routing as SSH authentication.
+By default, if Git requests another key or invokes the configured program for
+another operation, the helper replaces itself with `ssh-keygen` from `PATH`
+and passes the original arguments unchanged. The system command can use a key
+file directly. It also inherits `agent.sock`; requests for another agent key
+follow the same upstream routing as SSH authentication.
+
+With `--no-ssh-passthrough`, the helper rejects SSH signing with another key
+instead. It still delegates non-signing operations, such as signature
+verification, to the system `ssh-keygen`.
+
+This option controls only the agent and Git helper installed by Agentknock. It
+does not prevent the command from reading a private-key file, selecting another
+agent with `IdentityAgent`, replacing the injected Git configuration, or using
+a different signing system. Enforcing those restrictions would require an
+operating-system sandbox.
 
 The service opens a pidfd for the owner process, whose PID remains stable when
 the launcher replaces itself with the command. It exits when that process

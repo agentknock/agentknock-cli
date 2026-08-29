@@ -55,15 +55,25 @@ impl Drop for ChildGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticates_ssh_and_pushes_git_with_an_ed25519_secret() {
-    uses_an_ssh_secret("ed25519", &[], true).await;
+    uses_an_ssh_secret("ed25519", &[], true, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticates_ssh_with_an_rsa_secret() {
-    uses_an_ssh_secret("rsa", &["-b", "3072"], false).await;
+    uses_an_ssh_secret("rsa", &["-b", "3072"], false, true).await;
 }
 
-async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disables_ssh_key_passthrough() {
+    uses_an_ssh_secret("ed25519", &[], false, false).await;
+}
+
+async fn uses_an_ssh_secret(
+    key_type: &str,
+    key_options: &[&str],
+    push_git: bool,
+    ssh_passthrough: bool,
+) {
     let home = TestHome::active();
     let private_key = home.path().join("ssh-key");
     run(Command::new("ssh-keygen")
@@ -280,7 +290,11 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
         .env("SSH_AUTH_SOCK", &upstream_socket)
-        .args(["exec", "-s", "ssh-login", "--"]);
+        .args(["exec", "-s", "ssh-login"]);
+    if !ssh_passthrough {
+        command.arg("--no-ssh-passthrough");
+    }
+    command.arg("--");
     if push_git {
         command
             .arg("ssh")
@@ -292,13 +306,17 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool
             .arg(&probe)
             .args([
                 "--exact",
-                "authenticates_with_selected_and_upstream_keys_probe",
+                "authenticates_with_configured_ssh_passthrough_probe",
                 "--nocapture",
             ])
             .env("AGENTKNOCK_TEST_SSH_PORT", port.to_string())
             .env("AGENTKNOCK_TEST_SSH_USER", &user)
             .env("AGENTKNOCK_TEST_SELECTED_KEY", &public_key_path)
-            .env("AGENTKNOCK_TEST_UPSTREAM_KEY", &upstream_public_key_path);
+            .env("AGENTKNOCK_TEST_UPSTREAM_KEY", &upstream_public_key_path)
+            .env(
+                "AGENTKNOCK_TEST_SSH_PASSTHROUGH",
+                ssh_passthrough.to_string(),
+            );
     }
     let output = command.output().unwrap();
     assert!(
@@ -1258,7 +1276,7 @@ fn native_exec_probe() {
 }
 
 #[test]
-fn authenticates_with_selected_and_upstream_keys_probe() {
+fn authenticates_with_configured_ssh_passthrough_probe() {
     let Ok(port) = std::env::var("AGENTKNOCK_TEST_SSH_PORT") else {
         return;
     };
@@ -1266,25 +1284,30 @@ fn authenticates_with_selected_and_upstream_keys_probe() {
     let user = std::env::var("AGENTKNOCK_TEST_SSH_USER").unwrap();
     let selected_key = std::env::var_os("AGENTKNOCK_TEST_SELECTED_KEY").unwrap();
     let upstream_key = std::env::var_os("AGENTKNOCK_TEST_UPSTREAM_KEY").unwrap();
+    let ssh_passthrough = std::env::var("AGENTKNOCK_TEST_SSH_PASSTHROUGH").unwrap() == "true";
 
-    for (key, expected) in [
-        (selected_key, "selected-key"),
-        (upstream_key, "upstream-key"),
-    ] {
-        let output = Command::new("ssh")
+    let authenticate = |key, expected| {
+        Command::new("ssh")
             .args(ssh_options(port))
             .args(["-o", "IdentitiesOnly=yes", "-i"])
             .arg(key)
             .arg(format!("{user}@127.0.0.1"))
             .args(["printf", expected])
             .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            .unwrap()
+    };
+    let selected = authenticate(selected_key, "selected-key");
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert_eq!(String::from_utf8(selected.stdout).unwrap(), "selected-key");
+
+    let upstream = authenticate(upstream_key, "upstream-key");
+    assert_eq!(upstream.status.success(), ssh_passthrough);
+    if ssh_passthrough {
+        assert_eq!(String::from_utf8(upstream.stdout).unwrap(), "upstream-key");
     }
 }
 

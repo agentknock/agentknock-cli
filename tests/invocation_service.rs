@@ -46,6 +46,7 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
             "invocation_token": STARTUP,
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
+            "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
         }),
@@ -59,7 +60,7 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
 
     let mut unauthorized = UnixStream::connect(Path::new(runtime_directory).join("service.sock"))
         .expect("connect from a process outside the invocation");
-    if let Err(error) = unauthorized.write_all(br#"{"operation":"public_key"}"#) {
+    if let Err(error) = unauthorized.write_all(br#"{"operation":"configuration"}"#) {
         assert!(matches!(
             error.kind(),
             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
@@ -179,6 +180,7 @@ fn exposes_the_selected_key_through_ssh_auth_sock() {
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
             "upstream_agent_socket": BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
+            "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
         }),
@@ -213,6 +215,7 @@ fn serves_agent_and_helper_connections_concurrently() {
             "invocation_token": STARTUP,
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
+            "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
         }),
@@ -234,11 +237,14 @@ fn serves_agent_and_helper_connections_concurrently() {
     helper
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    helper.write_all(br#"{"operation":"public_key"}"#).unwrap();
+    helper
+        .write_all(br#"{"operation":"configuration"}"#)
+        .unwrap();
     helper.shutdown(std::net::Shutdown::Write).unwrap();
     let response: Value = serde_json::from_reader(helper).unwrap();
-    assert_eq!(response["status"], "public_key");
+    assert_eq!(response["status"], "configuration");
     assert_eq!(response["public_key"], PUBLIC_KEY);
+    assert_eq!(response["ssh_passthrough"], true);
 }
 
 #[test]
@@ -265,6 +271,15 @@ fn reports_a_malformed_startup_request() {
 
 #[test]
 fn uses_the_upstream_agent_for_another_git_signing_key() {
+    checks_git_signing_key_passthrough(true);
+}
+
+#[test]
+fn rejects_another_git_signing_key_when_passthrough_is_disabled() {
+    checks_git_signing_key_passthrough(false);
+}
+
+fn checks_git_signing_key_passthrough(ssh_passthrough: bool) {
     let directory = tempfile::tempdir().unwrap();
     let private_key = directory.path().join("signing-key");
     run(Command::new("ssh-keygen")
@@ -299,6 +314,7 @@ fn uses_the_upstream_agent_for_another_git_signing_key() {
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
             "upstream_agent_socket": BASE64_STANDARD.encode(agent_socket.as_os_str().as_bytes()),
+            "ssh_passthrough": ssh_passthrough,
             "quiet": false,
             "verbose": false,
         }),
@@ -315,32 +331,47 @@ fn uses_the_upstream_agent_for_another_git_signing_key() {
     assert!(identities.status.success());
     let identities = String::from_utf8(identities.stdout).unwrap();
     let identities = identities.lines().collect::<Vec<_>>();
-    assert_eq!(identities.len(), 2);
+    assert_eq!(identities.len(), if ssh_passthrough { 2 } else { 1 });
     assert_eq!(
         identities[0],
         PUBLIC_KEY.rsplit_once(' ').unwrap().0.to_owned() + " test-ssh"
     );
     let upstream_public_key = fs::read_to_string(&public_key).unwrap();
-    assert_eq!(
-        identities[1]
-            .split_ascii_whitespace()
-            .take(2)
-            .collect::<Vec<_>>(),
-        upstream_public_key
-            .split_ascii_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-    );
-    run(Command::new(helper)
+    if ssh_passthrough {
+        assert_eq!(
+            identities[1]
+                .split_ascii_whitespace()
+                .take(2)
+                .collect::<Vec<_>>(),
+            upstream_public_key
+                .split_ascii_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+        );
+    }
+    let output = Command::new(helper)
         .env("SSH_AUTH_SOCK", multiplexed_agent)
         .args(["-Y", "sign", "-n", "git", "-f"])
         .arg(&public_key)
         .arg("-U")
-        .arg(&message));
+        .arg(&message)
+        .output()
+        .unwrap();
 
     let mut signature = message.into_os_string();
     signature.push(".sig");
-    assert!(fs::exists(signature).unwrap());
+    if ssh_passthrough {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fs::exists(signature).unwrap());
+    } else {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("SSH passthrough is disabled"));
+        assert!(!fs::exists(signature).unwrap());
+    }
 }
 
 fn request_identities(connection: &mut UnixStream) -> Vec<u8> {
@@ -377,6 +408,7 @@ fn start_ready_service(mut command: Command) -> (ChildGuard, PathBuf) {
             "invocation_token": STARTUP,
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
+            "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
         }),

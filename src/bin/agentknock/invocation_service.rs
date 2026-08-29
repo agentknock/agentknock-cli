@@ -61,6 +61,7 @@ struct StartupRequest {
     public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upstream_agent_socket: Option<String>,
+    ssh_passthrough: bool,
     quiet: bool,
     verbose: bool,
 }
@@ -75,7 +76,7 @@ enum StartupResponse {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum HelperRequest {
-    PublicKey,
+    Configuration,
     Sign {
         public_key: String,
         message: String,
@@ -87,9 +88,16 @@ enum HelperRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum HelperResponse {
-    PublicKey { public_key: String },
-    Signature { signature: String },
-    Error { message: String },
+    Configuration {
+        public_key: String,
+        ssh_passthrough: bool,
+    },
+    Signature {
+        signature: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct ServiceContext {
@@ -100,6 +108,7 @@ struct ServiceContext {
     secret: String,
     public_key: String,
     upstream_agent_socket: Option<OsString>,
+    ssh_passthrough: bool,
     selected_identity: SelectedIdentity,
     quiet: bool,
     verbose: bool,
@@ -209,6 +218,7 @@ impl InvocationService {
         invocation: &SecretUseInvocation,
         ssh: &SshSecretUse,
         upstream_agent_socket: Option<&OsStr>,
+        ssh_passthrough: bool,
         quiet: bool,
         verbose: bool,
     ) -> io::Result<Self> {
@@ -229,6 +239,7 @@ impl InvocationService {
             invocation,
             ssh,
             upstream_agent_socket,
+            ssh_passthrough,
             quiet,
             verbose,
         ) {
@@ -313,6 +324,7 @@ fn initialize(
     invocation: &SecretUseInvocation,
     ssh: &SshSecretUse,
     upstream_agent_socket: Option<&OsStr>,
+    ssh_passthrough: bool,
     quiet: bool,
     verbose: bool,
 ) -> io::Result<PathBuf> {
@@ -326,6 +338,7 @@ fn initialize(
         upstream_agent_socket: upstream_agent_socket
             .map(OsStr::as_bytes)
             .map(|path| BASE64_STANDARD.encode(path)),
+        ssh_passthrough,
         quiet,
         verbose,
     };
@@ -361,20 +374,24 @@ fn prepare() -> io::Result<PreparedService> {
             "invocation token isn't 32 bytes",
         )
     })?;
-    let upstream_agent_socket = request
-        .upstream_agent_socket
-        .map(|socket| {
-            BASE64_STANDARD
-                .decode(socket)
-                .map(OsString::from_vec)
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid upstream SSH agent socket: {error}"),
-                    )
-                })
-        })
-        .transpose()?;
+    let upstream_agent_socket = if request.ssh_passthrough {
+        request
+            .upstream_agent_socket
+            .map(|socket| {
+                BASE64_STANDARD
+                    .decode(socket)
+                    .map(OsString::from_vec)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid upstream SSH agent socket: {error}"),
+                        )
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let owner = open_process(request.owner_pid)?;
     let runtime_directory = runtime_directory()?;
     let socket_path = runtime_directory.path().join(SOCKET_NAME);
@@ -421,6 +438,7 @@ fn prepare() -> io::Result<PreparedService> {
             secret: request.secret,
             public_key: request.public_key,
             upstream_agent_socket,
+            ssh_passthrough: request.ssh_passthrough,
             selected_identity,
             quiet: request.quiet,
             verbose: request.verbose,
@@ -584,8 +602,9 @@ async fn handle_connection(
         )
     })?;
     let response = match request {
-        HelperRequest::PublicKey => HelperResponse::PublicKey {
+        HelperRequest::Configuration => HelperResponse::Configuration {
             public_key: context.public_key.clone(),
+            ssh_passthrough: context.ssh_passthrough,
         },
         HelperRequest::Sign {
             public_key,
@@ -892,30 +911,33 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
     .ok_or_else(|| io::Error::other("Git signing helper has no runtime directory"))?;
 
     if arguments.len() == 1 {
-        let HelperResponse::PublicKey { public_key } =
-            call_service(runtime_directory, &HelperRequest::PublicKey)?
-        else {
-            return Err(io::Error::other(
-                "invocation service returned an unexpected public-key response",
-            ));
-        };
+        let (public_key, _) = helper_configuration(runtime_directory)?;
         println!("key::{public_key}");
         return Ok(());
     }
 
+    if !is_ssh_signing_operation(&arguments[1..]) {
+        return exec_ssh_keygen(runtime_directory, &arguments[1..]);
+    }
+    let (public_key, ssh_passthrough) = helper_configuration(runtime_directory)?;
     let signing = match parse_git_sign_arguments(&arguments[1..]) {
         Ok(signing) => signing,
+        Err(error) if !ssh_passthrough => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("SSH passthrough is disabled: {error}"),
+            ));
+        }
         Err(_) => return exec_ssh_keygen(runtime_directory, &arguments[1..]),
     };
     let requested_key = fs::read_to_string(&signing.key_file)?;
-    let HelperResponse::PublicKey { public_key } =
-        call_service(runtime_directory, &HelperRequest::PublicKey)?
-    else {
-        return Err(io::Error::other(
-            "invocation service returned an unexpected public-key response",
-        ));
-    };
     if !signing_key_matches(&requested_key, &public_key)? {
+        if !ssh_passthrough {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Git requested SSH signing with a key other than the selected Agentknock key, but SSH passthrough is disabled",
+            ));
+        }
         return exec_ssh_keygen(runtime_directory, &arguments[1..]);
     }
     let data = fs::read(&signing.data_file)?;
@@ -936,6 +958,24 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
     let mut signature_path = signing.data_file.as_os_str().to_owned();
     signature_path.push(".sig");
     fs::write(signature_path, signature)
+}
+
+fn is_ssh_signing_operation(arguments: &[OsString]) -> bool {
+    arguments.first().is_some_and(|argument| argument == "-Y")
+        && arguments.get(1).is_some_and(|argument| argument == "sign")
+}
+
+fn helper_configuration(runtime_directory: &Path) -> io::Result<(String, bool)> {
+    let HelperResponse::Configuration {
+        public_key,
+        ssh_passthrough,
+    } = call_service(runtime_directory, &HelperRequest::Configuration)?
+    else {
+        return Err(io::Error::other(
+            "invocation service returned an unexpected configuration response",
+        ));
+    };
+    Ok((public_key, ssh_passthrough))
 }
 
 struct GitSignArguments {
@@ -1117,6 +1157,16 @@ mod tests {
 
         assert!(parse_git_sign_arguments(&arguments("git")).is_ok());
         assert!(parse_git_sign_arguments(&arguments("file")).is_err());
+    }
+
+    #[test]
+    fn distinguishes_signing_from_other_ssh_keygen_operations() {
+        assert!(is_ssh_signing_operation(&[
+            "-Y".into(),
+            "sign".into(),
+            "message".into(),
+        ]));
+        assert!(!is_ssh_signing_operation(&["-Y".into(), "verify".into(),]));
     }
 
     #[test]
