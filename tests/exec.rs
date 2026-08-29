@@ -55,15 +55,89 @@ impl Drop for ChildGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticates_ssh_and_pushes_git_with_an_ed25519_secret() {
-    uses_an_ssh_secret("ed25519", &[], true).await;
+    uses_an_ssh_secret("ed25519", &[], SshCommandTest::GitPush).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticates_ssh_with_an_rsa_secret() {
-    uses_an_ssh_secret("rsa", &["-b", "3072"], false).await;
+    uses_an_ssh_secret(
+        "rsa",
+        &["-b", "3072"],
+        SshCommandTest::Authenticate {
+            ssh_passthrough: true,
+        },
+    )
+    .await;
 }
 
-async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disables_ssh_key_passthrough() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::Authenticate {
+            ssh_passthrough: false,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removes_the_ssh_agent_from_the_command() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::InspectEnvironment {
+            ssh_agent: false,
+            git_signing: true,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_not_provide_git_signing_when_disabled() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::InspectEnvironment {
+            ssh_agent: true,
+            git_signing: false,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disables_the_ssh_agent_and_git_signing_together() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::InspectEnvironment {
+            ssh_agent: false,
+            git_signing: false,
+        },
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum SshCommandTest {
+    Authenticate { ssh_passthrough: bool },
+    InspectEnvironment { ssh_agent: bool, git_signing: bool },
+    GitPush,
+}
+
+async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshCommandTest) {
+    let push_git = matches!(test, SshCommandTest::GitPush);
+    let (authenticate, ssh_agent, ssh_passthrough, git_signing) = match test {
+        SshCommandTest::Authenticate { ssh_passthrough } => (true, true, ssh_passthrough, true),
+        SshCommandTest::InspectEnvironment {
+            ssh_agent,
+            git_signing,
+        } => (false, ssh_agent, true, git_signing),
+        SshCommandTest::GitPush => (true, true, true, true),
+    };
     let home = TestHome::active();
     let private_key = home.path().join("ssh-key");
     run(Command::new("ssh-keygen")
@@ -207,6 +281,10 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool
             .await;
             drop(socket);
 
+            if !authenticate {
+                continue;
+            }
+
             let (_, mut socket) = accept(&listener).await;
             let request = receive_json(&mut socket).await;
             let client_id = request["client_id"].as_str().unwrap().to_owned();
@@ -280,7 +358,17 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
         .env("SSH_AUTH_SOCK", &upstream_socket)
-        .args(["exec", "-s", "ssh-login", "--"]);
+        .args(["exec", "-s", "ssh-login"]);
+    if !ssh_passthrough {
+        command.arg("--no-ssh-passthrough");
+    }
+    if !ssh_agent {
+        command.arg("--no-ssh-agent");
+    }
+    if !git_signing {
+        command.arg("--no-git-sign");
+    }
+    command.arg("--");
     if push_git {
         command
             .arg("ssh")
@@ -292,13 +380,23 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool
             .arg(&probe)
             .args([
                 "--exact",
-                "authenticates_with_selected_and_upstream_keys_probe",
+                "inspects_ssh_command_environment_probe",
                 "--nocapture",
             ])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "agentknock.test")
+            .env("GIT_CONFIG_VALUE_0", "sentinel")
             .env("AGENTKNOCK_TEST_SSH_PORT", port.to_string())
             .env("AGENTKNOCK_TEST_SSH_USER", &user)
             .env("AGENTKNOCK_TEST_SELECTED_KEY", &public_key_path)
-            .env("AGENTKNOCK_TEST_UPSTREAM_KEY", &upstream_public_key_path);
+            .env("AGENTKNOCK_TEST_UPSTREAM_KEY", &upstream_public_key_path)
+            .env(
+                "AGENTKNOCK_TEST_SSH_PASSTHROUGH",
+                ssh_passthrough.to_string(),
+            )
+            .env("AGENTKNOCK_TEST_SSH_AGENT", ssh_agent.to_string())
+            .env("AGENTKNOCK_TEST_GIT_SIGNING", git_signing.to_string())
+            .env("AGENTKNOCK_TEST_AUTHENTICATE", authenticate.to_string());
     }
     let output = command.output().unwrap();
     assert!(
@@ -380,20 +478,29 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ed25519_secret() {
-    signs_a_git_commit_with_an_ssh_secret("ed25519", &[]).await;
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_rsa_secret() {
-    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"]).await;
+    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"], true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ecdsa_secret() {
-    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"]).await;
+    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"], true).await;
 }
 
-async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&str]) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signs_a_git_commit_without_providing_an_ssh_agent() {
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], false).await;
+}
+
+async fn signs_a_git_commit_with_an_ssh_secret(
+    key_type: &str,
+    key_options: &[&str],
+    ssh_agent: bool,
+) {
     let home = TestHome::active();
     let repository = home.path().join("repository");
     let temporary_directory = home.path().join("temporary files");
@@ -612,11 +719,17 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
     })
     .await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
         .env("HOME", home.path())
         .env("TMPDIR", temporary_directory)
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "git-signing", "--", "git", "-C"])
+        .args(["exec", "-s", "git-signing"]);
+    if !ssh_agent {
+        command.arg("--no-ssh-agent");
+    }
+    let output = command
+        .args(["--", "git", "-C"])
         .arg(&repository)
         .args([
             "-c",
@@ -1258,7 +1371,7 @@ fn native_exec_probe() {
 }
 
 #[test]
-fn authenticates_with_selected_and_upstream_keys_probe() {
+fn inspects_ssh_command_environment_probe() {
     let Ok(port) = std::env::var("AGENTKNOCK_TEST_SSH_PORT") else {
         return;
     };
@@ -1266,25 +1379,48 @@ fn authenticates_with_selected_and_upstream_keys_probe() {
     let user = std::env::var("AGENTKNOCK_TEST_SSH_USER").unwrap();
     let selected_key = std::env::var_os("AGENTKNOCK_TEST_SELECTED_KEY").unwrap();
     let upstream_key = std::env::var_os("AGENTKNOCK_TEST_UPSTREAM_KEY").unwrap();
+    let ssh_passthrough = std::env::var("AGENTKNOCK_TEST_SSH_PASSTHROUGH").unwrap() == "true";
+    let ssh_agent = std::env::var("AGENTKNOCK_TEST_SSH_AGENT").unwrap() == "true";
+    let git_signing = std::env::var("AGENTKNOCK_TEST_GIT_SIGNING").unwrap() == "true";
+    let authenticate = std::env::var("AGENTKNOCK_TEST_AUTHENTICATE").unwrap() == "true";
 
-    for (key, expected) in [
-        (selected_key, "selected-key"),
-        (upstream_key, "upstream-key"),
-    ] {
-        let output = Command::new("ssh")
+    assert_eq!(std::env::var_os("SSH_AUTH_SOCK").is_some(), ssh_agent);
+    assert_eq!(
+        std::env::var("GIT_CONFIG_KEY_0").unwrap(),
+        "agentknock.test"
+    );
+    assert_eq!(
+        std::env::var("GIT_CONFIG_COUNT").unwrap(),
+        if git_signing { "3" } else { "1" }
+    );
+    assert_eq!(std::env::var_os("GIT_CONFIG_KEY_1").is_some(), git_signing);
+
+    if !authenticate {
+        return;
+    }
+
+    let authenticate = |key, expected| {
+        Command::new("ssh")
             .args(ssh_options(port))
             .args(["-o", "IdentitiesOnly=yes", "-i"])
             .arg(key)
             .arg(format!("{user}@127.0.0.1"))
             .args(["printf", expected])
             .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            .unwrap()
+    };
+    let selected = authenticate(selected_key, "selected-key");
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert_eq!(String::from_utf8(selected.stdout).unwrap(), "selected-key");
+
+    let upstream = authenticate(upstream_key, "upstream-key");
+    assert_eq!(upstream.status.success(), ssh_passthrough);
+    if ssh_passthrough {
+        assert_eq!(String::from_utf8(upstream.stdout).unwrap(), "upstream-key");
     }
 }
 

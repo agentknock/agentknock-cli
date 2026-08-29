@@ -61,6 +61,9 @@ struct StartupRequest {
     public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upstream_agent_socket: Option<String>,
+    ssh_agent: bool,
+    git_signing: bool,
+    ssh_passthrough: bool,
     quiet: bool,
     verbose: bool,
 }
@@ -75,7 +78,7 @@ enum StartupResponse {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum HelperRequest {
-    PublicKey,
+    Configuration,
     Sign {
         public_key: String,
         message: String,
@@ -87,9 +90,16 @@ enum HelperRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum HelperResponse {
-    PublicKey { public_key: String },
-    Signature { signature: String },
-    Error { message: String },
+    Configuration {
+        public_key: String,
+        ssh_passthrough: bool,
+    },
+    Signature {
+        signature: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct ServiceContext {
@@ -100,16 +110,26 @@ struct ServiceContext {
     secret: String,
     public_key: String,
     upstream_agent_socket: Option<OsString>,
+    ssh_passthrough: bool,
     selected_identity: SelectedIdentity,
     quiet: bool,
     verbose: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ServiceOptions {
+    pub(super) ssh_agent: bool,
+    pub(super) git_signing: bool,
+    pub(super) ssh_passthrough: bool,
+    pub(super) quiet: bool,
+    pub(super) verbose: bool,
+}
+
 struct PreparedService {
     owner: ProcessMonitor,
     _runtime_directory: tempfile::TempDir,
-    listener: tokio::net::UnixListener,
-    agent_listener: tokio::net::UnixListener,
+    listener: Option<tokio::net::UnixListener>,
+    agent_listener: Option<tokio::net::UnixListener>,
     runtime_directory: String,
     context: ServiceContext,
 }
@@ -131,6 +151,7 @@ pub struct InvocationService {
     _process: Child,
     runtime_directory: PathBuf,
     helper_name: &'static str,
+    options: ServiceOptions,
 }
 
 pub fn requested(arguments: &[OsString]) -> bool {
@@ -209,8 +230,7 @@ impl InvocationService {
         invocation: &SecretUseInvocation,
         ssh: &SshSecretUse,
         upstream_agent_socket: Option<&OsStr>,
-        quiet: bool,
-        verbose: bool,
+        options: ServiceOptions,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let executable = "/proc/self/exe";
@@ -229,17 +249,17 @@ impl InvocationService {
             invocation,
             ssh,
             upstream_agent_socket,
-            quiet,
-            verbose,
+            options,
         ) {
             Ok(runtime_directory) => Ok(Self {
                 _process: process,
                 runtime_directory,
-                helper_name: if quiet {
+                helper_name: if options.quiet {
                     QUIET_GIT_SIGN_HELPER_NAME
                 } else {
                     GIT_SIGN_HELPER_NAME
                 },
+                options,
             }),
             Err(error) => {
                 let _ = process.kill();
@@ -253,6 +273,19 @@ impl InvocationService {
         &self,
         existing_count: Option<&OsStr>,
     ) -> io::Result<BTreeMap<OsString, OsString>> {
+        let mut environment = BTreeMap::new();
+        if self.options.ssh_agent {
+            environment.insert(
+                "SSH_AUTH_SOCK".into(),
+                self.runtime_directory
+                    .join(crate::ssh_agent::SOCKET_NAME)
+                    .into_os_string(),
+            );
+        }
+        if !self.options.git_signing {
+            return Ok(environment);
+        }
+
         let helper = self.runtime_directory.join(self.helper_name);
         let helper = helper.to_str().ok_or_else(|| {
             io::Error::new(
@@ -283,13 +316,7 @@ impl InvocationService {
             .checked_add(2)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many Git settings"))?;
 
-        Ok(BTreeMap::from([
-            (
-                "SSH_AUTH_SOCK".into(),
-                self.runtime_directory
-                    .join(crate::ssh_agent::SOCKET_NAME)
-                    .into_os_string(),
-            ),
+        environment.extend([
             ("GIT_CONFIG_COUNT".into(), final_count.to_string().into()),
             (
                 format!("GIT_CONFIG_KEY_{count}").into(),
@@ -304,7 +331,8 @@ impl InvocationService {
                 format!("GIT_CONFIG_VALUE_{}", count + 1).into(),
                 default_key_command.into(),
             ),
-        ]))
+        ]);
+        Ok(environment)
     }
 }
 
@@ -313,8 +341,7 @@ fn initialize(
     invocation: &SecretUseInvocation,
     ssh: &SshSecretUse,
     upstream_agent_socket: Option<&OsStr>,
-    quiet: bool,
-    verbose: bool,
+    options: ServiceOptions,
 ) -> io::Result<PathBuf> {
     let request = StartupRequest {
         // SAFETY: getpid has no preconditions.
@@ -326,8 +353,11 @@ fn initialize(
         upstream_agent_socket: upstream_agent_socket
             .map(OsStr::as_bytes)
             .map(|path| BASE64_STANDARD.encode(path)),
-        quiet,
-        verbose,
+        ssh_agent: options.ssh_agent,
+        git_signing: options.git_signing,
+        ssh_passthrough: options.ssh_passthrough,
+        quiet: options.quiet,
+        verbose: options.verbose,
     };
     let mut input = process
         .stdin
@@ -361,36 +391,50 @@ fn prepare() -> io::Result<PreparedService> {
             "invocation token isn't 32 bytes",
         )
     })?;
-    let upstream_agent_socket = request
-        .upstream_agent_socket
-        .map(|socket| {
-            BASE64_STANDARD
-                .decode(socket)
-                .map(OsString::from_vec)
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid upstream SSH agent socket: {error}"),
-                    )
-                })
-        })
-        .transpose()?;
+    let upstream_agent_socket = if request.ssh_passthrough {
+        request
+            .upstream_agent_socket
+            .map(|socket| {
+                BASE64_STANDARD
+                    .decode(socket)
+                    .map(OsString::from_vec)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid upstream SSH agent socket: {error}"),
+                        )
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let owner = open_process(request.owner_pid)?;
     let runtime_directory = runtime_directory()?;
-    let socket_path = runtime_directory.path().join(SOCKET_NAME);
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
-    listener.set_nonblocking(true)?;
-    let listener = tokio::net::UnixListener::from_std(listener)?;
-    let agent_socket_path = runtime_directory.path().join(crate::ssh_agent::SOCKET_NAME);
-    let agent_listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
-    agent_listener.set_nonblocking(true)?;
-    let agent_listener = tokio::net::UnixListener::from_std(agent_listener)?;
-    let helper_path = runtime_directory.path().join(if request.quiet {
-        QUIET_GIT_SIGN_HELPER_NAME
+    let listener = if request.git_signing {
+        let socket_path = runtime_directory.path().join(SOCKET_NAME);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+        Some(tokio::net::UnixListener::from_std(listener)?)
     } else {
-        GIT_SIGN_HELPER_NAME
-    });
-    install_helper(&helper_path)?;
+        None
+    };
+    let agent_listener = if request.ssh_agent || upstream_agent_socket.is_some() {
+        let agent_socket_path = runtime_directory.path().join(crate::ssh_agent::SOCKET_NAME);
+        let listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
+        listener.set_nonblocking(true)?;
+        Some(tokio::net::UnixListener::from_std(listener)?)
+    } else {
+        None
+    };
+    if request.git_signing {
+        let helper_path = runtime_directory.path().join(if request.quiet {
+            QUIET_GIT_SIGN_HELPER_NAME
+        } else {
+            GIT_SIGN_HELPER_NAME
+        });
+        install_helper(&helper_path)?;
+    }
     let path = runtime_directory
         .path()
         .to_str()
@@ -421,6 +465,7 @@ fn prepare() -> io::Result<PreparedService> {
             secret: request.secret,
             public_key: request.public_key,
             upstream_agent_socket,
+            ssh_passthrough: request.ssh_passthrough,
             selected_identity,
             quiet: request.quiet,
             verbose: request.verbose,
@@ -500,8 +545,8 @@ async fn serve(service: PreparedService) -> io::Result<()> {
             Agent(tokio::net::UnixStream),
         }
         let connection = tokio::select! {
-            result = listener.accept() => Some(Connection::Helper(result?.0)),
-            result = agent_listener.accept() => Some(Connection::Agent(result?.0)),
+            result = accept_optional(&listener) => Some(Connection::Helper(result?)),
+            result = accept_optional(&agent_listener) => Some(Connection::Agent(result?)),
             Some(()) = connections.next(), if !connections.is_empty() => None,
             result = wait_for_process(&owner) => return result,
         };
@@ -521,6 +566,15 @@ async fn serve(service: PreparedService) -> io::Result<()> {
             .boxed_local(),
         };
         connections.push(handler);
+    }
+}
+
+async fn accept_optional(
+    listener: &Option<tokio::net::UnixListener>,
+) -> io::Result<tokio::net::UnixStream> {
+    match listener {
+        Some(listener) => Ok(listener.accept().await?.0),
+        None => std::future::pending().await,
     }
 }
 
@@ -584,8 +638,9 @@ async fn handle_connection(
         )
     })?;
     let response = match request {
-        HelperRequest::PublicKey => HelperResponse::PublicKey {
+        HelperRequest::Configuration => HelperResponse::Configuration {
             public_key: context.public_key.clone(),
+            ssh_passthrough: context.ssh_passthrough,
         },
         HelperRequest::Sign {
             public_key,
@@ -892,30 +947,33 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
     .ok_or_else(|| io::Error::other("Git signing helper has no runtime directory"))?;
 
     if arguments.len() == 1 {
-        let HelperResponse::PublicKey { public_key } =
-            call_service(runtime_directory, &HelperRequest::PublicKey)?
-        else {
-            return Err(io::Error::other(
-                "invocation service returned an unexpected public-key response",
-            ));
-        };
+        let (public_key, _) = helper_configuration(runtime_directory)?;
         println!("key::{public_key}");
         return Ok(());
     }
 
+    if !is_ssh_signing_operation(&arguments[1..]) {
+        return exec_ssh_keygen(runtime_directory, &arguments[1..]);
+    }
+    let (public_key, ssh_passthrough) = helper_configuration(runtime_directory)?;
     let signing = match parse_git_sign_arguments(&arguments[1..]) {
         Ok(signing) => signing,
+        Err(error) if !ssh_passthrough => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("SSH passthrough is disabled: {error}"),
+            ));
+        }
         Err(_) => return exec_ssh_keygen(runtime_directory, &arguments[1..]),
     };
     let requested_key = fs::read_to_string(&signing.key_file)?;
-    let HelperResponse::PublicKey { public_key } =
-        call_service(runtime_directory, &HelperRequest::PublicKey)?
-    else {
-        return Err(io::Error::other(
-            "invocation service returned an unexpected public-key response",
-        ));
-    };
     if !signing_key_matches(&requested_key, &public_key)? {
+        if !ssh_passthrough {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Git requested SSH signing with a key other than the selected Agentknock key, but SSH passthrough is disabled",
+            ));
+        }
         return exec_ssh_keygen(runtime_directory, &arguments[1..]);
     }
     let data = fs::read(&signing.data_file)?;
@@ -936,6 +994,24 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
     let mut signature_path = signing.data_file.as_os_str().to_owned();
     signature_path.push(".sig");
     fs::write(signature_path, signature)
+}
+
+fn is_ssh_signing_operation(arguments: &[OsString]) -> bool {
+    arguments.first().is_some_and(|argument| argument == "-Y")
+        && arguments.get(1).is_some_and(|argument| argument == "sign")
+}
+
+fn helper_configuration(runtime_directory: &Path) -> io::Result<(String, bool)> {
+    let HelperResponse::Configuration {
+        public_key,
+        ssh_passthrough,
+    } = call_service(runtime_directory, &HelperRequest::Configuration)?
+    else {
+        return Err(io::Error::other(
+            "invocation service returned an unexpected configuration response",
+        ));
+    };
+    Ok((public_key, ssh_passthrough))
 }
 
 struct GitSignArguments {
@@ -1117,6 +1193,16 @@ mod tests {
 
         assert!(parse_git_sign_arguments(&arguments("git")).is_ok());
         assert!(parse_git_sign_arguments(&arguments("file")).is_err());
+    }
+
+    #[test]
+    fn distinguishes_signing_from_other_ssh_keygen_operations() {
+        assert!(is_ssh_signing_operation(&[
+            "-Y".into(),
+            "sign".into(),
+            "message".into(),
+        ]));
+        assert!(!is_ssh_signing_operation(&["-Y".into(), "verify".into(),]));
     }
 
     #[test]

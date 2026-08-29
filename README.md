@@ -233,6 +233,20 @@ The command can select at most one SSH secret. Agentknock puts that key first
 in the temporary agent and then lists keys from any existing agent. Agentknock
 never sends the selected private key to the client or command.
 
+Use `--no-ssh-passthrough` when the temporary agent should not expose keys from
+the existing agent:
+
+```sh
+agentknock exec --no-ssh-passthrough -s production-ssh -- ssh example.com
+```
+
+This option also makes Git SSH signing fail if Git requests a different key.
+It does not prevent the command from using private-key files or another agent
+selected in SSH configuration.
+
+Use `--no-ssh-agent` when the command should receive no `SSH_AUTH_SOCK` at all.
+Agentknock Git signing remains available unless you also use `--no-git-sign`.
+
 An `IdentityAgent` setting in SSH configuration takes precedence over
 `SSH_AUTH_SOCK`. Set `IdentityAgent SSH_AUTH_SOCK` for a host that should use
 the Agentknock agent.
@@ -252,13 +266,17 @@ agentknock exec -s git-signing -- \
   git -c gpg.format=ssh commit -S -m "Describe the change"
 ```
 
+Use `--no-git-sign` when Agentknock should not provide Git signing. Agentknock
+then leaves the existing Git signing configuration unchanged; that
+configuration can still sign commits or tags independently.
+
 A command can select at most one SSH secret. If Git has no configured
 `user.signingKey`, Agentknock offers the selected SSH key as the default. If
 Git explicitly selects another key, signing proceeds through the ordinary
-`ssh-keygen` command. It can use a key file or a key from the existing SSH
-agent as usual. Agentknock does not change `gpg.format`, signing policy, or the
-configured signing key. Git signing can use SSH key types that Agentknock does
-not yet support for SSH authentication.
+`ssh-keygen` command unless you use `--no-ssh-passthrough`. It can use a key
+file or a key from the existing SSH agent as usual. Agentknock does not change
+`gpg.format`, signing policy, or the configured signing key. Git signing can
+use SSH key types that Agentknock does not yet support for SSH authentication.
 
 ### Use a network proxy
 
