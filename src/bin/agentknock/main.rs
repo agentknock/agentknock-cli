@@ -11,7 +11,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs,
     future::Future,
     io::{self, IsTerminal as _, Read as _},
@@ -35,22 +35,39 @@ use thiserror::Error;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LAUNCHER_DEPTH: usize = 4;
+const RUN_EXAMPLES: &str = concat!(
+    "Examples:\n",
+    "  Use one secret:\n",
+    "    agentknock -s github -- gh issue list\n\n",
+    "  Use the explicit command form:\n",
+    "    agentknock run -s github -- gh issue list\n\n",
+    "  Use multiple secrets and explain why:\n",
+    "    agentknock -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n",
+    "  Connect with an SSH secret:\n",
+    "    agentknock -s production-ssh -- ssh example.com\n\n",
+    "  Sign a Git commit with an SSH secret:\n",
+    "    agentknock -s git-signing -- git -c gpg.format=ssh commit -S -m \"Describe the change\"",
+);
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
     name = "agentknock",
     version,
     about = "Run commands with secrets, manage secrets, or pair with a device.",
-    long_about = "Pair this client with a device, run commands with selected secrets, list available secrets, and upload secrets for review on the device.\n\nBefore you use or manage secrets, run `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
+    long_about = "Pair this client with a device, run commands with selected secrets, list available secrets, and upload secrets for review on the device.\n\nTo run a command, put the run options directly after `agentknock`, followed by `--` and the command. You can also use the explicit `agentknock run` form.\n\nBefore you use or manage secrets, run `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
     max_term_width = 120,
     arg_required_else_help = true,
-    subcommand_required = true,
+    args_conflicts_with_subcommands = true,
     disable_help_subcommand = true,
-    propagate_version = true
+    propagate_version = true,
+    after_long_help = RUN_EXAMPLES
 )]
 struct Cli {
+    #[command(flatten)]
+    run: RunCommand,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -81,12 +98,10 @@ enum Command {
     /// reports progress and total elapsed time every 30 seconds unless you use `--quiet`.
     /// Interrupting Agentknock prevents the command from running.
     ///
-    /// You can use `agentknock x` as a shorter alias for `agentknock exec`.
-    #[command(
-        visible_alias = "x",
-        after_long_help = "Examples:\n  Use one secret:\n    agentknock exec -s github -- gh issue list\n\n  Use multiple secrets and explain why:\n    agentknock exec -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n  Connect with an SSH secret:\n    agentknock exec -s production-ssh -- ssh example.com\n\n  Sign a Git commit with an SSH secret:\n    agentknock exec -s git-signing -- git -c gpg.format=ssh commit -S -m \"Describe the change\""
-    )]
-    Exec(ExecCommand),
+    /// You can omit `run` and put its options directly after `agentknock`.
+    ///
+    #[command(after_long_help = RUN_EXAMPLES)]
+    Run(RunCommand),
 
     /// Pair this client with a device or remove its pairing.
     ///
@@ -126,7 +141,7 @@ enum Command {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
-struct ExecCommand {
+struct RunCommand {
     /// Name of a secret to use for the command.
     ///
     /// Repeat this option to use more than one secret. Each name must be unique. A secret name
@@ -393,7 +408,7 @@ struct EnvironmentSecretInput {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
-    Exec {
+    Run {
         secrets: BTreeSet<String>,
         git_signing: bool,
         reason: Option<String>,
@@ -428,12 +443,12 @@ enum PairingOperation {
 
 #[derive(Debug)]
 enum CommandError {
-    ExecRequest(RequestError),
-    ExecSelection { program: String, source: io::Error },
-    ExecInvocationService(io::Error),
-    ExecSignal(io::Error),
-    ExecInterrupted,
-    ExecProcess { program: String, source: io::Error },
+    RunRequest(RequestError),
+    RunSelection { program: String, source: io::Error },
+    RunInvocationService(io::Error),
+    RunSignal(io::Error),
+    RunInterrupted,
+    RunProcess { program: String, source: io::Error },
     StartPairing(RequestError),
     PairingStatus(ConfigurationError),
     FinishPairing(RequestError),
@@ -559,8 +574,10 @@ fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
 
 impl Cli {
     fn duplicate_secret(&self) -> Option<&str> {
-        let Command::Exec(command) = &self.command else {
-            return None;
+        let command = match &self.command {
+            None => &self.run,
+            Some(Command::Run(command)) => command,
+            Some(Command::Pairing { .. } | Command::Secret { .. }) => return None,
         };
         let mut seen = BTreeSet::new();
         command
@@ -572,46 +589,57 @@ impl Cli {
 
     fn into_operation(self) -> (Operation, OutputMode) {
         match self.command {
-            Command::Exec(command) => {
-                let output = command.output_mode();
-                (
-                    Operation::Exec {
-                        secrets: command.secrets.into_iter().collect(),
-                        git_signing: !command.no_git_sign,
-                        reason: command.reason,
-                        ssh_agent: !command.no_ssh_agent,
-                        ssh_passthrough: !command.no_ssh_passthrough,
-                        command: command.command,
-                    },
-                    output,
-                )
-            }
-            Command::Pairing {
+            None => self.run.into_operation(),
+            Some(command) => command.into_operation(),
+        }
+    }
+}
+
+impl Command {
+    fn into_operation(self) -> (Operation, OutputMode) {
+        match self {
+            Self::Run(command) => command.into_operation(),
+            Self::Pairing {
                 command: PairingCommand::Start { address },
             } => (Operation::StartPairing(address), OutputMode::Normal),
-            Command::Pairing {
+            Self::Pairing {
                 command: PairingCommand::Status,
             } => (Operation::ShowPairingStatus, OutputMode::Normal),
-            Command::Pairing {
+            Self::Pairing {
                 command: PairingCommand::Finish,
             } => (Operation::FinishPairing, OutputMode::Normal),
-            Command::Pairing {
+            Self::Pairing {
                 command: PairingCommand::Abort,
             } => (Operation::AbortPairing, OutputMode::Normal),
-            Command::Pairing {
+            Self::Pairing {
                 command: PairingCommand::Remove { force },
             } => (Operation::RemovePairing { force }, OutputMode::Normal),
-            Command::Secret {
+            Self::Secret {
                 command: SecretCommand::List,
             } => (Operation::ListSecrets, OutputMode::Normal),
-            Command::Secret {
+            Self::Secret {
                 command: SecretCommand::Upload(command),
             } => (Operation::UploadSecret(command), OutputMode::Normal),
         }
     }
 }
 
-impl ExecCommand {
+impl RunCommand {
+    fn into_operation(self) -> (Operation, OutputMode) {
+        let output = self.output_mode();
+        (
+            Operation::Run {
+                secrets: self.secrets.into_iter().collect(),
+                git_signing: !self.no_git_sign,
+                reason: self.reason,
+                ssh_agent: !self.no_ssh_agent,
+                ssh_passthrough: !self.no_ssh_passthrough,
+                command: self.command,
+            },
+            output,
+        )
+    }
+
     fn output_mode(&self) -> OutputMode {
         if self.quiet {
             OutputMode::Quiet
@@ -623,42 +651,12 @@ impl ExecCommand {
     }
 }
 
-fn exec_is_missing_separator(arguments: &[OsString]) -> bool {
-    let Some(command) = arguments.get(1).and_then(|argument| argument.to_str()) else {
-        return false;
-    };
-    if command != "exec" && command != "x" {
-        return false;
-    }
-
-    let arguments = &arguments[2..];
-    !arguments
-        .iter()
-        .any(|argument| argument == OsStr::new("--"))
-        && !arguments.iter().any(|argument| {
-            matches!(
-                argument.to_str(),
-                Some("-h" | "--help" | "-V" | "--version")
-            )
-        })
-}
-
-fn print_missing_exec_separator() {
-    print_exec_usage_error("add `--` before the command to run");
-}
-
 fn print_duplicate_secret(secret: &str) {
-    print_exec_usage_error(format_args!(
-        "secret {secret:?} was specified more than once"
-    ));
-}
-
-fn print_exec_usage_error(message: impl std::fmt::Display) {
-    eprintln!("error: {message}");
+    eprintln!("error: secret {secret:?} was specified more than once");
     eprintln!();
-    eprintln!("Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...");
+    eprintln!("Usage: agentknock [run] -s <SECRET> [-s <SECRET> ...] -- <COMMAND> [ARGUMENT]...");
     eprintln!();
-    eprintln!("For more information, run 'agentknock exec --help'.");
+    eprintln!("For more information, run 'agentknock run --help'.");
 }
 
 fn main() -> ExitCode {
@@ -674,11 +672,6 @@ fn main() -> ExitCode {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
-    if exec_is_missing_separator(&arguments) {
-        print_missing_exec_separator();
-        return ExitCode::from(2);
-    }
-
     let cli = Cli::parse_from(arguments);
     if let Some(secret) = cli.duplicate_secret() {
         print_duplicate_secret(secret);
@@ -700,7 +693,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
         env!("CARGO_PKG_VERSION"),
     ));
     match operation {
-        Operation::Exec {
+        Operation::Run {
             secrets,
             git_signing,
             reason,
@@ -710,12 +703,12 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
         } => {
             let (program, arguments) = command.split_first().expect("command is required");
             let selected = SelectedExecutable::select(program).map_err(|source| {
-                CommandError::ExecSelection {
+                CommandError::RunSelection {
                     program: program.clone(),
                     source,
                 }
             })?;
-            let signal_state = SignalState::capture().map_err(CommandError::ExecSignal)?;
+            let signal_state = SignalState::capture().map_err(CommandError::RunSignal)?;
             let launcher_chain = launcher_chain();
             let request = SecretUseRequest {
                 secrets: &secrets,
@@ -733,9 +726,9 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 reason: reason.as_deref(),
                 launcher_chain: &launcher_chain,
             };
-            let mut signals = CommandSignals::new().map_err(CommandError::ExecSignal)?;
+            let mut signals = CommandSignals::new().map_err(CommandError::RunSignal)?;
             let secret_use_output =
-                request_exec_secrets(&client, request, output, &mut signals).await?;
+                request_run_secrets(&client, request, output, &mut signals).await?;
             let upstream_agent_socket = if ssh_passthrough && (ssh_agent || git_signing) {
                 secret_use_output
                     .environment_variable("SSH_AUTH_SOCK")
@@ -759,7 +752,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                             verbose: output == OutputMode::Verbose,
                         },
                     )
-                    .map_err(CommandError::ExecInvocationService)?,
+                    .map_err(CommandError::RunInvocationService)?,
                 ),
                 None => None,
             };
@@ -770,7 +763,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             let additional_environment = match &invocation_service {
                 Some(service) => service
                     .environment(git_config_count.as_deref())
-                    .map_err(CommandError::ExecInvocationService)?,
+                    .map_err(CommandError::RunInvocationService)?,
                 None => BTreeMap::new(),
             };
             let removed_environment = if ssh_agent {
@@ -780,13 +773,13 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             };
             let blocked_signals = signal_state
                 .block_interrupts()
-                .map_err(CommandError::ExecSignal)?;
+                .map_err(CommandError::RunSignal)?;
             if signals.received()
                 || blocked_signals
                     .interrupted()
-                    .map_err(CommandError::ExecSignal)?
+                    .map_err(CommandError::RunSignal)?
             {
-                return Err(CommandError::ExecInterrupted);
+                return Err(CommandError::RunInterrupted);
             }
             if output == OutputMode::Verbose {
                 print_received_secrets(&secret_use_output);
@@ -804,9 +797,9 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 )
                 .map_err(|source| {
                     if source.kind() == io::ErrorKind::Interrupted {
-                        CommandError::ExecInterrupted
+                        CommandError::RunInterrupted
                     } else {
-                        CommandError::ExecProcess { program, source }
+                        CommandError::RunProcess { program, source }
                     }
                 })?;
         }
@@ -1236,7 +1229,7 @@ impl CommandSignals {
     }
 }
 
-async fn request_exec_secrets(
+async fn request_run_secrets(
     client: &Client,
     request: SecretUseRequest<'_>,
     output: OutputMode,
@@ -1260,7 +1253,7 @@ async fn request_exec_secrets(
     loop {
         tokio::select! {
             biased;
-            result = request.as_mut() => return result.map_err(CommandError::ExecRequest),
+            result = request.as_mut() => return result.map_err(CommandError::RunRequest),
             _ = heartbeat.as_mut(), if output != OutputMode::Quiet => {
                 if let Some(progress) = current_progress.get() {
                     print_message(progress_report(progress_message(progress), started.elapsed()));
@@ -1301,10 +1294,10 @@ fn print_pairing_status(status: PairingStatus) {
 
 fn print_command_error(error: &CommandError, output: OutputMode) {
     match error {
-        CommandError::ExecRequest(error) if output != OutputMode::Quiet => {
-            print_exec_request_error(error);
+        CommandError::RunRequest(error) if output != OutputMode::Quiet => {
+            print_run_request_error(error);
         }
-        CommandError::ExecSelection { program, source } if output != OutputMode::Quiet => {
+        CommandError::RunSelection { program, source } if output != OutputMode::Quiet => {
             match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message(format_args!("Command {program:?} wasn't found."));
@@ -1331,24 +1324,24 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                 _ => {}
             }
         }
-        CommandError::ExecSignal(source) if output != OutputMode::Quiet => {
+        CommandError::RunSignal(source) if output != OutputMode::Quiet => {
             print_message(format_args!(
                 "Agentknock couldn't configure signal handling: {source}."
             ));
             print_message("The command didn't run.");
         }
-        CommandError::ExecInvocationService(source) if output != OutputMode::Quiet => {
+        CommandError::RunInvocationService(source) if output != OutputMode::Quiet => {
             print_message(format_args!(
                 "Agentknock couldn't prepare SSH access for the command: {source}."
             ));
             print_message("The command didn't run.");
         }
-        CommandError::ExecInterrupted if output != OutputMode::Quiet => {
+        CommandError::RunInterrupted if output != OutputMode::Quiet => {
             print_message(
                 "Agentknock received an interrupt or termination signal. The command didn't run.",
             );
         }
-        CommandError::ExecProcess { program, source } if output != OutputMode::Quiet => {
+        CommandError::RunProcess { program, source } if output != OutputMode::Quiet => {
             print_message(format_args!(
                 "The device approved the request, but Agentknock couldn't run command {program:?}: {source}."
             ));
@@ -1364,12 +1357,12 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                 _ => {}
             }
         }
-        CommandError::ExecRequest(_)
-        | CommandError::ExecSelection { .. }
-        | CommandError::ExecInvocationService(_)
-        | CommandError::ExecSignal(_)
-        | CommandError::ExecInterrupted
-        | CommandError::ExecProcess { .. } => {}
+        CommandError::RunRequest(_)
+        | CommandError::RunSelection { .. }
+        | CommandError::RunInvocationService(_)
+        | CommandError::RunSignal(_)
+        | CommandError::RunInterrupted
+        | CommandError::RunProcess { .. } => {}
         CommandError::StartPairing(error) => print_start_pairing_error(error),
         CommandError::PairingStatus(error) => print_pairing_status_error(error),
         CommandError::FinishPairing(error) => print_finish_pairing_error(error),
@@ -1514,9 +1507,9 @@ fn print_list_error(error: &RequestError) {
     }
 }
 
-fn print_exec_request_error(error: &RequestError) {
+fn print_run_request_error(error: &RequestError) {
     match error {
-        RequestError::Configuration(error) => print_exec_configuration_error(error),
+        RequestError::Configuration(error) => print_run_configuration_error(error),
         RequestError::Denied {
             reason: DenialReason::UserDenied,
             message,
@@ -1602,7 +1595,7 @@ fn print_exec_request_error(error: &RequestError) {
     }
 }
 
-fn print_exec_configuration_error(error: &ConfigurationError) {
+fn print_run_configuration_error(error: &ConfigurationError) {
     match error {
         ConfigurationError::NoPairing { .. } => {
             print_message("Agentknock isn't paired, so the command didn't run.");
@@ -2043,14 +2036,14 @@ mod tests {
 
     use super::{
         Cli, EnvironmentSecretInput, Operation, OutputMode, SecretUploadCommand, VariableFile,
-        exec_is_missing_separator, format_elapsed_time, progress_message, progress_report,
+        format_elapsed_time, progress_message, progress_report,
     };
 
     #[test]
-    fn parses_exec_command() {
+    fn parses_run_command() {
         let cli = Cli::try_parse_from([
             "agentknock",
-            "exec",
+            "run",
             "-s",
             "gh-token",
             "--secret",
@@ -2070,7 +2063,7 @@ mod tests {
         assert_eq!(
             cli.into_operation(),
             (
-                Operation::Exec {
+                Operation::Run {
                     secrets: BTreeSet::from(["cf-wrangler".into(), "gh-token".into()]),
                     git_signing: false,
                     reason: Some("needed by the deployment agent".into()),
@@ -2086,13 +2079,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_exec_alias() {
-        let cli = Cli::try_parse_from(["agentknock", "x", "-s", "github", "--", "true"]).unwrap();
+    fn parses_implicit_run_command() {
+        let cli = Cli::try_parse_from(["agentknock", "-s", "github", "--", "true"]).unwrap();
 
         assert_eq!(
             cli.into_operation(),
             (
-                Operation::Exec {
+                Operation::Run {
                     secrets: BTreeSet::from(["github".into()]),
                     git_signing: true,
                     reason: None,
@@ -2108,20 +2101,13 @@ mod tests {
     #[test]
     fn parses_output_modes() {
         let normal =
-            Cli::try_parse_from(["agentknock", "exec", "-s", "secret", "--", "true"]).unwrap();
-        let quiet = Cli::try_parse_from([
-            "agentknock",
-            "exec",
-            "--quiet",
-            "-s",
-            "secret",
-            "--",
-            "true",
-        ])
-        .unwrap();
+            Cli::try_parse_from(["agentknock", "run", "-s", "secret", "--", "true"]).unwrap();
+        let quiet =
+            Cli::try_parse_from(["agentknock", "run", "--quiet", "-s", "secret", "--", "true"])
+                .unwrap();
         let verbose = Cli::try_parse_from([
             "agentknock",
-            "exec",
+            "run",
             "--verbose",
             "-s",
             "secret",
@@ -2139,7 +2125,7 @@ mod tests {
     fn rejects_quiet_and_verbose_together() {
         let error = Cli::try_parse_from([
             "agentknock",
-            "exec",
+            "run",
             "--quiet",
             "--verbose",
             "-s",
@@ -2380,10 +2366,12 @@ mod tests {
                 &[
                     "Pair this client with a device",
                     "Before you use or manage secrets",
+                    "Name of a secret to use for the command",
+                    "required `--` separator",
                 ],
             ),
             (
-                &["exec", "--help"],
+                &["run", "--help"],
                 &[
                     "adds them to the command's environment",
                     "separate decision for each use of the selected key",
@@ -2571,6 +2559,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_and_implicit_run_require_the_same_arguments() {
+        let explicit = Cli::try_parse_from(["agentknock", "run", "--", "git", "push"]).unwrap_err();
+        let implicit = Cli::try_parse_from(["agentknock", "--", "git", "push"]).unwrap_err();
+
+        assert_eq!(explicit.kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(implicit.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn rejects_removed_run_command_names() {
+        for command in ["exec", "x"] {
+            let error = Cli::try_parse_from(["agentknock", command, "-s", "test", "--", "true"])
+                .unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
     fn shows_help_without_a_pairing_command() {
         let error = Cli::try_parse_from(["agentknock", "pairing"]).unwrap_err();
 
@@ -2596,7 +2603,7 @@ mod tests {
         let pairing_error = Cli::try_parse_from(["agentknock", "pairing", "help"]).unwrap_err();
         let secret_error = Cli::try_parse_from(["agentknock", "secret", "help"]).unwrap_err();
 
-        assert_eq!(root_error.kind(), ErrorKind::InvalidSubcommand);
+        assert_eq!(root_error.kind(), ErrorKind::UnknownArgument);
         assert_eq!(pairing_error.kind(), ErrorKind::InvalidSubcommand);
         assert_eq!(secret_error.kind(), ErrorKind::InvalidSubcommand);
     }
@@ -2612,48 +2619,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_space_separated_secrets() {
-        let error = Cli::try_parse_from([
-            "agentknock",
-            "exec",
-            "-s",
-            "gh-token",
-            "cf-wrangler",
-            "--",
-            "echo",
-        ])
-        .unwrap_err();
+    fn requires_the_command_separator_in_both_forms() {
+        for arguments in [
+            vec!["agentknock", "run", "-s", "github", "gh", "issue", "list"],
+            vec!["agentknock", "-s", "github", "gh", "issue", "list"],
+        ] {
+            let error = Cli::try_parse_from(arguments).unwrap_err();
 
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn identifies_exec_without_separator() {
-        assert!(exec_is_missing_separator(&[
-            "agentknock".into(),
-            "exec".into(),
-            "-s".into(),
-            "gh-token".into(),
-            "echo".into(),
-        ]));
-        assert!(exec_is_missing_separator(&[
-            "agentknock".into(),
-            "x".into(),
-            "-s".into(),
-            "gh-token".into(),
-            "echo".into(),
-        ]));
-        assert!(!exec_is_missing_separator(&[
-            "agentknock".into(),
-            "exec".into(),
-            "--help".into(),
-        ]));
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]
     fn rejects_empty_command_after_delimiter() {
-        let error =
-            Cli::try_parse_from(["agentknock", "exec", "-s", "gh-token", "--"]).unwrap_err();
+        let error = Cli::try_parse_from(["agentknock", "run", "-s", "gh-token", "--"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
@@ -2662,7 +2641,7 @@ mod tests {
     fn rejects_comma_separated_secrets() {
         let error = Cli::try_parse_from([
             "agentknock",
-            "exec",
+            "run",
             "-s",
             "gh-token,cf-wrangler",
             "--",
@@ -2682,7 +2661,6 @@ mod tests {
         let cases = [
             vec![
                 "agentknock".into(),
-                "exec".into(),
                 "-s".into(),
                 invalid_utf8.clone(),
                 "--".into(),
@@ -2690,7 +2668,7 @@ mod tests {
             ],
             vec![
                 "agentknock".into(),
-                "exec".into(),
+                "run".into(),
                 "-s".into(),
                 "gh-token".into(),
                 "--".into(),
@@ -2698,7 +2676,7 @@ mod tests {
             ],
             vec![
                 "agentknock".into(),
-                "exec".into(),
+                "run".into(),
                 "-s".into(),
                 "gh-token".into(),
                 "--".into(),

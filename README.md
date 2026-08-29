@@ -21,7 +21,7 @@ them. For example:
 1. Run a command with the `gh-token` secret:
 
    ```sh
-   agentknock exec -s gh-token -- gh pr merge 123
+   agentknock -s gh-token -- gh pr merge 123
    ```
 
 2. The paired mobile device displays the request. Approve the use of
@@ -192,11 +192,18 @@ The client can now request secrets from the paired mobile device.
 
 ### Run a command with secrets
 
-The `exec` command requires at least one secret. Repeat `-s` when a command
-needs more than one, and use `--reason` to add context to the request:
+The `run` command requires at least one secret. Repeat `-s` when a command
+needs more than one, and use `--reason` to add context to the request. You can
+omit `run` and put its options directly after `agentknock`:
 
 ```sh
-agentknock exec -s gh-token -s cloudflare --reason "Publish release" -- ./release.sh
+agentknock -s gh-token -s cloudflare --reason "Publish release" -- ./release.sh
+```
+
+The explicit form is equivalent:
+
+```sh
+agentknock run -s gh-token -s cloudflare --reason "Publish release" -- ./release.sh
 ```
 
 The `--` separator is required. Agentknock passes the command and every
@@ -220,13 +227,13 @@ keys.
 Use the SSH secret with a direct connection:
 
 ```sh
-agentknock exec -s production-ssh -- ssh example.com
+agentknock -s production-ssh -- ssh example.com
 ```
 
 The same setup works when Git uses an SSH remote:
 
 ```sh
-agentknock exec -s github-ssh -- git push
+agentknock -s github-ssh -- git push
 ```
 
 The command can select at most one SSH secret. Agentknock puts that key first
@@ -237,7 +244,7 @@ Use `--no-ssh-passthrough` when the temporary agent should not expose keys from
 the existing agent:
 
 ```sh
-agentknock exec --no-ssh-passthrough -s production-ssh -- ssh example.com
+agentknock --no-ssh-passthrough -s production-ssh -- ssh example.com
 ```
 
 This option also makes Git SSH signing fail if Git requests a different key.
@@ -262,7 +269,7 @@ requested signature.
 Git must use SSH signing and request a signature. For example:
 
 ```sh
-agentknock exec -s git-signing -- \
+agentknock -s git-signing -- \
   git -c gpg.format=ssh commit -S -m "Describe the change"
 ```
 
