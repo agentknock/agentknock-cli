@@ -62,6 +62,7 @@ struct StartupRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upstream_agent_socket: Option<String>,
     ssh_agent: bool,
+    git_signing: bool,
     ssh_passthrough: bool,
     quiet: bool,
     verbose: bool,
@@ -116,17 +117,18 @@ struct ServiceContext {
 }
 
 #[derive(Clone, Copy)]
-struct ServiceOptions {
-    ssh_agent: bool,
-    ssh_passthrough: bool,
-    quiet: bool,
-    verbose: bool,
+pub(super) struct ServiceOptions {
+    pub(super) ssh_agent: bool,
+    pub(super) git_signing: bool,
+    pub(super) ssh_passthrough: bool,
+    pub(super) quiet: bool,
+    pub(super) verbose: bool,
 }
 
 struct PreparedService {
     owner: ProcessMonitor,
     _runtime_directory: tempfile::TempDir,
-    listener: tokio::net::UnixListener,
+    listener: Option<tokio::net::UnixListener>,
     agent_listener: Option<tokio::net::UnixListener>,
     runtime_directory: String,
     context: ServiceContext,
@@ -149,7 +151,7 @@ pub struct InvocationService {
     _process: Child,
     runtime_directory: PathBuf,
     helper_name: &'static str,
-    ssh_agent: bool,
+    options: ServiceOptions,
 }
 
 pub fn requested(arguments: &[OsString]) -> bool {
@@ -228,10 +230,7 @@ impl InvocationService {
         invocation: &SecretUseInvocation,
         ssh: &SshSecretUse,
         upstream_agent_socket: Option<&OsStr>,
-        ssh_agent: bool,
-        ssh_passthrough: bool,
-        quiet: bool,
-        verbose: bool,
+        options: ServiceOptions,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let executable = "/proc/self/exe";
@@ -245,12 +244,6 @@ impl InvocationService {
             .process_group(0)
             .spawn()?;
 
-        let options = ServiceOptions {
-            ssh_agent,
-            ssh_passthrough,
-            quiet,
-            verbose,
-        };
         match initialize(
             &mut process,
             invocation,
@@ -261,12 +254,12 @@ impl InvocationService {
             Ok(runtime_directory) => Ok(Self {
                 _process: process,
                 runtime_directory,
-                helper_name: if quiet {
+                helper_name: if options.quiet {
                     QUIET_GIT_SIGN_HELPER_NAME
                 } else {
                     GIT_SIGN_HELPER_NAME
                 },
-                ssh_agent,
+                options,
             }),
             Err(error) => {
                 let _ = process.kill();
@@ -280,6 +273,19 @@ impl InvocationService {
         &self,
         existing_count: Option<&OsStr>,
     ) -> io::Result<BTreeMap<OsString, OsString>> {
+        let mut environment = BTreeMap::new();
+        if self.options.ssh_agent {
+            environment.insert(
+                "SSH_AUTH_SOCK".into(),
+                self.runtime_directory
+                    .join(crate::ssh_agent::SOCKET_NAME)
+                    .into_os_string(),
+            );
+        }
+        if !self.options.git_signing {
+            return Ok(environment);
+        }
+
         let helper = self.runtime_directory.join(self.helper_name);
         let helper = helper.to_str().ok_or_else(|| {
             io::Error::new(
@@ -310,7 +316,7 @@ impl InvocationService {
             .checked_add(2)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many Git settings"))?;
 
-        let mut environment = BTreeMap::from([
+        environment.extend([
             ("GIT_CONFIG_COUNT".into(), final_count.to_string().into()),
             (
                 format!("GIT_CONFIG_KEY_{count}").into(),
@@ -326,14 +332,6 @@ impl InvocationService {
                 default_key_command.into(),
             ),
         ]);
-        if self.ssh_agent {
-            environment.insert(
-                "SSH_AUTH_SOCK".into(),
-                self.runtime_directory
-                    .join(crate::ssh_agent::SOCKET_NAME)
-                    .into_os_string(),
-            );
-        }
         Ok(environment)
     }
 }
@@ -356,6 +354,7 @@ fn initialize(
             .map(OsStr::as_bytes)
             .map(|path| BASE64_STANDARD.encode(path)),
         ssh_agent: options.ssh_agent,
+        git_signing: options.git_signing,
         ssh_passthrough: options.ssh_passthrough,
         quiet: options.quiet,
         verbose: options.verbose,
@@ -412,10 +411,14 @@ fn prepare() -> io::Result<PreparedService> {
     };
     let owner = open_process(request.owner_pid)?;
     let runtime_directory = runtime_directory()?;
-    let socket_path = runtime_directory.path().join(SOCKET_NAME);
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
-    listener.set_nonblocking(true)?;
-    let listener = tokio::net::UnixListener::from_std(listener)?;
+    let listener = if request.git_signing {
+        let socket_path = runtime_directory.path().join(SOCKET_NAME);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+        Some(tokio::net::UnixListener::from_std(listener)?)
+    } else {
+        None
+    };
     let agent_listener = if request.ssh_agent || upstream_agent_socket.is_some() {
         let agent_socket_path = runtime_directory.path().join(crate::ssh_agent::SOCKET_NAME);
         let listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
@@ -424,12 +427,14 @@ fn prepare() -> io::Result<PreparedService> {
     } else {
         None
     };
-    let helper_path = runtime_directory.path().join(if request.quiet {
-        QUIET_GIT_SIGN_HELPER_NAME
-    } else {
-        GIT_SIGN_HELPER_NAME
-    });
-    install_helper(&helper_path)?;
+    if request.git_signing {
+        let helper_path = runtime_directory.path().join(if request.quiet {
+            QUIET_GIT_SIGN_HELPER_NAME
+        } else {
+            GIT_SIGN_HELPER_NAME
+        });
+        install_helper(&helper_path)?;
+    }
     let path = runtime_directory
         .path()
         .to_str()
@@ -540,7 +545,7 @@ async fn serve(service: PreparedService) -> io::Result<()> {
             Agent(tokio::net::UnixStream),
         }
         let connection = tokio::select! {
-            result = listener.accept() => Some(Connection::Helper(result?.0)),
+            result = accept_optional(&listener) => Some(Connection::Helper(result?)),
             result = accept_optional(&agent_listener) => Some(Connection::Agent(result?)),
             Some(()) = connections.next(), if !connections.is_empty() => None,
             result = wait_for_process(&owner) => return result,

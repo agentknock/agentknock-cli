@@ -47,6 +47,7 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
             "ssh_agent": true,
+            "git_signing": true,
             "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
@@ -182,6 +183,7 @@ fn exposes_the_selected_key_through_ssh_auth_sock() {
             "public_key": PUBLIC_KEY,
             "upstream_agent_socket": BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
             "ssh_agent": true,
+            "git_signing": true,
             "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
@@ -218,6 +220,7 @@ fn does_not_create_an_ssh_agent_when_unused() {
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
             "ssh_agent": false,
+            "git_signing": true,
             "ssh_passthrough": false,
             "quiet": false,
             "verbose": false,
@@ -228,6 +231,31 @@ fn does_not_create_an_ssh_agent_when_unused() {
     assert!(!runtime_directory.join("agent.sock").exists());
     assert!(runtime_directory.join("service.sock").exists());
     assert!(runtime_directory.join("git-sign").exists());
+}
+
+#[test]
+fn does_not_create_git_signing_endpoints_when_disabled() {
+    let mut service = ChildGuard(start_service());
+    let response = send_startup(
+        &mut service.0,
+        &json!({
+            "owner_pid": std::process::id(),
+            "invocation_id": "01K00000000000000000000000",
+            "invocation_token": STARTUP,
+            "secret": "test-ssh",
+            "public_key": PUBLIC_KEY,
+            "ssh_agent": true,
+            "git_signing": false,
+            "ssh_passthrough": true,
+            "quiet": false,
+            "verbose": false,
+        }),
+    );
+    assert_eq!(response["status"], "ready", "{response}");
+    let runtime_directory = Path::new(response["runtime_directory"].as_str().unwrap());
+    assert!(runtime_directory.join("agent.sock").exists());
+    assert!(!runtime_directory.join("service.sock").exists());
+    assert!(!runtime_directory.join("git-sign").exists());
 }
 
 #[test]
@@ -242,6 +270,7 @@ fn serves_agent_and_helper_connections_concurrently() {
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
             "ssh_agent": true,
+            "git_signing": true,
             "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,
@@ -347,6 +376,7 @@ fn checks_git_signing_key_passthrough(ssh_agent: bool, ssh_passthrough: bool) {
             "public_key": PUBLIC_KEY,
             "upstream_agent_socket": BASE64_STANDARD.encode(agent_socket.as_os_str().as_bytes()),
             "ssh_agent": ssh_agent,
+            "git_signing": true,
             "ssh_passthrough": ssh_passthrough,
             "quiet": false,
             "verbose": false,
@@ -442,6 +472,7 @@ fn start_ready_service(mut command: Command) -> (ChildGuard, PathBuf) {
             "secret": "test-ssh",
             "public_key": PUBLIC_KEY,
             "ssh_agent": true,
+            "git_signing": true,
             "ssh_passthrough": true,
             "quiet": false,
             "verbose": false,

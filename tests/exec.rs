@@ -64,7 +64,6 @@ async fn authenticates_ssh_with_an_rsa_secret() {
         "rsa",
         &["-b", "3072"],
         SshCommandTest::Authenticate {
-            ssh_agent: true,
             ssh_passthrough: true,
         },
     )
@@ -77,7 +76,6 @@ async fn disables_ssh_key_passthrough() {
         "ed25519",
         &[],
         SshCommandTest::Authenticate {
-            ssh_agent: true,
             ssh_passthrough: false,
         },
     )
@@ -89,9 +87,35 @@ async fn removes_the_ssh_agent_from_the_command() {
     uses_an_ssh_secret(
         "ed25519",
         &[],
-        SshCommandTest::Authenticate {
+        SshCommandTest::InspectEnvironment {
             ssh_agent: false,
-            ssh_passthrough: true,
+            git_signing: true,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_not_provide_git_signing_when_disabled() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::InspectEnvironment {
+            ssh_agent: true,
+            git_signing: false,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disables_the_ssh_agent_and_git_signing_together() {
+    uses_an_ssh_secret(
+        "ed25519",
+        &[],
+        SshCommandTest::InspectEnvironment {
+            ssh_agent: false,
+            git_signing: false,
         },
     )
     .await;
@@ -99,21 +123,20 @@ async fn removes_the_ssh_agent_from_the_command() {
 
 #[derive(Clone, Copy)]
 enum SshCommandTest {
-    Authenticate {
-        ssh_agent: bool,
-        ssh_passthrough: bool,
-    },
+    Authenticate { ssh_passthrough: bool },
+    InspectEnvironment { ssh_agent: bool, git_signing: bool },
     GitPush,
 }
 
 async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshCommandTest) {
     let push_git = matches!(test, SshCommandTest::GitPush);
-    let (ssh_agent, ssh_passthrough) = match test {
-        SshCommandTest::Authenticate {
+    let (authenticate, ssh_agent, ssh_passthrough, git_signing) = match test {
+        SshCommandTest::Authenticate { ssh_passthrough } => (true, true, ssh_passthrough, true),
+        SshCommandTest::InspectEnvironment {
             ssh_agent,
-            ssh_passthrough,
-        } => (ssh_agent, ssh_passthrough),
-        SshCommandTest::GitPush => (true, true),
+            git_signing,
+        } => (false, ssh_agent, true, git_signing),
+        SshCommandTest::GitPush => (true, true, true, true),
     };
     let home = TestHome::active();
     let private_key = home.path().join("ssh-key");
@@ -258,7 +281,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
             .await;
             drop(socket);
 
-            if !ssh_agent {
+            if !authenticate {
                 continue;
             }
 
@@ -342,6 +365,9 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
     if !ssh_agent {
         command.arg("--no-ssh-agent");
     }
+    if !git_signing {
+        command.arg("--no-git-sign");
+    }
     command.arg("--");
     if push_git {
         command
@@ -354,9 +380,12 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
             .arg(&probe)
             .args([
                 "--exact",
-                "authenticates_with_configured_ssh_passthrough_probe",
+                "inspects_ssh_command_environment_probe",
                 "--nocapture",
             ])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "agentknock.test")
+            .env("GIT_CONFIG_VALUE_0", "sentinel")
             .env("AGENTKNOCK_TEST_SSH_PORT", port.to_string())
             .env("AGENTKNOCK_TEST_SSH_USER", &user)
             .env("AGENTKNOCK_TEST_SELECTED_KEY", &public_key_path)
@@ -365,7 +394,9 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
                 "AGENTKNOCK_TEST_SSH_PASSTHROUGH",
                 ssh_passthrough.to_string(),
             )
-            .env("AGENTKNOCK_TEST_SSH_AGENT", ssh_agent.to_string());
+            .env("AGENTKNOCK_TEST_SSH_AGENT", ssh_agent.to_string())
+            .env("AGENTKNOCK_TEST_GIT_SIGNING", git_signing.to_string())
+            .env("AGENTKNOCK_TEST_AUTHENTICATE", authenticate.to_string());
     }
     let output = command.output().unwrap();
     assert!(
@@ -1340,7 +1371,7 @@ fn native_exec_probe() {
 }
 
 #[test]
-fn authenticates_with_configured_ssh_passthrough_probe() {
+fn inspects_ssh_command_environment_probe() {
     let Ok(port) = std::env::var("AGENTKNOCK_TEST_SSH_PORT") else {
         return;
     };
@@ -1350,9 +1381,21 @@ fn authenticates_with_configured_ssh_passthrough_probe() {
     let upstream_key = std::env::var_os("AGENTKNOCK_TEST_UPSTREAM_KEY").unwrap();
     let ssh_passthrough = std::env::var("AGENTKNOCK_TEST_SSH_PASSTHROUGH").unwrap() == "true";
     let ssh_agent = std::env::var("AGENTKNOCK_TEST_SSH_AGENT").unwrap() == "true";
+    let git_signing = std::env::var("AGENTKNOCK_TEST_GIT_SIGNING").unwrap() == "true";
+    let authenticate = std::env::var("AGENTKNOCK_TEST_AUTHENTICATE").unwrap() == "true";
 
-    if !ssh_agent {
-        assert!(std::env::var_os("SSH_AUTH_SOCK").is_none());
+    assert_eq!(std::env::var_os("SSH_AUTH_SOCK").is_some(), ssh_agent);
+    assert_eq!(
+        std::env::var("GIT_CONFIG_KEY_0").unwrap(),
+        "agentknock.test"
+    );
+    assert_eq!(
+        std::env::var("GIT_CONFIG_COUNT").unwrap(),
+        if git_signing { "3" } else { "1" }
+    );
+    assert_eq!(std::env::var_os("GIT_CONFIG_KEY_1").is_some(), git_signing);
+
+    if !authenticate {
         return;
     }
 

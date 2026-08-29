@@ -137,9 +137,10 @@ After an authenticated response, Agentknock builds the command environment:
 3. Reject an empty returned name, a name containing `=` or NUL, or a value
    containing NUL.
 4. If an SSH secret enables deferred operations, add the Git configuration
-   entries described below. Unless `--no-ssh-agent` is set, replace
-   `SSH_AUTH_SOCK` with an invocation-scoped agent. Unless SSH passthrough is
-   disabled, that agent also routes requests to the previous agent.
+   entries described below unless `--no-git-sign` is set. Unless
+   `--no-ssh-agent` is set, replace `SSH_AUTH_SOCK` with an invocation-scoped
+   agent. Unless SSH passthrough is disabled, that agent also routes requests
+   to the previous agent.
 5. With `--no-ssh-agent`, remove `SSH_AUTH_SOCK` after applying all inherited
    and returned environment variables.
 6. Produce at most one entry for each environment variable name.
@@ -263,27 +264,28 @@ also leave interpreters and runtime dependencies unpinned.
 ### Invocation service and SSH operations
 
 An invocation response containing an SSH secret includes its name and public
-key, not its private key. Agentknock starts a separate copy of its executable
-as an invocation service before replacing the launcher process. The launcher
-sends the service the invocation identifier, a fresh 32-byte invocation token,
-the SSH secret name and public key, the optional upstream SSH agent socket, the
-SSH passthrough policy, the owner process ID, and output settings through the
-service's standard input. It does not pass a live HPKE context to the service.
+key, not its private key. When SSH-agent or Git-signing access is enabled,
+Agentknock starts a separate copy of its executable as an invocation service
+before replacing the launcher process. The launcher sends the service the
+invocation identifier, a fresh 32-byte invocation token, the SSH secret name
+and public key, the optional upstream SSH agent socket, the SSH passthrough
+policy, the owner process ID, and output settings through the service's
+standard input. It does not pass a live HPKE context to the service.
 
-The service creates a mode-0700 temporary directory containing `service.sock`
-and a symlink to `/proc/<service-pid>/exe`. `service.sock` is the private
-protocol used by the Git signing helper. The directory contains `agent.sock`,
-which implements the SSH agent protocol, when it is provided to the command or
-needed for Git signing passthrough.
-The symlink lets Git invoke the same Agentknock binary as its signing helper
-without installing another executable or adding a directory to `PATH`. On
-Linux, Agentknock canonicalizes `XDG_RUNTIME_DIR` and uses it only when it
-identifies an absolute, mode-0700 directory owned by the effective user. Every
-ancestor must be owned by root or the effective user, and an ancestor writable
-by other users must have sticky-directory protection. If validation or
-directory creation fails, Agentknock uses the system temporary directory. The
-directory and its entries are removed when the service exits normally; an
-abrupt service failure can leave them behind.
+The service creates a mode-0700 temporary directory. Unless `--no-git-sign` is
+set, the directory contains `service.sock` and a helper executable.
+`service.sock` is the private protocol used by the Git signing helper. The
+directory contains `agent.sock`, which implements the SSH agent protocol, when
+it is provided to the command or needed for Git signing passthrough. On Linux,
+the helper is a symlink to `/proc/<service-pid>/exe`; this lets Git invoke the
+same Agentknock binary without installing another executable or adding a
+directory to `PATH`. Agentknock canonicalizes `XDG_RUNTIME_DIR` and uses it
+only when it identifies an absolute, mode-0700 directory owned by the effective
+user. Every ancestor must be owned by root or the effective user, and an
+ancestor writable by other users must have sticky-directory protection. If
+validation or directory creation fails, Agentknock uses the system temporary
+directory. The directory and its entries are removed when the service exits
+normally; an abrupt service failure can leave them behind.
 
 Unless `--no-ssh-agent` is set, the launcher sets `SSH_AUTH_SOCK` to
 `agent.sock`, replacing any inherited or device-returned value. With
@@ -335,15 +337,19 @@ An explicit OpenSSH `IdentityAgent` setting takes precedence over
 `SSH_AUTH_SOCK` and can therefore select another agent. Agentknock does not
 rewrite SSH command arguments or configuration to prevent that override.
 
-The launcher adds two Git settings through `GIT_CONFIG_COUNT`:
+Unless `--no-git-sign` is set, the launcher adds two Git settings through
+`GIT_CONFIG_COUNT`:
 
-- `gpg.ssh.program` names the helper symlink.
+- `gpg.ssh.program` names the helper executable.
 - `gpg.ssh.defaultKeyCommand` asks the same helper for the selected SSH public
   key when Git has no configured `user.signingKey`.
 
 These settings affect Git processes in the command's environment. Agentknock
 does not set `gpg.format`, `commit.gpgSign`, `tag.gpgSign`, or
 `user.signingKey`; those remain under user and repository control.
+
+With `--no-git-sign`, Agentknock adds neither setting. Existing Git
+configuration remains unchanged and may still sign without Agentknock.
 
 For an SSHSIG signing operation in the `git` namespace, the helper compares
 Git's requested key with the selected Agentknock public key. A match sends the

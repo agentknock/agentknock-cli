@@ -245,7 +245,7 @@ It does not prevent the command from using private-key files or another agent
 selected in SSH configuration.
 
 Use `--no-ssh-agent` when the command should receive no `SSH_AUTH_SOCK` at all.
-Agentknock Git signing remains available.
+Agentknock Git signing remains available unless you also use `--no-git-sign`.
 
 An `IdentityAgent` setting in SSH configuration takes precedence over
 `SSH_AUTH_SOCK`. Set `IdentityAgent SSH_AUTH_SOCK` for a host that should use
@@ -265,6 +265,10 @@ Git must use SSH signing and request a signature. For example:
 agentknock exec -s git-signing -- \
   git -c gpg.format=ssh commit -S -m "Describe the change"
 ```
+
+Use `--no-git-sign` when Agentknock should not provide Git signing. Agentknock
+then leaves the existing Git signing configuration unchanged; that
+configuration can still sign commits or tags independently.
 
 A command can select at most one SSH secret. If Git has no configured
 `user.signingKey`, Agentknock offers the selected SSH key as the default. If
