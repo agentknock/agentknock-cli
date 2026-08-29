@@ -25,6 +25,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
+
 use agentknock::{
     ApplicationInfo, Client, GitSignProgress, GitSignRepository, GitSignRequest,
     SecretUseInvocation, SshAuthenticationProgress, SshAuthenticationRequest, SshSecretUse,
@@ -432,13 +435,50 @@ fn runtime_directory() -> io::Result<tempfile::TempDir> {
         .permissions(fs::Permissions::from_mode(0o700));
 
     #[cfg(target_os = "linux")]
-    return directory.tempdir();
+    {
+        if let Some(path) = xdg_runtime_directory()
+            && let Ok(runtime_directory) = directory.tempdir_in(path)
+        {
+            return Ok(runtime_directory);
+        }
+        directory.tempdir()
+    }
 
     // macOS limits Unix socket paths to 104 bytes. Its per-user temporary
     // directory can already approach that limit before our directory and
     // socket names are appended.
     #[cfg(target_os = "macos")]
-    return directory.tempdir_in("/tmp");
+    directory.tempdir_in("/tmp")
+}
+
+#[cfg(target_os = "linux")]
+fn xdg_runtime_directory() -> Option<PathBuf> {
+    let configured_path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    if !configured_path.is_absolute() {
+        return None;
+    }
+    let path = fs::canonicalize(configured_path).ok()?;
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    // SAFETY: geteuid has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return None;
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor).ok()?;
+        let owner = metadata.uid();
+        let mode = metadata.mode();
+        if !metadata.is_dir()
+            || (owner != 0 && owner != effective_uid)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return None;
+        }
+    }
+    Some(path)
 }
 
 async fn serve(service: PreparedService) -> io::Result<()> {

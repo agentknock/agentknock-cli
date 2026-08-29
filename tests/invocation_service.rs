@@ -13,6 +13,9 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+
 const STARTUP: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const PUBLIC_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB test";
@@ -84,6 +87,82 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
     owner.0.wait().unwrap();
     wait_for_exit(&mut service.0);
     assert!(!fs::exists(runtime_directory).unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prefers_the_xdg_runtime_directory() {
+    let runtime_base = tempfile::tempdir().unwrap();
+    fs::set_permissions(runtime_base.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let fallback_base = tempfile::tempdir().unwrap();
+    let mut command = service_command();
+    command
+        .env("XDG_RUNTIME_DIR", runtime_base.path())
+        .env("TMPDIR", fallback_base.path());
+    let (_service, runtime_directory) = start_ready_service(command);
+
+    assert_eq!(runtime_directory.parent(), Some(runtime_base.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uses_the_temporary_directory_without_an_xdg_runtime_directory() {
+    let temporary_base = tempfile::tempdir().unwrap();
+    let mut command = service_command();
+    command
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", temporary_base.path());
+    let (_service, runtime_directory) = start_ready_service(command);
+
+    assert_eq!(runtime_directory.parent(), Some(temporary_base.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rejects_a_nonprivate_xdg_runtime_directory() {
+    let runtime_base = tempfile::tempdir().unwrap();
+    fs::set_permissions(runtime_base.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let fallback_base = tempfile::tempdir().unwrap();
+    let mut command = service_command();
+    command
+        .env("XDG_RUNTIME_DIR", runtime_base.path())
+        .env("TMPDIR", fallback_base.path());
+    let (_service, runtime_directory) = start_ready_service(command);
+
+    assert_eq!(runtime_directory.parent(), Some(fallback_base.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rejects_an_xdg_runtime_directory_below_an_unsafe_ancestor() {
+    let unsafe_parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(unsafe_parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    let runtime_base = unsafe_parent.path().join("runtime");
+    fs::create_dir(&runtime_base).unwrap();
+    fs::set_permissions(&runtime_base, fs::Permissions::from_mode(0o700)).unwrap();
+    let fallback_base = tempfile::tempdir().unwrap();
+    let mut command = service_command();
+    command
+        .env("XDG_RUNTIME_DIR", &runtime_base)
+        .env("TMPDIR", fallback_base.path());
+    let (_service, runtime_directory) = start_ready_service(command);
+
+    assert_eq!(runtime_directory.parent(), Some(fallback_base.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn falls_back_when_the_xdg_runtime_directory_is_unavailable() {
+    let unavailable_parent = tempfile::tempdir().unwrap();
+    let unavailable_base = unavailable_parent.path().join("missing");
+    let fallback_base = tempfile::tempdir().unwrap();
+    let mut command = service_command();
+    command
+        .env("XDG_RUNTIME_DIR", unavailable_base)
+        .env("TMPDIR", fallback_base.path());
+    let (_service, runtime_directory) = start_ready_service(command);
+
+    assert_eq!(runtime_directory.parent(), Some(fallback_base.path()));
 }
 
 #[test]
@@ -274,13 +353,37 @@ fn request_identities(connection: &mut UnixStream) -> Vec<u8> {
 }
 
 fn start_service() -> Child {
-    Command::new(env!("CARGO_BIN_EXE_agentknock"))
+    service_command().spawn().expect("start invocation service")
+}
+
+fn service_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
         .arg("__invocation-service")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start invocation service")
+        .stderr(Stdio::piped());
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn start_ready_service(mut command: Command) -> (ChildGuard, PathBuf) {
+    let mut service = ChildGuard(command.spawn().expect("start invocation service"));
+    let response = send_startup(
+        &mut service.0,
+        &json!({
+            "owner_pid": std::process::id(),
+            "invocation_id": "01K00000000000000000000000",
+            "invocation_token": STARTUP,
+            "secret": "test-ssh",
+            "public_key": PUBLIC_KEY,
+            "quiet": false,
+            "verbose": false,
+        }),
+    );
+    assert_eq!(response["status"], "ready", "{response}");
+    let runtime_directory = PathBuf::from(response["runtime_directory"].as_str().unwrap());
+    (service, runtime_directory)
 }
 
 fn run(command: &mut Command) {
