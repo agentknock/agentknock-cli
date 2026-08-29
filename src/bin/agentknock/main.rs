@@ -5,6 +5,7 @@ mod executable;
 mod git_repository;
 mod invocation_service;
 mod process_info;
+mod ssh_agent;
 
 use std::{
     cell::Cell,
@@ -61,9 +62,11 @@ enum Command {
     /// path, SHA-256 hash when available, paths of the programs that launched Agentknock, and how
     /// standard input, output, and error are connected. If the response contains environment
     /// variables, Agentknock adds them to the command's environment. Returned values replace
-    /// existing values with the same names. An SSH secret can sign Git commits and tags when Git
-    /// uses SSH signing; the device makes a separate decision for each signature. Agentknock then
-    /// replaces itself with the command.
+    /// existing values with the same names. An Ed25519 or RSA SSH secret is available through a
+    /// temporary SSH agent for remote authentication. Keys from an existing SSH agent remain
+    /// available. SSH secrets can sign Git commits and tags when Git uses SSH signing. The device
+    /// makes a separate decision for each use of the selected key. Agentknock then replaces itself
+    /// with the command.
     ///
     /// Specify each secret with a separate `--secret` option. The `--` separator is required;
     /// Agentknock treats everything after it as the command and its arguments. Agentknock doesn't
@@ -80,7 +83,7 @@ enum Command {
     /// You can use `agentknock x` as a shorter alias for `agentknock exec`.
     #[command(
         visible_alias = "x",
-        after_long_help = "Examples:\n  Use one secret:\n    agentknock exec -s github -- gh issue list\n\n  Use multiple secrets and explain why:\n    agentknock exec -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n  Sign a Git commit with an SSH secret:\n    agentknock exec -s git-signing -- git -c gpg.format=ssh commit -S -m \"Describe the change\""
+        after_long_help = "Examples:\n  Use one secret:\n    agentknock exec -s github -- gh issue list\n\n  Use multiple secrets and explain why:\n    agentknock exec -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n  Connect with an SSH secret:\n    agentknock exec -s production-ssh -- ssh example.com\n\n  Sign a Git commit with an SSH secret:\n    agentknock exec -s git-signing -- git -c gpg.format=ssh commit -S -m \"Describe the change\""
     )]
     Exec(ExecCommand),
 
@@ -700,11 +703,16 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             let mut signals = CommandSignals::new().map_err(CommandError::ExecSignal)?;
             let secret_use_output =
                 request_exec_secrets(&client, request, output, &mut signals).await?;
+            let upstream_agent_socket = secret_use_output
+                .environment_variable("SSH_AUTH_SOCK")
+                .map(OsString::from)
+                .or_else(|| env::var_os("SSH_AUTH_SOCK"));
             let invocation_service = match secret_use_output.ssh() {
                 Some(ssh) => Some(
                     invocation_service::InvocationService::start(
                         secret_use_output.invocation(),
                         ssh,
+                        upstream_agent_socket.as_deref(),
                         output == OutputMode::Quiet,
                         output == OutputMode::Verbose,
                     )
@@ -718,7 +726,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 .or_else(|| env::var_os("GIT_CONFIG_COUNT"));
             let additional_environment = match &invocation_service {
                 Some(service) => service
-                    .git_environment(git_config_count.as_deref())
+                    .environment(git_config_count.as_deref())
                     .map_err(CommandError::ExecInvocationService)?,
                 None => BTreeMap::new(),
             };
@@ -1846,7 +1854,7 @@ fn print_received_secrets(secret_use_output: &SecretUseOutput) {
     }
     if let Some(ssh) = secret_use_output.ssh() {
         print_message(format_args!(
-            "SSH secret {:?} is available to the command.",
+            "SSH secret {:?} is available for Git signing and supported SSH authentication.",
             ssh.name()
         ));
     }
@@ -2320,7 +2328,7 @@ mod tests {
                 &["exec", "--help"],
                 &[
                     "adds them to the command's environment",
-                    "separate decision for each signature",
+                    "separate decision for each use of the selected key",
                     "The `--` separator is required",
                     "doesn't invoke a shell",
                     "Repeat this option",

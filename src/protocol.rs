@@ -16,6 +16,7 @@ pub(crate) enum Method {
     SecretList,
     SecretUpload,
     GitSign,
+    SshAuthenticate,
 }
 
 pub(crate) fn encode<T>(

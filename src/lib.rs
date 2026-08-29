@@ -17,6 +17,7 @@ mod protocol;
 mod proxy;
 mod secret_use;
 mod secrets;
+mod ssh_authentication;
 mod websocket;
 
 pub use client::{ApplicationInfo, Client, PairingStatus};
@@ -33,4 +34,7 @@ pub use secret_use::{
 pub use secrets::{
     Secret, SecretListProgress, SecretUpload, SecretUploadError, SecretUploadMode,
     SecretUploadProgress, Secrets,
+};
+pub use ssh_authentication::{
+    SshAuthenticationProgress, SshAuthenticationRequest, SshSignatureAlgorithm,
 };

@@ -207,13 +207,43 @@ return the secrets before it starts the command. If the request is still
 waiting after 30 seconds, Agentknock writes a progress update with the elapsed
 time to standard error every 30 seconds. Press Ctrl-C to cancel the request.
 
+### Use SSH keys
+
+An SSH secret keeps its private key on the paired device. Agentknock makes the
+selected public key available to the command through a temporary SSH agent.
+The temporary agent also makes keys from an existing SSH agent available.
+When SSH uses the selected key, Agentknock sends the exact authentication
+request to the device for a separate decision. Other keys continue to use the
+existing agent. Agentknock authentication currently supports Ed25519 and RSA
+keys.
+
+Use the SSH secret with a direct connection:
+
+```sh
+agentknock exec -s production-ssh -- ssh example.com
+```
+
+The same setup works when Git uses an SSH remote:
+
+```sh
+agentknock exec -s github-ssh -- git push
+```
+
+The command can select at most one SSH secret. Agentknock puts that key first
+in the temporary agent and then lists keys from any existing agent. Agentknock
+never sends the selected private key to the client or command.
+
+An `IdentityAgent` setting in SSH configuration takes precedence over
+`SSH_AUTH_SOCK`. Set `IdentityAgent SSH_AUTH_SOCK` for a host that should use
+the Agentknock agent.
+
 ### Sign Git commits and tags
 
-An SSH secret keeps its private key on the paired device. When Git requests a
-signature while running a command through Agentknock, Agentknock sends Git's
-exact signing payload to the device so it can show the commit or tag message
-for a separate decision. For commits, it also sends available repository,
-branch, and changed-path context to help identify the requested signature.
+When Git requests a signature while running a command through Agentknock,
+Agentknock sends Git's exact signing payload to the device so it can show the
+commit or tag message for a separate decision. For commits, it also sends
+available repository, branch, and changed-path context to help identify the
+requested signature.
 
 Git must use SSH signing and request a signature. For example:
 
@@ -225,8 +255,10 @@ agentknock exec -s git-signing -- \
 A command can select at most one SSH secret. If Git has no configured
 `user.signingKey`, Agentknock offers the selected SSH key as the default. If
 Git explicitly selects another key, signing proceeds through the ordinary
-`ssh-keygen` command instead. Agentknock does not change `gpg.format`, signing
-policy, or the configured signing key.
+`ssh-keygen` command. It can use a key file or a key from the existing SSH
+agent as usual. Agentknock does not change `gpg.format`, signing policy, or the
+configured signing key. Git signing can use SSH key types that Agentknock does
+not yet support for SSH authentication.
 
 ### Use a network proxy
 
