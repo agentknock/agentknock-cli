@@ -358,7 +358,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
         .env("SSH_AUTH_SOCK", &upstream_socket)
-        .args(["exec", "-s", "ssh-login"]);
+        .args(["run", "-s", "ssh-login"]);
     if !ssh_passthrough {
         command.arg("--no-ssh-passthrough");
     }
@@ -454,7 +454,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("SSH_AUTH_SOCK", upstream_socket)
-        .args(["exec", "-s", "ssh-login", "--", "git", "-C"])
+        .args(["run", "-s", "ssh-login", "--", "git", "-C"])
         .arg(&repository)
         .args(["-c", &format!("core.sshCommand={ssh_command}")])
         .args(["push", "--quiet", "origin", "main"])
@@ -724,7 +724,7 @@ async fn signs_a_git_commit_with_an_ssh_secret(
         .env("HOME", home.path())
         .env("TMPDIR", temporary_directory)
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "git-signing"]);
+        .args(["run", "-s", "git-signing"]);
     if !ssh_agent {
         command.arg("--no-ssh-agent");
     }
@@ -1056,7 +1056,6 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
-            "exec",
             "-s",
             "github",
             "-s",
@@ -1161,7 +1160,7 @@ async fn reports_and_executes_a_shebang_script() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "test", "--", script.to_str().unwrap()])
+        .args(["run", "-s", "test", "--", script.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -1249,7 +1248,7 @@ async fn replace_selected_native_file_after_approval() -> std::process::Output {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("PATH", home.path())
-        .arg("exec")
+        .arg("run")
         .arg("-s")
         .arg("test")
         .arg("--")
@@ -1343,7 +1342,7 @@ async fn restores_sigpipe_before_executing_the_command() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
-            "exec",
+            "run",
             "-s",
             "test",
             "--",
@@ -1431,7 +1430,7 @@ fn rejects_a_missing_command_before_sending_an_invocation() {
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", "ws://127.0.0.1:1")
         .args([
-            "exec",
+            "run",
             "-s",
             "test",
             "--",
@@ -1451,41 +1450,27 @@ fn rejects_a_missing_command_before_sending_an_invocation() {
 }
 
 #[test]
-fn explains_that_the_command_separator_is_required() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .args(["exec", "-s", "github", "gh", "issue", "list"])
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(output.stdout, b"");
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "error: add `--` before the command to run\n\
-         \n\
-         Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...\n\
-         \n\
-         For more information, run 'agentknock exec --help'.\n"
-    );
-}
-
-#[test]
 fn rejects_a_duplicate_secret() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .args(["exec", "-s", "github", "--secret", "github", "--", "true"])
-        .output()
-        .unwrap();
+    for arguments in [
+        vec!["run", "-s", "github", "--secret", "github", "--", "true"],
+        vec!["-s", "github", "--secret", "github", "--", "true"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+            .args(arguments)
+            .output()
+            .unwrap();
 
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(output.stdout, b"");
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "error: secret \"github\" was specified more than once\n\
-         \n\
-         Usage: agentknock exec -s <SECRET>... -- <COMMAND> [ARGUMENT]...\n\
-         \n\
-         For more information, run 'agentknock exec --help'.\n"
-    );
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout, b"");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "error: secret \"github\" was specified more than once\n\
+             \n\
+             Usage: agentknock [run] -s <SECRET> [-s <SECRET> ...] -- <COMMAND> [ARGUMENT]...\n\
+             \n\
+             For more information, run 'agentknock run --help'.\n"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1551,7 +1536,7 @@ async fn resends_the_exact_request_when_the_connection_closes_before_ack() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "github", "--", "env"])
+        .args(["run", "-s", "github", "--", "env"])
         .output()
         .unwrap();
     assert!(
@@ -1658,7 +1643,7 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "github", "--", "env"])
+        .args(["run", "-s", "github", "--", "env"])
         .output()
         .unwrap();
     assert!(
@@ -1717,7 +1702,7 @@ async fn signal_before_response_sends_an_aborted_completion() {
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "github", "--", "env"])
+        .args(["run", "-s", "github", "--", "env"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1793,7 +1778,7 @@ async fn authenticated_device_error_sends_an_aborted_completion() {
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "github", "--", "env"])
+        .args(["run", "-s", "github", "--", "env"])
         .output()
         .unwrap();
 
@@ -1873,7 +1858,7 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["exec", "-s", "github", "--", "env"])
+        .args(["run", "-s", "github", "--", "env"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

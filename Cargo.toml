@@ -52,8 +52,8 @@ ulid = "3.0.0"
 tokio-websockets = { version = "0.13.3", default-features = false, features = ["server"] }
 
 [[test]]
-name = "exec"
-path = "tests/exec.rs"
+name = "run"
+path = "tests/run.rs"
 required-features = ["integration-tests"]
 
 [[test]]

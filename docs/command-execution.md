@@ -40,7 +40,7 @@ into a sandbox or privilege boundary.
 
 ## Common execution semantics
 
-`agentknock exec` follows this sequence:
+`agentknock run` follows this sequence:
 
 1. Capture the working directory and executable search path.
 2. Select, open, inspect, and retain the top-level executable.
