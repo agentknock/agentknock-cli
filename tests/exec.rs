@@ -4,9 +4,15 @@ mod support;
 
 use std::{
     fs,
+    io::{Read as _, Write as _},
+    net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt as _,
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    process::Child,
     process::{Command, Stdio},
     sync::mpsc,
+    thread,
     time::Duration,
 };
 
@@ -38,6 +44,340 @@ fn approved_environment(secret: &str, variables: serde_json::Map<String, Value>)
     })
 }
 
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticates_ssh_and_pushes_git_with_an_ed25519_secret() {
+    uses_an_ssh_secret("ed25519", &[], true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticates_ssh_with_an_rsa_secret() {
+    uses_an_ssh_secret("rsa", &["-b", "3072"], false).await;
+}
+
+async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], push_git: bool) {
+    let home = TestHome::active();
+    let private_key = home.path().join("ssh-key");
+    run(Command::new("ssh-keygen")
+        .args(["-q", "-t", key_type])
+        .args(key_options)
+        .args(["-N", "", "-f"])
+        .arg(&private_key));
+    let public_key_path = private_key.with_extension("pub");
+    let public_key = fs::read_to_string(&public_key_path)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let key_blob = BASE64_STANDARD
+        .decode(public_key.split_ascii_whitespace().nth(1).unwrap())
+        .unwrap();
+
+    let reference_socket = home.path().join("reference-agent.sock");
+    let mut reference_agent = ChildGuard(
+        Command::new("ssh-agent")
+            .args(["-D", "-a"])
+            .arg(&reference_socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_path(&reference_socket, &mut reference_agent.0);
+    run(Command::new("ssh-add")
+        .arg(&private_key)
+        .env("SSH_AUTH_SOCK", &reference_socket));
+
+    let upstream_private_key = home.path().join("upstream-key");
+    run(Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&upstream_private_key));
+    let upstream_public_key_path = upstream_private_key.with_extension("pub");
+    let upstream_public_key = fs::read_to_string(&upstream_public_key_path)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let upstream_socket = home.path().join("upstream-agent.sock");
+    let mut upstream_agent = ChildGuard(
+        Command::new("ssh-agent")
+            .args(["-D", "-a"])
+            .arg(&upstream_socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_path(&upstream_socket, &mut upstream_agent.0);
+    run(Command::new("ssh-add")
+        .arg(&upstream_private_key)
+        .env("SSH_AUTH_SOCK", &upstream_socket));
+    fs::remove_file(&private_key).unwrap();
+    fs::remove_file(&upstream_private_key).unwrap();
+
+    let authorized_keys = home.path().join("authorized_keys");
+    fs::write(
+        &authorized_keys,
+        format!("{public_key}\n{upstream_public_key}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
+    let host_key = home.path().join("host-key");
+    run(Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&host_key));
+    let port = available_port();
+    let user = std::env::var("USER").expect("USER is set for the SSH integration test");
+    let mut sshd = start_sshd(port, &user, &host_key, &authorized_keys, home.path());
+
+    let device_private_key = home.device_private_key.clone();
+    let server_public_key = public_key.clone();
+    let server_key_blob = key_blob.clone();
+    let server_agent_socket = reference_socket.clone();
+    let probe = std::env::current_exe().unwrap();
+    let expected_commands = if push_git {
+        vec!["ssh".to_owned(), "git".to_owned()]
+    } else {
+        vec![probe.to_str().unwrap().to_owned()]
+    };
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        for expected_command in expected_commands {
+            let (_, mut socket) = accept(&listener).await;
+            let request = receive_json(&mut socket).await;
+            let client_id = request["client_id"].as_str().unwrap().to_owned();
+            let invocation_id = request["request_id"].as_str().unwrap().to_owned();
+            let (mut context, key, plaintext) =
+                open_request(&device_private_key, &invocation_id, &request["payload"]);
+            assert_eq!(plaintext["method"], "Invocation");
+            assert_eq!(plaintext["operation"]["command"], expected_command);
+            let invocation_token = plaintext["invocation_token"].as_str().unwrap().to_owned();
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "ack",
+                    "client_id": client_id,
+                    "request_id": invocation_id,
+                    "kind": "request",
+                }),
+            )
+            .await;
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "message",
+                    "client_id": client_id,
+                    "request_id": invocation_id,
+                    "kind": "response",
+                    "payload": encrypt_response(
+                        &context,
+                        &key,
+                        &json!({
+                            "result": "APPROVED",
+                            "secrets": {
+                                "ssh-login": {
+                                    "type": "ssh",
+                                    "public_key": server_public_key,
+                                },
+                            },
+                        }),
+                    ),
+                }),
+            )
+            .await;
+            assert_eq!(receive_json(&mut socket).await["kind"], "response");
+            let completion = receive_json(&mut socket).await;
+            let completion = open_completion(&mut context, &completion["payload"]);
+            assert_eq!(completion["result"], "APPROVED");
+            assert!(completion.get("signature").is_none());
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "ack",
+                    "client_id": client_id,
+                    "request_id": invocation_id,
+                    "kind": "completion",
+                }),
+            )
+            .await;
+            drop(socket);
+
+            let (_, mut socket) = accept(&listener).await;
+            let request = receive_json(&mut socket).await;
+            let client_id = request["client_id"].as_str().unwrap().to_owned();
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            let (mut context, key, plaintext) =
+                open_request(&device_private_key, &request_id, &request["payload"]);
+            assert_eq!(plaintext["method"], "SshAuthenticate");
+            assert_eq!(plaintext["invocation_id"], invocation_id);
+            assert_eq!(plaintext["invocation_token"], invocation_token);
+            assert_eq!(plaintext["secret"], "ssh-login");
+            assert!(plaintext.get("algorithm").is_none());
+            let message = BASE64_STANDARD
+                .decode(plaintext["message"].as_str().unwrap())
+                .unwrap();
+            let signature = sign_with_agent(
+                &server_agent_socket,
+                &server_key_blob,
+                &message,
+                ssh_signature_flags(&message),
+            );
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "ack",
+                    "client_id": client_id,
+                    "request_id": request_id,
+                    "kind": "request",
+                }),
+            )
+            .await;
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "message",
+                    "client_id": client_id,
+                    "request_id": request_id,
+                    "kind": "response",
+                    "payload": encrypt_response(
+                        &context,
+                        &key,
+                        &json!({
+                            "result": "APPROVED",
+                            "signature": BASE64_STANDARD.encode(signature),
+                        }),
+                    ),
+                }),
+            )
+            .await;
+            assert_eq!(receive_json(&mut socket).await["kind"], "response");
+            let completion = receive_json(&mut socket).await;
+            let completion = open_completion(&mut context, &completion["payload"]);
+            assert_eq!(completion["result"], "APPROVED");
+            assert!(completion.get("signature").is_none());
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "ack",
+                    "client_id": client_id,
+                    "request_id": request_id,
+                    "kind": "completion",
+                }),
+            )
+            .await;
+        }
+    })
+    .await;
+
+    let ssh_options = ssh_options(port);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
+        .env("SSH_AUTH_SOCK", &upstream_socket)
+        .args(["exec", "-s", "ssh-login", "--"]);
+    if push_git {
+        command
+            .arg("ssh")
+            .args(&ssh_options)
+            .arg(format!("{user}@127.0.0.1"))
+            .args(["printf", "ssh-authenticated"]);
+    } else {
+        command
+            .arg(&probe)
+            .args([
+                "--exact",
+                "authenticates_with_selected_and_upstream_keys_probe",
+                "--nocapture",
+            ])
+            .env("AGENTKNOCK_TEST_SSH_PORT", port.to_string())
+            .env("AGENTKNOCK_TEST_SSH_USER", &user)
+            .env("AGENTKNOCK_TEST_SELECTED_KEY", &public_key_path)
+            .env("AGENTKNOCK_TEST_UPSTREAM_KEY", &upstream_public_key_path);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nsshd: {}",
+        String::from_utf8_lossy(&output.stderr),
+        child_stderr(&mut sshd.0),
+    );
+    if push_git {
+        assert_eq!(output.stdout, b"ssh-authenticated");
+    }
+
+    if !push_git {
+        server.await.unwrap();
+        return;
+    }
+
+    let remote = home.path().join("remote.git");
+    let repository = home.path().join("git-worktree");
+    run(Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&remote));
+    run(Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .arg(&repository));
+    fs::write(repository.join("example.txt"), "example\n").unwrap();
+    run(Command::new("git")
+        .args(["-C"])
+        .arg(&repository)
+        .args(["add", "example.txt"]));
+    run(Command::new("git").args(["-C"]).arg(&repository).args([
+        "-c",
+        "user.name=Agentknock Test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "Initial commit",
+    ]));
+    let remote_url = format!("ssh://{user}@127.0.0.1:{port}{}", remote.display());
+    run(Command::new("git").args(["-C"]).arg(&repository).args([
+        "remote",
+        "add",
+        "origin",
+        &remote_url,
+    ]));
+    let ssh_command = std::iter::once("ssh".to_owned())
+        .chain(ssh_options.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .env("SSH_AUTH_SOCK", upstream_socket)
+        .args(["exec", "-s", "ssh-login", "--", "git", "-C"])
+        .arg(&repository)
+        .args(["-c", &format!("core.sshCommand={ssh_command}")])
+        .args(["push", "--quiet", "origin", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nsshd: {}",
+        String::from_utf8_lossy(&output.stderr),
+        child_stderr(&mut sshd.0),
+    );
+    server.await.unwrap();
+    let pushed = Command::new("git")
+        .args(["--git-dir"])
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/main"])
+        .output()
+        .unwrap();
+    assert!(pushed.status.success());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ed25519_secret() {
     signs_a_git_commit_with_an_ssh_secret("ed25519", &[]).await;
@@ -46,6 +386,11 @@ async fn signs_a_git_commit_with_an_ed25519_secret() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_rsa_secret() {
     signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signs_a_git_commit_with_an_ecdsa_secret() {
+    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"]).await;
 }
 
 async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&str]) {
@@ -75,6 +420,8 @@ async fn signs_a_git_commit_with_an_ssh_secret(key_type: &str, key_options: &[&s
             "user.name=Agentknock Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgSign=false",
             "commit",
             "--quiet",
             "-m",
@@ -311,6 +658,165 @@ fn run(command: &mut Command) {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn start_sshd(
+    port: u16,
+    user: &str,
+    host_key: &Path,
+    authorized_keys: &Path,
+    directory: &Path,
+) -> ChildGuard {
+    let sshd = command_path("sshd");
+    let mut child = ChildGuard(
+        Command::new(sshd)
+            .args(["-D", "-e", "-f", "/dev/null", "-p", &port.to_string()])
+            .arg("-h")
+            .arg(host_key)
+            .arg("-o")
+            .arg("ListenAddress=127.0.0.1")
+            .arg("-o")
+            .arg(format!("AuthorizedKeysFile={}", authorized_keys.display()))
+            .arg("-o")
+            .arg("StrictModes=no")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("KbdInteractiveAuthentication=no")
+            .arg("-o")
+            .arg("UsePAM=no")
+            .arg("-o")
+            .arg(format!("PidFile={}", directory.join("sshd.pid").display()))
+            .arg("-o")
+            .arg(format!("AllowUsers={user}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return child;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("sshd exited during startup: {}", child_stderr(&mut child.0));
+        }
+        assert!(std::time::Instant::now() < deadline, "sshd didn't start");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn ssh_options(port: u16) -> Vec<String> {
+    [
+        "-F".to_owned(),
+        "/dev/null".to_owned(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "StrictHostKeyChecking=no".to_owned(),
+        "-o".to_owned(),
+        "UserKnownHostsFile=/dev/null".to_owned(),
+        "-o".to_owned(),
+        "LogLevel=ERROR".to_owned(),
+        "-p".to_owned(),
+        port.to_string(),
+    ]
+    .into()
+}
+
+fn available_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn command_path(name: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{name} isn't available in PATH"))
+}
+
+fn wait_for_path(path: &Path, child: &mut Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        if child.try_wait().unwrap().is_some() {
+            panic!(
+                "process exited before creating {}: {}",
+                path.display(),
+                child_stderr(child)
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process didn't create {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn child_stderr(child: &mut Child) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut input) = child.stderr.take() {
+        let _ = input.read_to_string(&mut stderr);
+    }
+    stderr
+}
+
+fn sign_with_agent(socket_path: &Path, key_blob: &[u8], message: &[u8], flags: u32) -> Vec<u8> {
+    let mut request = vec![13];
+    put_ssh_string(&mut request, key_blob);
+    put_ssh_string(&mut request, message);
+    request.extend_from_slice(&flags.to_be_bytes());
+    let mut connection = UnixStream::connect(socket_path).unwrap();
+    connection
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .unwrap();
+    connection.write_all(&request).unwrap();
+    let mut length = [0; 4];
+    connection.read_exact(&mut length).unwrap();
+    let mut response = vec![0; u32::from_be_bytes(length) as usize];
+    connection.read_exact(&mut response).unwrap();
+    assert_eq!(
+        response.first(),
+        Some(&14),
+        "reference agent refused to sign"
+    );
+    let (signature, trailing) = take_ssh_string(&response[1..]);
+    assert!(trailing.is_empty());
+    signature.to_vec()
+}
+
+fn put_ssh_string(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+fn take_ssh_string(input: &[u8]) -> (&[u8], &[u8]) {
+    let length = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    (&input[4..4 + length], &input[4 + length..])
+}
+
+fn ssh_signature_flags(message: &[u8]) -> u32 {
+    let (_, message) = take_ssh_string(message);
+    assert_eq!(message[0], 50);
+    let (_, message) = take_ssh_string(&message[1..]);
+    let (_, message) = take_ssh_string(message);
+    let (_, message) = take_ssh_string(message);
+    assert_eq!(message[0], 1);
+    let (algorithm, _) = take_ssh_string(&message[1..]);
+    match algorithm {
+        b"ssh-ed25519" => 0,
+        b"rsa-sha2-256" => 2,
+        b"rsa-sha2-512" => 4,
+        _ => panic!("unexpected SSH authentication algorithm"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -748,6 +1254,37 @@ async fn restores_sigpipe_before_executing_the_command() {
 fn native_exec_probe() {
     if let Ok(value) = std::env::var("AGENTKNOCK_PINNED_EXEC_TEST") {
         println!("PINNED_EXECUTABLE={value}");
+    }
+}
+
+#[test]
+fn authenticates_with_selected_and_upstream_keys_probe() {
+    let Ok(port) = std::env::var("AGENTKNOCK_TEST_SSH_PORT") else {
+        return;
+    };
+    let port = port.parse().unwrap();
+    let user = std::env::var("AGENTKNOCK_TEST_SSH_USER").unwrap();
+    let selected_key = std::env::var_os("AGENTKNOCK_TEST_SELECTED_KEY").unwrap();
+    let upstream_key = std::env::var_os("AGENTKNOCK_TEST_UPSTREAM_KEY").unwrap();
+
+    for (key, expected) in [
+        (selected_key, "selected-key"),
+        (upstream_key, "upstream-key"),
+    ] {
+        let output = Command::new("ssh")
+            .args(ssh_options(port))
+            .args(["-o", "IdentitiesOnly=yes", "-i"])
+            .arg(key)
+            .arg(format!("{user}@127.0.0.1"))
+            .args(["printf", expected])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     }
 }
 

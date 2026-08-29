@@ -6,7 +6,12 @@ use std::{
     io::{self, Read as _, Write as _},
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
-        unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
+        unix::{
+            ffi::{OsStrExt as _, OsStringExt as _},
+            fs::PermissionsExt as _,
+            net::UnixStream,
+            process::CommandExt as _,
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
@@ -22,9 +27,12 @@ use std::sync::{
 
 use agentknock::{
     ApplicationInfo, Client, GitSignProgress, GitSignRepository, GitSignRequest,
-    SecretUseInvocation, SshSecretUse,
+    SecretUseInvocation, SshAuthenticationProgress, SshAuthenticationRequest, SshSecretUse,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures_util::{
+    FutureExt as _, StreamExt as _, future::LocalBoxFuture, stream::FuturesUnordered,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -32,6 +40,7 @@ use tokio::{
 };
 
 use crate::git_repository::Repository;
+use crate::ssh_agent::{Action as AgentAction, AgentConnection, SelectedIdentity};
 
 const INTERNAL_ARGUMENT: &str = "__invocation-service";
 const GIT_SIGN_HELPER_NAME: &str = "git-sign";
@@ -47,6 +56,8 @@ struct StartupRequest {
     invocation_token: String,
     secret: String,
     public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_agent_socket: Option<String>,
     quiet: bool,
     verbose: bool,
 }
@@ -85,6 +96,8 @@ struct ServiceContext {
     invocation_token: [u8; 32],
     secret: String,
     public_key: String,
+    upstream_agent_socket: Option<OsString>,
+    selected_identity: SelectedIdentity,
     quiet: bool,
     verbose: bool,
 }
@@ -93,6 +106,7 @@ struct PreparedService {
     owner: ProcessMonitor,
     _runtime_directory: tempfile::TempDir,
     listener: tokio::net::UnixListener,
+    agent_listener: tokio::net::UnixListener,
     runtime_directory: String,
     context: ServiceContext,
 }
@@ -191,6 +205,7 @@ impl InvocationService {
     pub fn start(
         invocation: &SecretUseInvocation,
         ssh: &SshSecretUse,
+        upstream_agent_socket: Option<&OsStr>,
         quiet: bool,
         verbose: bool,
     ) -> io::Result<Self> {
@@ -206,7 +221,14 @@ impl InvocationService {
             .process_group(0)
             .spawn()?;
 
-        match initialize(&mut process, invocation, ssh, quiet, verbose) {
+        match initialize(
+            &mut process,
+            invocation,
+            ssh,
+            upstream_agent_socket,
+            quiet,
+            verbose,
+        ) {
             Ok(runtime_directory) => Ok(Self {
                 _process: process,
                 runtime_directory,
@@ -224,7 +246,7 @@ impl InvocationService {
         }
     }
 
-    pub fn git_environment(
+    pub fn environment(
         &self,
         existing_count: Option<&OsStr>,
     ) -> io::Result<BTreeMap<OsString, OsString>> {
@@ -259,6 +281,12 @@ impl InvocationService {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many Git settings"))?;
 
         Ok(BTreeMap::from([
+            (
+                "SSH_AUTH_SOCK".into(),
+                self.runtime_directory
+                    .join(crate::ssh_agent::SOCKET_NAME)
+                    .into_os_string(),
+            ),
             ("GIT_CONFIG_COUNT".into(), final_count.to_string().into()),
             (
                 format!("GIT_CONFIG_KEY_{count}").into(),
@@ -281,6 +309,7 @@ fn initialize(
     process: &mut Child,
     invocation: &SecretUseInvocation,
     ssh: &SshSecretUse,
+    upstream_agent_socket: Option<&OsStr>,
     quiet: bool,
     verbose: bool,
 ) -> io::Result<PathBuf> {
@@ -291,6 +320,9 @@ fn initialize(
         invocation_token: BASE64_STANDARD.encode(invocation.token()),
         secret: ssh.name().to_owned(),
         public_key: ssh.public_key().to_owned(),
+        upstream_agent_socket: upstream_agent_socket
+            .map(OsStr::as_bytes)
+            .map(|path| BASE64_STANDARD.encode(path)),
         quiet,
         verbose,
     };
@@ -326,12 +358,30 @@ fn prepare() -> io::Result<PreparedService> {
             "invocation token isn't 32 bytes",
         )
     })?;
+    let upstream_agent_socket = request
+        .upstream_agent_socket
+        .map(|socket| {
+            BASE64_STANDARD
+                .decode(socket)
+                .map(OsString::from_vec)
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid upstream SSH agent socket: {error}"),
+                    )
+                })
+        })
+        .transpose()?;
     let owner = open_process(request.owner_pid)?;
     let runtime_directory = runtime_directory()?;
     let socket_path = runtime_directory.path().join(SOCKET_NAME);
     let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
+    let agent_socket_path = runtime_directory.path().join(crate::ssh_agent::SOCKET_NAME);
+    let agent_listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
+    agent_listener.set_nonblocking(true)?;
+    let agent_listener = tokio::net::UnixListener::from_std(agent_listener)?;
     let helper_path = runtime_directory.path().join(if request.quiet {
         QUIET_GIT_SIGN_HELPER_NAME
     } else {
@@ -349,10 +399,13 @@ fn prepare() -> io::Result<PreparedService> {
         })?
         .to_owned();
 
+    let selected_identity =
+        SelectedIdentity::from_openssh(&request.public_key, request.secret.clone())?;
     Ok(PreparedService {
         owner,
         _runtime_directory: runtime_directory,
         listener,
+        agent_listener,
         runtime_directory: path,
         context: ServiceContext {
             client: Client::new(ApplicationInfo::new(
@@ -364,6 +417,8 @@ fn prepare() -> io::Result<PreparedService> {
             invocation_token,
             secret: request.secret,
             public_key: request.public_key,
+            upstream_agent_socket,
+            selected_identity,
             quiet: request.quiet,
             verbose: request.verbose,
         },
@@ -387,12 +442,86 @@ fn runtime_directory() -> io::Result<tempfile::TempDir> {
 }
 
 async fn serve(service: PreparedService) -> io::Result<()> {
+    let PreparedService {
+        owner,
+        _runtime_directory,
+        listener,
+        agent_listener,
+        runtime_directory: _,
+        context,
+    } = service;
+    let owner = Rc::new(owner);
+    let context = Rc::new(context);
+    let mut connections = FuturesUnordered::<LocalBoxFuture<'static, ()>>::new();
+
     loop {
+        enum Connection {
+            Helper(tokio::net::UnixStream),
+            Agent(tokio::net::UnixStream),
+        }
         let connection = tokio::select! {
-            result = service.listener.accept() => result?.0,
-            result = wait_for_process(&service.owner) => return result,
+            result = listener.accept() => Some(Connection::Helper(result?.0)),
+            result = agent_listener.accept() => Some(Connection::Agent(result?.0)),
+            Some(()) = connections.next(), if !connections.is_empty() => None,
+            result = wait_for_process(&owner) => return result,
         };
-        let _ = handle_connection(connection, &service.context, &service.owner).await;
+        let Some(connection) = connection else {
+            continue;
+        };
+        let context = Rc::clone(&context);
+        let owner = Rc::clone(&owner);
+        let handler = match connection {
+            Connection::Helper(connection) => async move {
+                let _ = handle_connection(connection, &context, &owner).await;
+            }
+            .boxed_local(),
+            Connection::Agent(connection) => async move {
+                let _ = handle_agent_connection(connection, &context, &owner).await;
+            }
+            .boxed_local(),
+        };
+        connections.push(handler);
+    }
+}
+
+async fn handle_agent_connection(
+    mut connection: tokio::net::UnixStream,
+    context: &ServiceContext,
+    owner: &ProcessMonitor,
+) -> io::Result<()> {
+    let peer_pid = connection
+        .peer_cred()?
+        .pid()
+        .ok_or_else(|| io::Error::other("SSH agent client has no process identifier"))?;
+    require_descendant(peer_pid, context.owner_pid)?;
+    let mut agent = AgentConnection::new(
+        &context.selected_identity,
+        context.upstream_agent_socket.as_deref(),
+    );
+
+    loop {
+        let packet = tokio::select! {
+            result = crate::ssh_agent::read_packet(&mut connection) => result?,
+            result = wait_for_process(owner) => return result,
+        };
+        let Some(packet) = packet else {
+            return Ok(());
+        };
+        let response = match agent.handle(&packet).await {
+            AgentAction::Respond(response) => response,
+            AgentAction::Authenticate { algorithm, message } => {
+                match request_ssh_authentication(context, owner, algorithm, &message).await {
+                    Ok(signature) => crate::ssh_agent::signature_response(&signature),
+                    Err(error) => {
+                        if !context.quiet {
+                            print_message(format!("SSH authentication failed: {error}."));
+                        }
+                        crate::ssh_agent::failure_response().to_vec()
+                    }
+                }
+            }
+        };
+        crate::ssh_agent::write_packet(&mut connection, &response).await?;
     }
 }
 
@@ -489,6 +618,54 @@ async fn request_git_signature(
                     print_message(format!(
                         "{} ({} elapsed).",
                         progress_message(progress),
+                        human_duration(started.elapsed()),
+                    ));
+                }
+                heartbeat.as_mut().reset(Instant::now() + PROGRESS_INTERVAL);
+            }
+        }
+    }
+}
+
+async fn request_ssh_authentication(
+    context: &ServiceContext,
+    owner: &ProcessMonitor,
+    algorithm: agentknock::SshSignatureAlgorithm,
+    message: &[u8],
+) -> io::Result<Vec<u8>> {
+    let current_progress = Rc::new(Cell::new(None));
+    let observed_progress = Rc::clone(&current_progress);
+    let request = context.client.request_ssh_authentication(
+        SshAuthenticationRequest {
+            invocation_id: &context.invocation_id,
+            invocation_token: &context.invocation_token,
+            secret: &context.secret,
+            algorithm,
+            message,
+        },
+        async {
+            let _ = wait_for_process(owner).await;
+        },
+        |progress| {
+            let changed = observed_progress.replace(Some(progress)) != Some(progress);
+            if changed && context.verbose {
+                print_ssh_progress(progress);
+            }
+        },
+    );
+    tokio::pin!(request);
+    let started = Instant::now();
+    let heartbeat = sleep(PROGRESS_INTERVAL);
+    tokio::pin!(heartbeat);
+
+    loop {
+        tokio::select! {
+            result = request.as_mut() => return result.map_err(io::Error::other),
+            _ = heartbeat.as_mut(), if !context.quiet => {
+                if let Some(progress) = current_progress.get() {
+                    print_message(format!(
+                        "{} ({} elapsed).",
+                        ssh_progress_message(progress),
                         human_duration(started.elapsed()),
                     ));
                 }
@@ -688,7 +865,7 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
 
     let signing = match parse_git_sign_arguments(&arguments[1..]) {
         Ok(signing) => signing,
-        Err(_) => return exec_ssh_keygen(&arguments[1..]),
+        Err(_) => return exec_ssh_keygen(runtime_directory, &arguments[1..]),
     };
     let requested_key = fs::read_to_string(&signing.key_file)?;
     let HelperResponse::PublicKey { public_key } =
@@ -699,7 +876,7 @@ fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
         ));
     };
     if !signing_key_matches(&requested_key, &public_key)? {
-        return exec_ssh_keygen(&arguments[1..]);
+        return exec_ssh_keygen(runtime_directory, &arguments[1..]);
     }
     let data = fs::read(&signing.data_file)?;
     let repository = Repository::collect(&data);
@@ -808,8 +985,14 @@ fn validate_signing_key(requested: &str, expected: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn exec_ssh_keygen(arguments: &[OsString]) -> io::Result<()> {
-    Err(Command::new("ssh-keygen").args(arguments).exec())
+fn exec_ssh_keygen(runtime_directory: &Path, arguments: &[OsString]) -> io::Result<()> {
+    Err(Command::new("ssh-keygen")
+        .args(arguments)
+        .env(
+            "SSH_AUTH_SOCK",
+            runtime_directory.join(crate::ssh_agent::SOCKET_NAME),
+        )
+        .exec())
 }
 
 fn call_service(runtime_directory: &Path, request: &HelperRequest) -> io::Result<HelperResponse> {
@@ -826,6 +1009,25 @@ fn call_service(runtime_directory: &Path, request: &HelperRequest) -> io::Result
 
 fn print_progress(progress: GitSignProgress) {
     print_message(progress_message(progress));
+}
+
+fn print_ssh_progress(progress: SshAuthenticationProgress) {
+    print_message(ssh_progress_message(progress));
+}
+
+fn ssh_progress_message(progress: SshAuthenticationProgress) -> &'static str {
+    match progress {
+        SshAuthenticationProgress::Preparing => "Preparing the SSH authentication request.",
+        SshAuthenticationProgress::WaitingForDelivery => {
+            "Waiting to deliver the SSH authentication request to the device."
+        }
+        SshAuthenticationProgress::WaitingForResponse => {
+            "Waiting for the device to approve SSH authentication."
+        }
+        SshAuthenticationProgress::Completing => "The device approved SSH authentication.",
+        SshAuthenticationProgress::Completed => "SSH authentication is approved.",
+        _ => "Waiting for SSH authentication approval.",
+    }
 }
 
 fn progress_message(progress: GitSignProgress) -> &'static str {

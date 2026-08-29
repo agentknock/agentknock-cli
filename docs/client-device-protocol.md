@@ -303,6 +303,7 @@ member. Version 1 defines the following methods:
 | --- | --- |
 | `Invocation` | Prepare one or more secrets for a command invocation. |
 | `GitSign` | Request a Git SSH signature for an existing invocation. |
+| `SshAuthenticate` | Request an SSH user-authentication signature for an existing invocation. |
 | `SecretList` | List secret metadata without secret values. |
 | `SecretUpload` | Deliver a secret proposal for separate acceptance. |
 | `PairingRemove` | Remove the relationship between the client and device. |
@@ -366,7 +367,7 @@ key remains on the device.
 The `Invocation` method asks the device to prepare a set of named secrets for
 one command invocation. Environment secrets can release values in the
 response. SSH secrets release only their public keys; later `GitSign`
-exchanges request individual signatures.
+or `SshAuthenticate` exchanges request individual signatures.
 
 ### Invocation request
 
@@ -609,6 +610,106 @@ produces an aborted completion. After the client authenticates a terminal
 response, later cancellation does not change its completion result. Each
 signature uses its own request identifier and paired cryptographic context.
 
+## SSH authentication
+
+The `SshAuthenticate` method requests a signature for one SSH user
+authentication. It uses a new paired exchange related to an earlier
+`Invocation` exchange. The device makes a separate decision for every
+authentication request; accepting the invocation does not approve later SSH
+authentication.
+
+### SSH authentication request
+
+```json
+{
+  "method": "SshAuthenticate",
+  "invocation_id": "01K2ENXDTW1P3XAR4J7V7C9D0H",
+  "invocation_token": "base64 invocation token",
+  "secret": "production-ssh",
+  "message": "base64 SSH user-authentication message"
+}
+```
+
+`invocation_id`, `invocation_token`, and `secret` have the same meaning and
+validation requirements as in a `GitSign` request. `message` is the Base64
+encoding of the complete byte sequence that the SSH client asks its agent to
+sign.
+
+The decoded message must have one of these SSH binary forms, using the SSH
+`string`, `byte`, and `boolean` encodings:
+
+```text
+string  session_identifier
+byte    SSH_MSG_USERAUTH_REQUEST (50)
+string  user_name
+string  "ssh-connection"
+string  "publickey"
+boolean TRUE
+string  signature_algorithm
+string  public_key_blob
+```
+
+```text
+string  session_identifier
+byte    SSH_MSG_USERAUTH_REQUEST (50)
+string  user_name
+string  "ssh-connection"
+string  "publickey-hostbound-v00@openssh.com"
+boolean TRUE
+string  signature_algorithm
+string  public_key_blob
+string  server_public_host_key
+```
+
+The session identifier must not be empty. `public_key_blob` must be exactly
+the public key selected by `secret`. For an Ed25519 key,
+`signature_algorithm` is `ssh-ed25519`. For an RSA key, it is
+`rsa-sha2-512` or `rsa-sha2-256`; the legacy RSA-SHA1 `ssh-rsa` signature
+algorithm is invalid. The host-bound form contains a nonempty SSH public host
+key blob with a nonempty algorithm and key data. No fields or trailing bytes
+are permitted beyond the selected form.
+
+Both endpoints validate the complete outer message structure before using it.
+In particular, a device must not treat `SshAuthenticate` as a generic signing
+operation.
+
+### SSH authentication response and completion
+
+An approved response contains a complete SSH signature blob, encoded as
+Base64:
+
+```json
+{
+  "result": "APPROVED",
+  "signature": "base64 SSH signature blob"
+}
+```
+
+The decoded signature blob has this SSH binary form:
+
+```text
+string  signature_algorithm
+string  signature
+```
+
+The signature covers the decoded request `message` with the SSH key named by
+`secret`. Its algorithm must match the algorithm in that message. An Ed25519
+signature is exactly 64 bytes. An RSA signature uses RSASSA-PKCS1-v1_5 with
+the SHA-256 or SHA-512 hash selected by the algorithm. The approval completion
+omits the signature:
+
+```json
+{
+  "result": "APPROVED"
+}
+```
+
+A denied response and its completion use the same `DENIED` form as an
+invocation response. Cancellation, failure, and invalid responses use the same
+client-only `ABORTED` completion form and rules as Git signing. Each
+authentication uses its own request identifier and paired cryptographic
+context.
+
 ## Secret list
 
 The `SecretList` request contains only the method and client software
@@ -825,4 +926,9 @@ version string.
 
 - [Agentknock v1 cryptosystem](cryptosystem.md)
 - [Agentknock v1 client-relay protocol](client-relay-protocol.md)
+- [OpenSSH protocol extensions](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL)
+- [RFC 4251: SSH Protocol Architecture](https://www.rfc-editor.org/rfc/rfc4251.html)
+- [RFC 4252: SSH Authentication Protocol](https://www.rfc-editor.org/rfc/rfc4252.html)
 - [RFC 4648: The Base16, Base32, and Base64 Data Encodings](https://www.rfc-editor.org/rfc/rfc4648.html)
+- [RFC 8332: RSA Keys with SHA-2 for SSH](https://www.rfc-editor.org/rfc/rfc8332.html)
+- [RFC 8709: Ed25519 and Ed448 Public Key Algorithms for SSH](https://www.rfc-editor.org/rfc/rfc8709.html)

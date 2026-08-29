@@ -1,9 +1,9 @@
 # Agentknock command execution semantics
 
 This document explains how the Agentknock CLI selects and starts a command,
-delivers environment values, and supports deferred operations such as Git
-signing. It describes the operating-system mechanisms, the consistency
-properties they provide, and the limits of those properties.
+delivers environment values, and provides SSH authentication and Git signing
+during the command. It describes the operating-system mechanisms, the
+consistency properties they provide, and the limits of those properties.
 
 The [Agentknock v1 client-device protocol](client-device-protocol.md) defines
 the command metadata sent to the device. The [Agentknock v1
@@ -48,7 +48,8 @@ into a sandbox or privilege boundary.
    device.
 4. Wait for an authenticated response and complete the protocol exchange.
 5. If the response contains an SSH secret, start an invocation service for
-   deferred operations and add its Git settings to the command environment.
+   deferred SSH operations and add its agent socket and Git settings to the
+   command environment.
 6. Revalidate the selected executable, including its hash when available.
 7. Overlay returned environment variables and Agentknock's Git settings on the
    inherited environment.
@@ -88,7 +89,7 @@ specific races:
 | Approval metadata to executable contents | Hash before the request and again before execution. | The file can change after the second hash observation. |
 | Approval wait to script execution | Rehash the captured script path immediately before `execve`. | The pathname or file can change after revalidation. |
 | Signal handling to process replacement | Block termination signals, check pending signals, then restore the caller's state. | A later signal follows the restored disposition as normal. |
-| Invocation to deferred helper | Keep the invocation token in a service tied to the command PID and check helper ancestry. | A capable same-user process remains inside the threat boundary. |
+| Invocation to deferred operation | Keep the invocation token in a service tied to the command PID and check client-process ancestry. | A capable same-user process remains inside the threat boundary. |
 
 An executable hash is an observation, not an execution handle. Revalidating a
 hash can detect a change, but it cannot make mutable bytes immutable or make
@@ -135,8 +136,9 @@ After an authenticated response, Agentknock builds the command environment:
    replaces an inherited value with the same name.
 3. Reject an empty returned name, a name containing `=` or NUL, or a value
    containing NUL.
-4. If an SSH secret enables deferred Git signing, add the Git configuration
-   entries described below.
+4. If an SSH secret enables deferred operations, replace `SSH_AUTH_SOCK` with
+   an invocation-scoped agent that also routes requests to the previous agent,
+   and add the Git configuration entries described below.
 5. Produce at most one entry for each environment variable name.
 
 When multiple requested secrets provide the same environment variable, their
@@ -255,22 +257,65 @@ be a different execution object and could change path behavior, file
 attributes, capabilities, signatures, or security-policy treatment. It would
 also leave interpreters and runtime dependencies unpinned.
 
-### Invocation service and Git signing
+### Invocation service and SSH operations
 
 An invocation response containing an SSH secret includes its name and public
 key, not its private key. Agentknock starts a separate copy of its executable
 as an invocation service before replacing the launcher process. The launcher
 sends the service the invocation identifier, a fresh 32-byte invocation token,
-the SSH secret name and public key, the owner process ID, and output settings
-through the service's standard input. It does not pass a live HPKE context to
-the service.
+the SSH secret name and public key, the upstream SSH agent socket, the owner
+process ID, and output settings through the service's standard input. It does
+not pass a live HPKE context to the service.
 
-The service creates a mode-0700 temporary directory containing a Unix-domain
-socket and a symlink to `/proc/<service-pid>/exe`. The symlink lets Git invoke
-the same Agentknock binary as its signing helper without installing another
-executable or adding a directory to `PATH`. The directory and its entries are
-removed when the service exits normally; an abrupt service failure can leave
-them behind.
+The service creates a mode-0700 temporary directory containing two Unix-domain
+sockets and a symlink to `/proc/<service-pid>/exe`. `agent.sock` implements the
+SSH agent protocol. `service.sock` is the private protocol used by the Git
+signing helper. The symlink lets Git invoke the same Agentknock binary as its
+signing helper without installing another executable or adding a directory to
+`PATH`. The directory and its entries are removed when the service exits
+normally; an abrupt service failure can leave them behind.
+
+The launcher sets `SSH_AUTH_SOCK` to `agent.sock`, replacing any inherited or
+device-returned value. The service uses that previous value as an optional
+upstream agent. For every client connection, it lazily opens one corresponding
+upstream connection and preserves it for the lifetime of the client
+connection.
+
+For a supported key, the agent lists the selected public key first, followed
+by identities reported by the upstream agent in their original order. It
+removes an upstream identity with the same key blob as the selected key. For a
+selected key type that Agentknock cannot use for authentication, it omits the
+selected identity and still removes an upstream duplicate. These rules ensure
+that the selected key cannot bypass Agentknock through the upstream agent.
+
+When an SSH client asks the selected key to sign a valid SSH
+user-authentication message, the service creates a protected
+`SshAuthenticate` exchange containing the original invocation identifier and
+token, the SSH secret name, and the exact message. Every authentication
+receives a separate device decision. A signing request for any other key is
+passed unchanged to the upstream agent, and its response is returned
+unchanged.
+
+The agent accepts the standard `publickey` message and OpenSSH's host-bound
+variant. It supports Ed25519 and the SHA-256 and SHA-512 RSA signature
+algorithms. It rejects legacy RSA-SHA1 signatures and arbitrary signing
+payloads for the selected key. Extension requests are passed to the same
+upstream connection so that connection-scoped behavior remains intact. The
+service refuses key management, locking, and other operations whose semantics
+cannot apply consistently to both the immutable selected key and the upstream
+agent.
+
+If an upstream socket is absent, unavailable, or fails during a connection,
+the selected key remains available. Upstream operations fail for the rest of
+that client connection; a new connection can try the upstream socket again.
+
+The service handles socket connections concurrently and handles messages in
+order within each connection. This permits multiple SSH clients and the Git
+signing helper to use the invocation service at the same time.
+
+An explicit OpenSSH `IdentityAgent` setting takes precedence over
+`SSH_AUTH_SOCK` and can therefore select another agent. Agentknock does not
+rewrite SSH command arguments or configuration to prevent that override.
 
 The launcher adds two Git settings through `GIT_CONFIG_COUNT`:
 
@@ -296,14 +341,17 @@ expected by Git. Every signature receives a separate device decision.
 
 If Git requests another key or invokes the configured program for another
 operation, the helper replaces itself with `ssh-keygen` from `PATH` and passes
-the original arguments unchanged.
+the original arguments unchanged. The system command can use a key file
+directly. It also inherits `agent.sock`; requests for another agent key follow
+the same upstream routing as SSH authentication.
 
 The service opens a pidfd for the owner process, whose PID remains stable when
 the launcher replaces itself with the command. It exits when that process
-exits. Before serving a helper connection, it reads the peer PID from the Unix
-socket and walks Linux parent-process records to require that the helper is a
-descendant of the owner. If the owner exits during a signing request, the
-service cancels the request and attempts a short aborted completion.
+exits. Before serving a helper or agent connection, it reads the peer PID from
+the Unix socket and walks Linux parent-process records to require that the
+client is a descendant of the owner. If the owner exits during a protected
+operation, the service cancels the request and attempts a short aborted
+completion.
 
 These checks keep ordinary unrelated processes from accidentally using an
 invocation service. They are not a same-user security boundary. The security
@@ -440,9 +488,11 @@ similar to the Linux script path.
 ### Invocation service
 
 The invocation service copies its current Agentknock executable into its
-private mode-0700 temporary directory as the Git signing helper. This avoids a
-dependency on `/proc`, which macOS does not provide. The copied helper contains
-no secret data; the invocation token and SSH metadata remain in service memory.
+private mode-0700 temporary directory as the Git signing helper. It uses the
+same agent and helper sockets as the Linux implementation. Copying the helper
+avoids a dependency on `/proc`, which macOS does not provide. The copied helper
+contains no secret data; the invocation token and SSH metadata remain in
+service memory.
 
 The service registers the owner PID with `kqueue` using `EVFILT_PROC` and
 `NOTE_EXIT`, and exits when that process exits. It obtains a helper's peer PID
@@ -484,3 +534,6 @@ secrets.
 - [macOS `kqueue(2)` manual page](https://keith.github.io/xcode-man-pages/kqueue.2.html)
 - [Apple `libproc` interface](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.h)
 - [POSIX `exec` specification](https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html)
+- [RFC 4252: SSH Authentication Protocol](https://www.rfc-editor.org/rfc/rfc4252.html)
+- [RFC 8332: RSA Keys with SHA-2 for SSH](https://www.rfc-editor.org/rfc/rfc8332.html)
+- [RFC 9987: SSH Agent Protocol](https://www.rfc-editor.org/rfc/rfc9987.html)

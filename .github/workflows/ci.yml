@@ -64,6 +64,12 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install OpenSSH server
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server
+
       - name: Run checks and integration tests
         run: make check
 
