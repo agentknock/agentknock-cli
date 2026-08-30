@@ -14,8 +14,9 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode, Stdio},
+    process::{Child, ChildStdout, Command, ExitCode, Stdio},
     rc::Rc,
+    sync::mpsc,
     time::Duration,
 };
 
@@ -57,8 +58,10 @@ struct StartupRequest {
     owner_pid: libc::pid_t,
     invocation_id: String,
     invocation_token: String,
-    secret: String,
-    public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh: Option<StartupSsh>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upstream_agent_socket: Option<String>,
     ssh_agent: bool,
@@ -69,10 +72,21 @@ struct StartupRequest {
 }
 
 #[derive(Deserialize, Serialize)]
+struct StartupSsh {
+    secret: String,
+    public_key: String,
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum StartupResponse {
-    Ready { runtime_directory: String },
-    Error { message: String },
+    Ready {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_directory: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,13 +121,17 @@ struct ServiceContext {
     owner_pid: libc::pid_t,
     invocation_id: String,
     invocation_token: [u8; 32],
-    secret: String,
-    public_key: String,
+    ssh: Option<ServiceSsh>,
     upstream_agent_socket: Option<OsString>,
     ssh_passthrough: bool,
-    selected_identity: SelectedIdentity,
     quiet: bool,
     verbose: bool,
+}
+
+struct ServiceSsh {
+    secret: String,
+    public_key: String,
+    selected_identity: SelectedIdentity,
 }
 
 #[derive(Clone, Copy)]
@@ -127,10 +145,11 @@ pub(super) struct ServiceOptions {
 
 struct PreparedService {
     owner: ProcessMonitor,
-    _runtime_directory: tempfile::TempDir,
+    _runtime_directory: Option<tempfile::TempDir>,
     listener: Option<tokio::net::UnixListener>,
     agent_listener: Option<tokio::net::UnixListener>,
-    runtime_directory: String,
+    runtime_directory: Option<String>,
+    stdin: Option<String>,
     context: ServiceContext,
 }
 
@@ -149,7 +168,8 @@ struct ProcessMonitor {
 /// process exits.
 pub struct InvocationService {
     _process: Child,
-    runtime_directory: PathBuf,
+    stdin: Option<ChildStdout>,
+    runtime_directory: Option<PathBuf>,
     helper_name: &'static str,
     options: ServiceOptions,
 }
@@ -179,6 +199,7 @@ pub fn run() -> ExitCode {
             let _ = write_response(&StartupResponse::Error {
                 message: error.to_string(),
             });
+            close_standard_output();
             return ExitCode::FAILURE;
         }
     };
@@ -186,14 +207,28 @@ pub fn run() -> ExitCode {
         let _runtime = runtime.enter();
         prepare()
     };
-    let service = match prepared {
+    let mut service = match prepared {
         Ok(service) => service,
         Err(error) => {
             let _ = write_response(&StartupResponse::Error {
                 message: error.to_string(),
             });
+            close_standard_output();
             return ExitCode::FAILURE;
         }
+    };
+    let stdin_writer = match service.stdin.take() {
+        Some(value) => match prepare_stdin_writer(value) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                let _ = write_response(&StartupResponse::Error {
+                    message: error.to_string(),
+                });
+                close_standard_output();
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
     };
     if write_response(&StartupResponse::Ready {
         runtime_directory: service.runtime_directory.clone(),
@@ -202,11 +237,33 @@ pub fn run() -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
+    match stdin_writer {
+        Some(writer) => {
+            let _ = writer.send(());
+        }
+        None => close_standard_output(),
+    }
 
     match runtime.block_on(serve(service)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
+}
+
+fn prepare_stdin_writer(value: String) -> io::Result<mpsc::SyncSender<()>> {
+    let (start, ready) = mpsc::sync_channel(0);
+    std::thread::Builder::new()
+        .name("agentknock-stdin-writer".into())
+        .spawn(move || {
+            if ready.recv().is_ok() {
+                let mut output = io::stdout().lock();
+                let _ = output.write_all(value.as_bytes());
+                let _ = output.flush();
+                drop(output);
+                close_standard_output();
+            }
+        })?;
+    Ok(start)
 }
 
 pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
@@ -228,7 +285,8 @@ pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
 impl InvocationService {
     pub fn start(
         invocation: &SecretUseInvocation,
-        ssh: &SshSecretUse,
+        ssh: Option<&SshSecretUse>,
+        stdin: Option<&str>,
         upstream_agent_socket: Option<&OsStr>,
         options: ServiceOptions,
     ) -> io::Result<Self> {
@@ -248,11 +306,13 @@ impl InvocationService {
             &mut process,
             invocation,
             ssh,
+            stdin,
             upstream_agent_socket,
             options,
         ) {
-            Ok(runtime_directory) => Ok(Self {
+            Ok((runtime_directory, stdin)) => Ok(Self {
                 _process: process,
+                stdin,
                 runtime_directory,
                 helper_name: if options.quiet {
                     QUIET_GIT_SIGN_HELPER_NAME
@@ -274,10 +334,13 @@ impl InvocationService {
         existing_count: Option<&OsStr>,
     ) -> io::Result<BTreeMap<OsString, OsString>> {
         let mut environment = BTreeMap::new();
+        let Some(runtime_directory) = &self.runtime_directory else {
+            return Ok(environment);
+        };
         if self.options.ssh_agent {
             environment.insert(
                 "SSH_AUTH_SOCK".into(),
-                self.runtime_directory
+                runtime_directory
                     .join(crate::ssh_agent::SOCKET_NAME)
                     .into_os_string(),
             );
@@ -286,7 +349,7 @@ impl InvocationService {
             return Ok(environment);
         }
 
-        let helper = self.runtime_directory.join(self.helper_name);
+        let helper = runtime_directory.join(self.helper_name);
         let helper = helper.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -334,22 +397,31 @@ impl InvocationService {
         ]);
         Ok(environment)
     }
+
+    pub fn take_stdin(&mut self) -> Option<ChildStdout> {
+        self.stdin.take()
+    }
 }
 
 fn initialize(
     process: &mut Child,
     invocation: &SecretUseInvocation,
-    ssh: &SshSecretUse,
+    ssh: Option<&SshSecretUse>,
+    stdin: Option<&str>,
     upstream_agent_socket: Option<&OsStr>,
     options: ServiceOptions,
-) -> io::Result<PathBuf> {
+) -> io::Result<(Option<PathBuf>, Option<ChildStdout>)> {
+    let has_stdin = stdin.is_some();
     let request = StartupRequest {
         // SAFETY: getpid has no preconditions.
         owner_pid: unsafe { libc::getpid() },
         invocation_id: invocation.id().to_owned(),
         invocation_token: BASE64_STANDARD.encode(invocation.token()),
-        secret: ssh.name().to_owned(),
-        public_key: ssh.public_key().to_owned(),
+        ssh: ssh.map(|ssh| StartupSsh {
+            secret: ssh.name().to_owned(),
+            public_key: ssh.public_key().to_owned(),
+        }),
+        stdin: stdin.map(str::to_owned),
         upstream_agent_socket: upstream_agent_socket
             .map(OsStr::as_bytes)
             .map(|path| BASE64_STANDARD.encode(path)),
@@ -367,15 +439,16 @@ fn initialize(
     input.write_all(b"\n")?;
     drop(input);
 
-    let response: StartupResponse = serde_json::from_reader(
-        process
-            .stdout
-            .take()
-            .expect("the invocation service has piped standard output"),
-    )
-    .map_err(io::Error::other)?;
+    let mut output = process
+        .stdout
+        .take()
+        .expect("the invocation service has piped standard output");
+    let response = read_response(&mut output)?;
     match response {
-        StartupResponse::Ready { runtime_directory } => Ok(PathBuf::from(runtime_directory)),
+        StartupResponse::Ready { runtime_directory } => Ok((
+            runtime_directory.map(PathBuf::from),
+            has_stdin.then_some(output),
+        )),
         StartupResponse::Error { message } => Err(io::Error::other(message)),
     }
 }
@@ -391,7 +464,7 @@ fn prepare() -> io::Result<PreparedService> {
             "invocation token isn't 32 bytes",
         )
     })?;
-    let upstream_agent_socket = if request.ssh_passthrough {
+    let upstream_agent_socket = if request.ssh.is_some() && request.ssh_passthrough {
         request
             .upstream_agent_socket
             .map(|socket| {
@@ -410,50 +483,83 @@ fn prepare() -> io::Result<PreparedService> {
         None
     };
     let owner = open_process(request.owner_pid)?;
-    let runtime_directory = runtime_directory()?;
-    let listener = if request.git_signing {
-        let socket_path = runtime_directory.path().join(SOCKET_NAME);
+    let runtime_directory = request
+        .ssh
+        .as_ref()
+        .map(|_| runtime_directory())
+        .transpose()?;
+    let listener = if request.ssh.is_some() && request.git_signing {
+        let socket_path = runtime_directory
+            .as_ref()
+            .expect("an SSH service has a runtime directory")
+            .path()
+            .join(SOCKET_NAME);
         let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
         listener.set_nonblocking(true)?;
         Some(tokio::net::UnixListener::from_std(listener)?)
     } else {
         None
     };
-    let agent_listener = if request.ssh_agent || upstream_agent_socket.is_some() {
-        let agent_socket_path = runtime_directory.path().join(crate::ssh_agent::SOCKET_NAME);
-        let listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
-        listener.set_nonblocking(true)?;
-        Some(tokio::net::UnixListener::from_std(listener)?)
-    } else {
-        None
-    };
-    if request.git_signing {
-        let helper_path = runtime_directory.path().join(if request.quiet {
-            QUIET_GIT_SIGN_HELPER_NAME
+    let agent_listener =
+        if request.ssh.is_some() && (request.ssh_agent || upstream_agent_socket.is_some()) {
+            let agent_socket_path = runtime_directory
+                .as_ref()
+                .expect("an SSH service has a runtime directory")
+                .path()
+                .join(crate::ssh_agent::SOCKET_NAME);
+            let listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
+            listener.set_nonblocking(true)?;
+            Some(tokio::net::UnixListener::from_std(listener)?)
         } else {
-            GIT_SIGN_HELPER_NAME
-        });
+            None
+        };
+    if request.ssh.is_some() && request.git_signing {
+        let helper_path = runtime_directory
+            .as_ref()
+            .expect("an SSH service has a runtime directory")
+            .path()
+            .join(if request.quiet {
+                QUIET_GIT_SIGN_HELPER_NAME
+            } else {
+                GIT_SIGN_HELPER_NAME
+            });
         install_helper(&helper_path)?;
     }
     let path = runtime_directory
-        .path()
-        .to_str()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invocation service runtime directory isn't valid UTF-8",
-            )
-        })?
-        .to_owned();
+        .as_ref()
+        .map(|runtime_directory| {
+            runtime_directory
+                .path()
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invocation service runtime directory isn't valid UTF-8",
+                    )
+                })
+                .map(str::to_owned)
+        })
+        .transpose()?;
 
-    let selected_identity =
-        SelectedIdentity::from_openssh(&request.public_key, request.secret.clone())?;
+    let ssh = request
+        .ssh
+        .map(|ssh| {
+            let selected_identity =
+                SelectedIdentity::from_openssh(&ssh.public_key, ssh.secret.clone())?;
+            Ok::<_, io::Error>(ServiceSsh {
+                secret: ssh.secret,
+                public_key: ssh.public_key,
+                selected_identity,
+            })
+        })
+        .transpose()?;
     Ok(PreparedService {
         owner,
         _runtime_directory: runtime_directory,
         listener,
         agent_listener,
         runtime_directory: path,
+        stdin: request.stdin,
         context: ServiceContext {
             client: Client::new(ApplicationInfo::new(
                 "agentknock",
@@ -462,11 +568,9 @@ fn prepare() -> io::Result<PreparedService> {
             owner_pid: request.owner_pid,
             invocation_id: request.invocation_id,
             invocation_token,
-            secret: request.secret,
-            public_key: request.public_key,
+            ssh,
             upstream_agent_socket,
             ssh_passthrough: request.ssh_passthrough,
-            selected_identity,
             quiet: request.quiet,
             verbose: request.verbose,
         },
@@ -533,6 +637,7 @@ async fn serve(service: PreparedService) -> io::Result<()> {
         listener,
         agent_listener,
         runtime_directory: _,
+        stdin: _,
         context,
     } = service;
     let owner = Rc::new(owner);
@@ -557,11 +662,19 @@ async fn serve(service: PreparedService) -> io::Result<()> {
         let owner = Rc::clone(&owner);
         let handler = match connection {
             Connection::Helper(connection) => async move {
-                let _ = handle_connection(connection, &context, &owner).await;
+                let ssh = context
+                    .ssh
+                    .as_ref()
+                    .expect("a Git helper listener requires an SSH secret");
+                let _ = handle_connection(connection, &context, ssh, &owner).await;
             }
             .boxed_local(),
             Connection::Agent(connection) => async move {
-                let _ = handle_agent_connection(connection, &context, &owner).await;
+                let ssh = context
+                    .ssh
+                    .as_ref()
+                    .expect("an SSH agent listener requires an SSH secret");
+                let _ = handle_agent_connection(connection, &context, ssh, &owner).await;
             }
             .boxed_local(),
         };
@@ -581,6 +694,7 @@ async fn accept_optional(
 async fn handle_agent_connection(
     mut connection: tokio::net::UnixStream,
     context: &ServiceContext,
+    ssh: &ServiceSsh,
     owner: &ProcessMonitor,
 ) -> io::Result<()> {
     let peer_pid = connection
@@ -589,7 +703,7 @@ async fn handle_agent_connection(
         .ok_or_else(|| io::Error::other("SSH agent client has no process identifier"))?;
     require_descendant(peer_pid, context.owner_pid)?;
     let mut agent = AgentConnection::new(
-        &context.selected_identity,
+        &ssh.selected_identity,
         context.upstream_agent_socket.as_deref(),
     );
 
@@ -604,7 +718,7 @@ async fn handle_agent_connection(
         let response = match agent.handle(&packet).await {
             AgentAction::Respond(response) => response,
             AgentAction::Authenticate { algorithm, message } => {
-                match request_ssh_authentication(context, owner, algorithm, &message).await {
+                match request_ssh_authentication(context, ssh, owner, algorithm, &message).await {
                     Ok(signature) => crate::ssh_agent::signature_response(&signature),
                     Err(error) => {
                         if !context.quiet {
@@ -622,6 +736,7 @@ async fn handle_agent_connection(
 async fn handle_connection(
     mut connection: tokio::net::UnixStream,
     context: &ServiceContext,
+    ssh: &ServiceSsh,
     owner: &ProcessMonitor,
 ) -> io::Result<()> {
     let peer_pid = connection
@@ -639,7 +754,7 @@ async fn handle_connection(
     })?;
     let response = match request {
         HelperRequest::Configuration => HelperResponse::Configuration {
-            public_key: context.public_key.clone(),
+            public_key: ssh.public_key.clone(),
             ssh_passthrough: context.ssh_passthrough,
         },
         HelperRequest::Sign {
@@ -647,7 +762,7 @@ async fn handle_connection(
             message,
             repository,
         } => {
-            let result = validate_signing_key(&public_key, &context.public_key).and_then(|()| {
+            let result = validate_signing_key(&public_key, &ssh.public_key).and_then(|()| {
                 BASE64_STANDARD
                     .decode(message)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -655,7 +770,7 @@ async fn handle_connection(
             let result = match result {
                 Ok(data) => {
                     let repository = repository.map(GitSignRepository::from);
-                    request_git_signature(context, owner, &data, repository.as_ref())
+                    request_git_signature(context, ssh, owner, &data, repository.as_ref())
                         .await
                         .map(|signature| HelperResponse::Signature { signature })
                 }
@@ -676,6 +791,7 @@ async fn handle_connection(
 
 async fn request_git_signature(
     context: &ServiceContext,
+    ssh: &ServiceSsh,
     owner: &ProcessMonitor,
     data: &[u8],
     repository: Option<&GitSignRepository>,
@@ -686,7 +802,7 @@ async fn request_git_signature(
         GitSignRequest {
             invocation_id: &context.invocation_id,
             invocation_token: &context.invocation_token,
-            secret: &context.secret,
+            secret: &ssh.secret,
             message: data,
             repository,
         },
@@ -724,6 +840,7 @@ async fn request_git_signature(
 
 async fn request_ssh_authentication(
     context: &ServiceContext,
+    ssh: &ServiceSsh,
     owner: &ProcessMonitor,
     algorithm: agentknock::SshSignatureAlgorithm,
     message: &[u8],
@@ -734,7 +851,7 @@ async fn request_ssh_authentication(
         SshAuthenticationRequest {
             invocation_id: &context.invocation_id,
             invocation_token: &context.invocation_token,
-            secret: &context.secret,
+            secret: &ssh.secret,
             algorithm,
             message,
         },
@@ -780,16 +897,27 @@ fn read_request() -> io::Result<StartupRequest> {
 }
 
 fn write_response(response: &StartupResponse) -> io::Result<()> {
+    let encoded = serde_json::to_vec(response).map_err(io::Error::other)?;
+    let length = u32::try_from(encoded.len())
+        .map_err(|_| io::Error::other("invocation service response is too large"))?;
     let mut output = io::stdout().lock();
-    serde_json::to_writer(&mut output, response).map_err(io::Error::other)?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    drop(output);
+    output.write_all(&length.to_be_bytes())?;
+    output.write_all(&encoded)?;
+    output.flush()
+}
 
-    // The launcher treats EOF as the end of the one-shot startup channel.
+fn read_response(input: &mut ChildStdout) -> io::Result<StartupResponse> {
+    let mut length = [0_u8; 4];
+    input.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    let mut encoded = vec![0_u8; length];
+    input.read_exact(&mut encoded)?;
+    serde_json::from_slice(&encoded).map_err(io::Error::other)
+}
+
+fn close_standard_output() {
     // SAFETY: This process owns its standard output and doesn't use it again.
     let _ = unsafe { libc::close(libc::STDOUT_FILENO) };
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

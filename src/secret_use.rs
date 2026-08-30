@@ -30,8 +30,8 @@ const INVOCATION_TOKEN_LENGTH: usize = 32;
 /// that constructs it is responsible for reporting the operation and launcher
 /// information accurately.
 pub struct SecretUseRequest<'a> {
-    /// The unique names of the secrets requested together.
-    pub secrets: &'a BTreeSet<String>,
+    /// The unique secrets requested together and their delivery options.
+    pub secrets: &'a BTreeMap<String, SecretUseOptions>,
 
     /// The operation that will receive or use the selected secrets.
     pub operation: SecretUseOperation<'a>,
@@ -45,6 +45,42 @@ pub struct SecretUseRequest<'a> {
     ///
     /// Order and selection are defined by the embedding application.
     pub launcher_chain: &'a [String],
+}
+
+/// Configures how one requested secret is delivered.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SecretUseOptions {
+    /// Options for an environment-variable secret.
+    pub environment: EnvironmentVariableOptions,
+}
+
+/// Configures which variables an environment secret delivers and where.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EnvironmentVariableOptions {
+    /// The only stored variable names to deliver.
+    ///
+    /// `None` selects all variables that aren't omitted. A present set must
+    /// not be empty.
+    pub only: Option<BTreeSet<String>>,
+
+    /// Stored variable names not to deliver.
+    pub omit: BTreeSet<String>,
+
+    /// Stored variable names mapped to command environment names.
+    pub rename: BTreeMap<String, String>,
+
+    /// A stored variable to deliver to the command's standard input instead
+    /// of its environment.
+    pub stdin: Option<String>,
+}
+
+impl EnvironmentVariableOptions {
+    fn is_empty(&self) -> bool {
+        self.only.is_none()
+            && self.omit.is_empty()
+            && self.rename.is_empty()
+            && self.stdin.is_none()
+    }
 }
 
 /// Describes how a command's standard stream is connected.
@@ -118,10 +154,13 @@ pub enum ExecutableMode {
 ///
 /// This type doesn't implement [`Debug`](std::fmt::Debug) because it contains
 /// secret values. Use [`SecretUseOutput::environment_variable_names`] to
-/// inspect names without exposing values, or consume the output with
+/// inspect names without exposing values. Use
+/// [`SecretUseOutput::stdin_value`] to access requested standard-input
+/// delivery before consuming the output with
 /// [`SecretUseOutput::into_environment`].
 pub struct SecretUseOutput {
     environment: BTreeMap<String, String>,
+    stdin: Option<String>,
     ssh: Option<SshSecretUse>,
     invocation: SecretUseInvocation,
 }
@@ -182,6 +221,11 @@ impl SecretUseOutput {
         self.environment.get(name).map(String::as_str)
     }
 
+    /// Returns the approved value to deliver to standard input, if requested.
+    pub fn stdin_value(&self) -> Option<&str> {
+        self.stdin.as_deref()
+    }
+
     /// Returns the SSH secret available to the invocation, if one was requested.
     pub fn ssh(&self) -> Option<&SshSecretUse> {
         self.ssh.as_ref()
@@ -195,7 +239,8 @@ impl SecretUseOutput {
     /// Consumes the output and returns its environment variables and values.
     ///
     /// The map is keyed by environment variable name and ordered
-    /// lexicographically.
+    /// lexicographically. This discards any standard-input value, SSH public
+    /// key, and invocation authorization retained by the output.
     pub fn into_environment(self) -> BTreeMap<String, String> {
         self.environment
     }
@@ -333,11 +378,12 @@ impl Client {
     /// Requests selected secrets for an invocation.
     ///
     /// The authenticated response must contain exactly the requested secret
-    /// names. Environment values are returned directly. An SSH secret returns
-    /// its public key and authorization for related operations. If multiple
-    /// secrets provide the same environment variable, their values must be
-    /// identical. The response can contain at most one SSH secret. Otherwise,
-    /// the method sends an aborted completion and returns an error.
+    /// names and honor their delivery options. Environment values are selected,
+    /// omitted, renamed, or separated for standard-input delivery as requested.
+    /// An SSH secret returns its public key and authorization for related
+    /// operations. If multiple values have the same final environment name,
+    /// they must be identical. The response can contain at most one SSH secret.
+    /// Otherwise, the method sends an aborted completion and returns an error.
     ///
     /// The `progress` callback receives lifecycle updates synchronously and
     /// should return promptly. If `cancellation` resolves before a response is
@@ -355,15 +401,18 @@ impl Client {
     /// # Examples
     ///
     /// ```
-    /// use std::{collections::BTreeSet, future};
+    /// use std::{collections::BTreeMap, future};
     ///
     /// use agentknock::{
-    ///     Client, ExecutableMode, RequestError, SecretUseOperation, SecretUseRequest,
-    ///     StreamKind,
+    ///     Client, ExecutableMode, RequestError, SecretUseOperation, SecretUseOptions,
+    ///     SecretUseRequest, StreamKind,
     /// };
     ///
     /// # async fn request_secrets(client: &Client) -> Result<(), RequestError> {
-    /// let secrets = BTreeSet::from(["github".to_owned()]);
+    /// let secrets = BTreeMap::from([(
+    ///     "github".to_owned(),
+    ///     SecretUseOptions::default(),
+    /// )]);
     /// let arguments = ["issue".to_owned(), "list".to_owned()];
     /// let launcher_chain = ["/usr/bin/bash".to_owned()];
     /// let request = SecretUseRequest {
@@ -402,6 +451,7 @@ impl Client {
     {
         tokio::pin!(cancellation);
         progress(SecretUseProgress::Preparing);
+        validate_secret_options(request.secrets).map_err(RequestError::other)?;
         self.maybe_rotate_psk().map_err(|error| match error {
             RotationError::Configuration(error) => RequestError::Configuration(error),
             RotationError::Other(error) => RequestError::Other(error),
@@ -438,13 +488,17 @@ impl Client {
                 stderr: stderr.into(),
             },
         };
-        let request_payload = InvocationRequestPayload {
-            method: Method::Invocation,
+        let secrets = secret_options_message(request.secrets);
+        let exchange_request = InvocationExchangeRequest {
+            message: InvocationRequestPayload {
+                method: Method::Invocation,
+                secrets,
+                reason: request.reason,
+                operation,
+                launcher_chain: request.launcher_chain,
+                invocation_token: BASE64_STANDARD.encode(invocation_token),
+            },
             secrets: request.secrets,
-            reason: request.reason,
-            operation,
-            launcher_chain: request.launcher_chain,
-            invocation_token: BASE64_STANDARD.encode(invocation_token),
         };
 
         message_exchange(
@@ -452,7 +506,7 @@ impl Client {
             &pairing_path,
             &pairing,
             invocation,
-            &request_payload,
+            &exchange_request,
             cancellation.as_mut(),
             &mut progress,
         )
@@ -465,7 +519,7 @@ async fn message_exchange<C, P>(
     pairing_path: &Path,
     pairing: &Pairing,
     invocation: SecretUseInvocation,
-    request_payload: &InvocationRequestPayload<'_>,
+    exchange_request: &InvocationExchangeRequest<'_>,
     mut cancellation: Pin<&mut C>,
     progress: &mut P,
 ) -> Result<SecretUseOutput, RequestError>
@@ -478,7 +532,7 @@ where
         .parse::<Ulid>()
         .expect("a generated invocation identifier is a ULID");
     let plaintext = client
-        .encode(request_payload)
+        .encode(&exchange_request.message)
         .map_err(RequestError::other)?;
     let mut session = Session::new(pairing, &request_id).map_err(RequestError::other)?;
     let request = session
@@ -542,7 +596,7 @@ where
     let (completion_result, exchange_result) = match result {
         InvocationResult::Approved {
             secrets: Some(secrets),
-        } => match secret_use_output_from_secrets(secrets, request_payload.secrets, invocation) {
+        } => match secret_use_output_from_secrets(secrets, exchange_request.secrets, invocation) {
             Ok(secret_use_output) => (
                 InvocationResult::Approved { secrets: None },
                 Ok(secret_use_output),
@@ -607,27 +661,53 @@ where
 
 fn secret_use_output_from_secrets(
     secrets: BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>,
-    requested_secrets: &BTreeSet<String>,
+    requested_secrets: &BTreeMap<String, SecretUseOptions>,
     invocation: SecretUseInvocation,
 ) -> io::Result<SecretUseOutput> {
     let mut environment = BTreeMap::new();
+    let mut stdin = None;
     let mut ssh = None;
-    let received_secrets = secrets.keys().cloned().collect::<BTreeSet<_>>();
+    if !secrets.keys().eq(requested_secrets.keys()) {
+        return Err(io::Error::other(format!(
+            "approved response contains secrets {:?}, expected {:?}",
+            secrets.keys().collect::<Vec<_>>(),
+            requested_secrets.keys().collect::<Vec<_>>()
+        )));
+    }
     for (name, secret) in secrets {
+        let options = requested_secrets
+            .get(&name)
+            .expect("the received secret set was checked");
         match secret.contents {
             SecretContentsMessage::Environment { variables } => {
-                for (name, variable) in variables {
-                    if let Some(previous) = environment.get(&name)
+                let environment_options = &options.environment;
+                validate_returned_variables(&name, &variables, environment_options)?;
+                for (source_name, variable) in variables {
+                    if environment_options.stdin.as_deref() == Some(&source_name) {
+                        stdin = Some(variable.value);
+                        continue;
+                    }
+                    let final_name = environment_options
+                        .rename
+                        .get(&source_name)
+                        .cloned()
+                        .unwrap_or(source_name);
+                    if let Some(previous) = environment.get(&final_name)
                         && previous != &variable.value
                     {
                         return Err(io::Error::other(format!(
-                            "approved secrets contain different values for environment variable {name:?}"
+                            "approved secrets contain different values for environment variable {final_name:?}"
                         )));
                     }
-                    environment.insert(name, variable.value);
+                    environment.insert(final_name, variable.value);
                 }
             }
             SecretContentsMessage::Ssh { public_key } => {
+                if !options.environment.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "approved SSH secret {name:?} has environment-variable options"
+                    )));
+                }
                 if public_key.is_empty() {
                     return Err(io::Error::other(format!(
                         "approved SSH secret {name:?} has an empty public key"
@@ -642,18 +722,137 @@ fn secret_use_output_from_secrets(
             }
         }
     }
-    if &received_secrets != requested_secrets {
-        return Err(io::Error::other(format!(
-            "approved response contains secrets {:?}, expected {:?}",
-            received_secrets.into_iter().collect::<Vec<_>>(),
-            requested_secrets.iter().collect::<Vec<_>>()
-        )));
-    }
     Ok(SecretUseOutput {
         environment,
+        stdin,
         ssh,
         invocation,
     })
+}
+
+fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::Result<()> {
+    if secrets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an invocation must request at least one secret",
+        ));
+    }
+    let mut has_stdin = false;
+    for (secret, options) in secrets {
+        if secret.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a requested secret has an empty name",
+            ));
+        }
+        let options = &options.environment;
+        if options.only.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("secret {secret:?} has an empty only set"),
+            ));
+        }
+        if options.only.is_some() && !options.omit.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("secret {secret:?} uses both only and omit"),
+            ));
+        }
+        for name in options
+            .only
+            .iter()
+            .flatten()
+            .chain(options.omit.iter())
+            .chain(options.rename.keys())
+            .chain(options.rename.values())
+            .chain(options.stdin.iter())
+        {
+            validate_environment_name(name)?;
+        }
+        if let Some(only) = &options.only {
+            for source in options.rename.keys().chain(options.stdin.iter()) {
+                if !only.contains(source) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "environment variable {source:?} is configured for secret {secret:?} but isn't selected by only"
+                        ),
+                    ));
+                }
+            }
+        }
+        for source in options.rename.keys().chain(options.stdin.iter()) {
+            if options.omit.contains(source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "environment variable {source:?} is both used and omitted for secret {secret:?}"
+                    ),
+                ));
+            }
+        }
+        if let Some(source) = &options.stdin {
+            if options.rename.contains_key(source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "environment variable {source:?} is both renamed and sent to standard input for secret {secret:?}"
+                    ),
+                ));
+            }
+            if has_stdin {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invocation can send only one environment variable to standard input",
+                ));
+            }
+            has_stdin = true;
+        }
+    }
+    Ok(())
+}
+
+fn validate_environment_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains('=') || name.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid environment variable name {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_returned_variables(
+    secret: &str,
+    variables: &BTreeMap<String, EnvironmentVariableMessage>,
+    options: &EnvironmentVariableOptions,
+) -> io::Result<()> {
+    if let Some(only) = &options.only
+        && !variables.keys().eq(only.iter())
+    {
+        return Err(io::Error::other(format!(
+            "approved environment secret {secret:?} contains variables {:?}, expected {:?}",
+            variables.keys().collect::<Vec<_>>(),
+            only.iter().collect::<Vec<_>>()
+        )));
+    }
+    if let Some(omitted) = options
+        .omit
+        .iter()
+        .find(|name| variables.contains_key(*name))
+    {
+        return Err(io::Error::other(format!(
+            "approved environment secret {secret:?} contains omitted variable {omitted:?}"
+        )));
+    }
+    for source in options.rename.keys().chain(options.stdin.iter()) {
+        if !variables.contains_key(source) {
+            return Err(io::Error::other(format!(
+                "approved environment secret {secret:?} doesn't contain requested variable {source:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn abort_reason(error: &websocket::Error) -> InvocationAbortReason {
@@ -713,12 +912,55 @@ impl From<websocket::Error> for RequestError {
 #[derive(Serialize)]
 struct InvocationRequestPayload<'a> {
     method: Method,
-    secrets: &'a BTreeSet<String>,
+    secrets: BTreeMap<&'a str, SecretUseOptionsMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     operation: InvocationOperationMessage<'a>,
     launcher_chain: &'a [String],
     invocation_token: String,
+}
+
+struct InvocationExchangeRequest<'a> {
+    message: InvocationRequestPayload<'a>,
+    secrets: &'a BTreeMap<String, SecretUseOptions>,
+}
+
+#[derive(Serialize)]
+struct SecretUseOptionsMessage<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<EnvironmentVariableOptionsMessage<'a>>,
+}
+
+#[derive(Serialize)]
+struct EnvironmentVariableOptionsMessage<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only: Option<&'a BTreeSet<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omit: Option<&'a BTreeSet<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rename: Option<&'a BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdin: Option<&'a str>,
+}
+
+fn secret_options_message(
+    secrets: &BTreeMap<String, SecretUseOptions>,
+) -> BTreeMap<&str, SecretUseOptionsMessage<'_>> {
+    secrets
+        .iter()
+        .map(|(name, options)| {
+            let environment = (!options.environment.is_empty()).then(|| {
+                let options = &options.environment;
+                EnvironmentVariableOptionsMessage {
+                    only: options.only.as_ref(),
+                    omit: (!options.omit.is_empty()).then_some(&options.omit),
+                    rename: (!options.rename.is_empty()).then_some(&options.rename),
+                    stdin: options.stdin.as_deref(),
+                }
+            });
+            (name.as_str(), SecretUseOptionsMessage { environment })
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -803,7 +1045,7 @@ mod tests {
                 environment_secret([("TOKEN", "same"), ("OTHER", "value")]),
             ),
         ]);
-        let requested = BTreeSet::from(["first".into(), "second".into()]);
+        let requested = requested(["first", "second"]);
 
         let secret_use_output =
             secret_use_output_from_secrets(secrets, &requested, invocation()).unwrap();
@@ -823,7 +1065,7 @@ mod tests {
             ("first".into(), environment_secret([("TOKEN", "one")])),
             ("second".into(), environment_secret([("TOKEN", "two")])),
         ]);
-        let requested = BTreeSet::from(["first".into(), "second".into()]);
+        let requested = requested(["first", "second"]);
 
         let error = secret_use_output_from_secrets(secrets, &requested, invocation())
             .err()
@@ -837,7 +1079,7 @@ mod tests {
     #[test]
     fn rejects_a_different_secret_set() {
         let secrets = BTreeMap::from([("other".into(), environment_secret([("TOKEN", "value")]))]);
-        let requested = BTreeSet::from(["requested".into()]);
+        let requested = requested(["requested"]);
 
         let error = secret_use_output_from_secrets(secrets, &requested, invocation())
             .err()
@@ -857,7 +1099,7 @@ mod tests {
             ),
             ("ssh".into(), ssh_secret("ssh-ed25519 AAAA test")),
         ]);
-        let requested = BTreeSet::from(["environment".into(), "ssh".into()]);
+        let requested = requested(["environment", "ssh"]);
 
         let output = secret_use_output_from_secrets(secrets, &requested, invocation()).unwrap();
 
@@ -872,7 +1114,7 @@ mod tests {
             ("first".into(), ssh_secret("ssh-ed25519 AAAA first")),
             ("second".into(), ssh_secret("ssh-ed25519 BBBB second")),
         ]);
-        let requested = BTreeSet::from(["first".into(), "second".into()]);
+        let requested = requested(["first", "second"]);
 
         let error = secret_use_output_from_secrets(secrets, &requested, invocation())
             .err()
@@ -881,6 +1123,190 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "approved response contains more than one SSH secret"
+        );
+    }
+
+    #[test]
+    fn routes_environment_values_after_selecting_them() {
+        let secrets = BTreeMap::from([
+            (
+                "first".into(),
+                environment_secret([("TOKEN", "one"), ("INPUT", "exact input")]),
+            ),
+            ("second".into(), environment_secret([("TOKEN", "two")])),
+        ]);
+        let requested = BTreeMap::from([
+            (
+                "first".into(),
+                SecretUseOptions {
+                    environment: EnvironmentVariableOptions {
+                        only: Some(BTreeSet::from(["INPUT".into(), "TOKEN".into()])),
+                        rename: BTreeMap::from([("TOKEN".into(), "FIRST_TOKEN".into())]),
+                        stdin: Some("INPUT".into()),
+                        ..EnvironmentVariableOptions::default()
+                    },
+                },
+            ),
+            (
+                "second".into(),
+                SecretUseOptions {
+                    environment: EnvironmentVariableOptions {
+                        rename: BTreeMap::from([("TOKEN".into(), "SECOND_TOKEN".into())]),
+                        ..EnvironmentVariableOptions::default()
+                    },
+                },
+            ),
+        ]);
+
+        let output = secret_use_output_from_secrets(secrets, &requested, invocation()).unwrap();
+
+        assert_eq!(
+            output.environment,
+            BTreeMap::from([
+                ("FIRST_TOKEN".into(), "one".into()),
+                ("SECOND_TOKEN".into(), "two".into()),
+            ])
+        );
+        assert_eq!(output.stdin_value(), Some("exact input"));
+    }
+
+    #[test]
+    fn rejects_environment_values_excluded_by_the_request() {
+        let secrets = BTreeMap::from([(
+            "test".into(),
+            environment_secret([("TOKEN", "value"), ("OTHER", "unexpected")]),
+        )]);
+        let requested = BTreeMap::from([(
+            "test".into(),
+            SecretUseOptions {
+                environment: EnvironmentVariableOptions {
+                    only: Some(BTreeSet::from(["TOKEN".into()])),
+                    ..EnvironmentVariableOptions::default()
+                },
+            },
+        )]);
+
+        let error = secret_use_output_from_secrets(secrets, &requested, invocation())
+            .err()
+            .expect("an excluded environment value should fail");
+
+        assert!(error.to_string().contains("contains variables"));
+    }
+
+    #[test]
+    fn rejects_an_omitted_environment_value() {
+        let secrets =
+            BTreeMap::from([("test".into(), environment_secret([("TOKEN", "unexpected")]))]);
+        let requested = BTreeMap::from([(
+            "test".into(),
+            SecretUseOptions {
+                environment: EnvironmentVariableOptions {
+                    omit: BTreeSet::from(["TOKEN".into()]),
+                    ..EnvironmentVariableOptions::default()
+                },
+            },
+        )]);
+
+        let error = secret_use_output_from_secrets(secrets, &requested, invocation())
+            .err()
+            .expect("an omitted environment value should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "approved environment secret \"test\" contains omitted variable \"TOKEN\""
+        );
+    }
+
+    #[test]
+    fn validates_environment_delivery_options() {
+        let empty_only = BTreeMap::from([(
+            "test".into(),
+            SecretUseOptions {
+                environment: EnvironmentVariableOptions {
+                    only: Some(BTreeSet::new()),
+                    ..EnvironmentVariableOptions::default()
+                },
+            },
+        )]);
+        assert_eq!(
+            validate_secret_options(&empty_only)
+                .unwrap_err()
+                .to_string(),
+            "secret \"test\" has an empty only set"
+        );
+
+        let both_only_and_omit = BTreeMap::from([(
+            "test".into(),
+            SecretUseOptions {
+                environment: EnvironmentVariableOptions {
+                    only: Some(BTreeSet::from(["TOKEN".into()])),
+                    omit: BTreeSet::from(["OTHER".into()]),
+                    ..EnvironmentVariableOptions::default()
+                },
+            },
+        )]);
+        assert_eq!(
+            validate_secret_options(&both_only_and_omit)
+                .unwrap_err()
+                .to_string(),
+            "secret \"test\" uses both only and omit"
+        );
+
+        let two_stdin_values = BTreeMap::from([
+            (
+                "first".into(),
+                SecretUseOptions {
+                    environment: EnvironmentVariableOptions {
+                        stdin: Some("ONE".into()),
+                        ..EnvironmentVariableOptions::default()
+                    },
+                },
+            ),
+            (
+                "second".into(),
+                SecretUseOptions {
+                    environment: EnvironmentVariableOptions {
+                        stdin: Some("TWO".into()),
+                        ..EnvironmentVariableOptions::default()
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(
+            validate_secret_options(&two_stdin_values)
+                .unwrap_err()
+                .to_string(),
+            "an invocation can send only one environment variable to standard input"
+        );
+    }
+
+    #[test]
+    fn serializes_secret_options_as_a_map() {
+        let secrets: BTreeMap<String, SecretUseOptions> = BTreeMap::from([
+            ("plain".into(), SecretUseOptions::default()),
+            (
+                "selected".into(),
+                SecretUseOptions {
+                    environment: EnvironmentVariableOptions {
+                        only: Some(BTreeSet::from(["TOKEN".into()])),
+                        rename: BTreeMap::from([("TOKEN".into(), "API_TOKEN".into())]),
+                        ..EnvironmentVariableOptions::default()
+                    },
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(secret_options_message(&secrets)).unwrap(),
+            serde_json::json!({
+                "plain": {},
+                "selected": {
+                    "environment": {
+                        "only": ["TOKEN"],
+                        "rename": {"TOKEN": "API_TOKEN"},
+                    },
+                },
+            })
         );
     }
 
@@ -919,5 +1345,12 @@ mod tests {
             id: "01K00000000000000000000000".into(),
             token: [0x42; INVOCATION_TOKEN_LENGTH],
         }
+    }
+
+    fn requested<const N: usize>(names: [&str; N]) -> BTreeMap<String, SecretUseOptions> {
+        names
+            .into_iter()
+            .map(|name| (name.into(), SecretUseOptions::default()))
+            .collect()
     }
 }

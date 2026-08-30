@@ -23,13 +23,14 @@ use std::{
 };
 
 use agentknock::{
-    ApplicationInfo, Client, ConfigurationError, DenialReason, PairingProgress, PairingRemoveError,
-    PairingSas, PairingStatus, RequestError, Secret, SecretListProgress, SecretUpload,
-    SecretUploadError, SecretUploadMode, SecretUploadProgress, SecretUseOperation, SecretUseOutput,
-    SecretUseProgress, SecretUseRequest, Secrets, StreamKind,
+    ApplicationInfo, Client, ConfigurationError, DenialReason, EnvironmentVariableOptions,
+    PairingProgress, PairingRemoveError, PairingSas, PairingStatus, RequestError, Secret,
+    SecretListProgress, SecretUpload, SecretUploadError, SecretUploadMode, SecretUploadProgress,
+    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseProgress, SecretUseRequest,
+    Secrets, StreamKind,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
-use executable::{SelectedExecutable, SignalState};
+use executable::{CommandEnvironment, SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
 use thiserror::Error;
 
@@ -43,6 +44,10 @@ const RUN_EXAMPLES: &str = concat!(
     "    agentknock run -s github -- gh issue list\n\n",
     "  Use multiple secrets and explain why:\n",
     "    agentknock -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n",
+    "  Select and rename an environment variable:\n",
+    "    agentknock -s github --only-env github GH_TOKEN --rename-env github GH_TOKEN GITHUB_TOKEN -- env\n\n",
+    "  Send one environment variable to standard input:\n",
+    "    agentknock -s password --only-env password PASSWORD --stdin password PASSWORD -- command-reading-a-password\n\n",
     "  Connect with an SSH secret:\n",
     "    agentknock -s production-ssh -- ssh example.com\n\n",
     "  Sign a Git commit with an SSH secret:\n",
@@ -78,25 +83,27 @@ enum Command {
     /// reason, command, and arguments. It also sends the working directory, selected executable
     /// path, SHA-256 hash when available, paths of the programs that launched Agentknock, and how
     /// standard input, output, and error are connected. If the response contains environment
-    /// variables, Agentknock adds them to the command's environment. Returned values replace
-    /// existing values with the same names. An Ed25519 or RSA SSH secret is available through a
-    /// temporary SSH agent for remote authentication unless you use `--no-ssh-agent`. Keys from an
-    /// existing SSH agent remain available unless you use `--no-ssh-passthrough`. Unless you use
-    /// `--no-git-sign`, SSH secrets can sign Git commits and tags when Git uses SSH signing. The
-    /// device makes a separate decision for each use of the selected key. Agentknock then replaces
-    /// itself with the command.
+    /// variables, Agentknock adds them to the command's environment. You can select, omit, or
+    /// rename variables from each environment secret, or send one variable to standard input.
+    /// Returned values replace existing values with the same names. An Ed25519 or RSA SSH secret
+    /// is available through a temporary SSH agent for remote authentication unless you use
+    /// `--no-ssh-agent`. Keys from an existing SSH agent remain available unless you use
+    /// `--no-ssh-passthrough`. Unless you use `--no-git-sign`, SSH secrets can sign Git commits and
+    /// tags when Git uses SSH signing. The device makes a separate decision for each use of the
+    /// selected key. Agentknock then replaces itself with the command.
     ///
     /// Specify each secret with a separate `--secret` option. The `--` separator is required;
     /// Agentknock treats everything after it as the command and its arguments. Agentknock doesn't
     /// invoke a shell or interpret those arguments.
     ///
-    /// If multiple secrets provide the same environment variable, their values must match.
+    /// If multiple delivered values have the same final environment name, their values must match.
     /// Otherwise, Agentknock doesn't run the command.
     ///
     /// Agentknock writes its messages to standard error. The command inherits standard input,
-    /// standard output, and standard error. While Agentknock waits for the device to respond, it
-    /// reports progress and total elapsed time every 30 seconds unless you use `--quiet`.
-    /// Interrupting Agentknock prevents the command from running.
+    /// standard output, and standard error unless `--stdin` replaces its standard input. While
+    /// Agentknock waits for the device to respond, it reports progress and total elapsed time every
+    /// 30 seconds unless you use `--quiet`. Interrupting Agentknock prevents the command from
+    /// running.
     ///
     /// You can omit `run` and put its options directly after `agentknock`.
     ///
@@ -156,6 +163,53 @@ struct RunCommand {
     )]
     secrets: Vec<String>,
 
+    /// Select one variable from an environment secret.
+    ///
+    /// SECRET must also be selected with `--secret`. When this option is used for a secret, the
+    /// device returns only the variables selected for that secret. Repeat the option to select
+    /// more variables. You can't combine `--only-env` and `--omit-env` for one secret.
+    #[arg(
+        long,
+        action = ArgAction::Append,
+        num_args = 2,
+        value_names = ["SECRET", "VARIABLE"]
+    )]
+    only_env: Vec<String>,
+
+    /// Omit one variable from an environment secret.
+    ///
+    /// SECRET must also be selected with `--secret`. Repeat this option to omit more variables
+    /// from the same secret. You can't combine `--omit-env` and `--only-env` for one secret.
+    #[arg(
+        long,
+        action = ArgAction::Append,
+        num_args = 2,
+        value_names = ["SECRET", "VARIABLE"]
+    )]
+    omit_env: Vec<String>,
+
+    /// Rename one variable delivered by an environment secret.
+    ///
+    /// SECRET must also be selected with `--secret`. The stored variable is delivered to the
+    /// command as NEW_VARIABLE. Repeat this option to rename more variables.
+    #[arg(
+        long,
+        action = ArgAction::Append,
+        num_args = 3,
+        value_names = ["SECRET", "VARIABLE", "NEW_VARIABLE"]
+    )]
+    rename_env: Vec<String>,
+
+    /// Send one variable to the command's standard input.
+    ///
+    /// SECRET must also be selected with `--secret`. Agentknock sends the exact stored value,
+    /// without adding a newline, and then closes the input. The variable isn't added to the
+    /// command's environment. Other variables from the secret are still added to the environment
+    /// unless you restrict them with `--only-env`. A command can receive only one variable on
+    /// standard input.
+    #[arg(long, num_args = 2, value_names = ["SECRET", "VARIABLE"])]
+    stdin: Option<Vec<String>>,
+
     /// Explain why the command needs the selected secrets.
     ///
     /// Agentknock sends this text unchanged to the device with the request.
@@ -197,8 +251,9 @@ struct RunCommand {
 
     /// Show detailed request and command-launch messages.
     ///
-    /// Before Agentknock runs the command, it lists the environment variable names and selected
-    /// SSH secret. It never displays environment values or private keys.
+    /// Before Agentknock runs the command, it lists the final environment variable names, the
+    /// standard-input source, and the selected SSH secret. It never displays environment values or
+    /// private keys.
     #[arg(long, conflicts_with = "quiet")]
     verbose: bool,
 
@@ -409,7 +464,7 @@ struct EnvironmentSecretInput {
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
     Run {
-        secrets: BTreeSet<String>,
+        secrets: BTreeMap<String, SecretUseOptions>,
         git_signing: bool,
         reason: Option<String>,
         ssh_agent: bool,
@@ -587,7 +642,7 @@ impl Cli {
             .map(String::as_str)
     }
 
-    fn into_operation(self) -> (Operation, OutputMode) {
+    fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
         match self.command {
             None => self.run.into_operation(),
             Some(command) => command.into_operation(),
@@ -596,9 +651,9 @@ impl Cli {
 }
 
 impl Command {
-    fn into_operation(self) -> (Operation, OutputMode) {
-        match self {
-            Self::Run(command) => command.into_operation(),
+    fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
+        Ok(match self {
+            Self::Run(command) => return command.into_operation(),
             Self::Pairing {
                 command: PairingCommand::Start { address },
             } => (Operation::StartPairing(address), OutputMode::Normal),
@@ -620,16 +675,17 @@ impl Command {
             Self::Secret {
                 command: SecretCommand::Upload(command),
             } => (Operation::UploadSecret(command), OutputMode::Normal),
-        }
+        })
     }
 }
 
 impl RunCommand {
-    fn into_operation(self) -> (Operation, OutputMode) {
+    fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
         let output = self.output_mode();
-        (
+        let secrets = self.secret_options()?;
+        Ok((
             Operation::Run {
-                secrets: self.secrets.into_iter().collect(),
+                secrets,
                 git_signing: !self.no_git_sign,
                 reason: self.reason,
                 ssh_agent: !self.no_ssh_agent,
@@ -637,7 +693,63 @@ impl RunCommand {
                 command: self.command,
             },
             output,
-        )
+        ))
+    }
+
+    fn secret_options(&self) -> Result<BTreeMap<String, SecretUseOptions>, RunOptionsError> {
+        let mut secrets = self
+            .secrets
+            .iter()
+            .cloned()
+            .map(|secret| (secret, SecretUseOptions::default()))
+            .collect::<BTreeMap<_, _>>();
+
+        for [secret, variable] in self.only_env.as_chunks::<2>().0 {
+            validate_run_environment_name(variable)?;
+            let options = environment_options(&mut secrets, "--only-env", secret)?;
+            if !options
+                .only
+                .get_or_insert_with(BTreeSet::new)
+                .insert(variable.clone())
+            {
+                return Err(RunOptionsError(format!(
+                    "environment variable {variable:?} was selected more than once from secret {secret:?}"
+                )));
+            }
+        }
+        for [secret, variable] in self.omit_env.as_chunks::<2>().0 {
+            validate_run_environment_name(variable)?;
+            let options = environment_options(&mut secrets, "--omit-env", secret)?;
+            if !options.omit.insert(variable.clone()) {
+                return Err(RunOptionsError(format!(
+                    "environment variable {variable:?} was omitted more than once from secret {secret:?}"
+                )));
+            }
+        }
+        for [secret, variable, new_variable] in self.rename_env.as_chunks::<3>().0 {
+            validate_run_environment_name(variable)?;
+            validate_run_environment_name(new_variable)?;
+            let options = environment_options(&mut secrets, "--rename-env", secret)?;
+            if options
+                .rename
+                .insert(variable.clone(), new_variable.clone())
+                .is_some()
+            {
+                return Err(RunOptionsError(format!(
+                    "environment variable {variable:?} was renamed more than once for secret {secret:?}"
+                )));
+            }
+        }
+        if let Some(values) = &self.stdin {
+            let [secret, variable] = values.as_slice() else {
+                unreachable!("clap provides two --stdin values");
+            };
+            validate_run_environment_name(variable)?;
+            environment_options(&mut secrets, "--stdin", secret)?.stdin = Some(variable.clone());
+        }
+
+        validate_run_environment_options(&secrets)?;
+        Ok(secrets)
     }
 
     fn output_mode(&self) -> OutputMode {
@@ -651,10 +763,76 @@ impl RunCommand {
     }
 }
 
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct RunOptionsError(String);
+
+fn environment_options<'a>(
+    secrets: &'a mut BTreeMap<String, SecretUseOptions>,
+    option: &str,
+    secret: &str,
+) -> Result<&'a mut EnvironmentVariableOptions, RunOptionsError> {
+    let Some(secret_options) = secrets.get_mut(secret) else {
+        return Err(RunOptionsError(format!(
+            "{option} refers to secret {secret:?}, which wasn't selected with --secret"
+        )));
+    };
+    Ok(&mut secret_options.environment)
+}
+
+fn validate_run_environment_name(name: &str) -> Result<(), RunOptionsError> {
+    parse_environment_name(name)
+        .map(drop)
+        .map_err(|message| RunOptionsError(format!("{message}: {name:?}")))
+}
+
+fn validate_run_environment_options(
+    secrets: &BTreeMap<String, SecretUseOptions>,
+) -> Result<(), RunOptionsError> {
+    for (secret, secret_options) in secrets {
+        let options = &secret_options.environment;
+        if options.only.is_some() && !options.omit.is_empty() {
+            return Err(RunOptionsError(format!(
+                "--only-env and --omit-env can't be combined for secret {secret:?}"
+            )));
+        }
+        if let Some(only) = &options.only {
+            for variable in options.rename.keys().chain(options.stdin.iter()) {
+                if !only.contains(variable) {
+                    return Err(RunOptionsError(format!(
+                        "environment variable {variable:?} must also be selected with --only-env for secret {secret:?}"
+                    )));
+                }
+            }
+        }
+        for variable in options.rename.keys().chain(options.stdin.iter()) {
+            if options.omit.contains(variable) {
+                return Err(RunOptionsError(format!(
+                    "environment variable {variable:?} can't be both used and omitted for secret {secret:?}"
+                )));
+            }
+        }
+        if let Some(variable) = &options.stdin
+            && options.rename.contains_key(variable)
+        {
+            return Err(RunOptionsError(format!(
+                "environment variable {variable:?} can't be both renamed and sent to standard input for secret {secret:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn print_duplicate_secret(secret: &str) {
     eprintln!("error: secret {secret:?} was specified more than once");
     eprintln!();
     eprintln!("Usage: agentknock [run] -s <SECRET> [-s <SECRET> ...] -- <COMMAND> [ARGUMENT]...");
+    eprintln!();
+    eprintln!("For more information, run 'agentknock run --help'.");
+}
+
+fn print_run_options_error(error: &RunOptionsError) {
+    eprintln!("error: {error}");
     eprintln!();
     eprintln!("For more information, run 'agentknock run --help'.");
 }
@@ -677,7 +855,13 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
         print_duplicate_secret(secret);
         return ExitCode::from(2);
     }
-    let (operation, output) = cli.into_operation();
+    let (operation, output) = match cli.into_operation() {
+        Ok(operation) => operation,
+        Err(error) => {
+            print_run_options_error(&error);
+            return ExitCode::from(2);
+        }
+    };
     match run(operation, output).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -710,6 +894,13 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             })?;
             let signal_state = SignalState::capture().map_err(CommandError::RunSignal)?;
             let launcher_chain = launcher_chain();
+            let stdin_source = secrets.iter().find_map(|(secret, options)| {
+                options
+                    .environment
+                    .stdin
+                    .as_deref()
+                    .map(|variable| (secret.as_str(), variable))
+            });
             let request = SecretUseRequest {
                 secrets: &secrets,
                 operation: SecretUseOperation::Exec {
@@ -719,7 +910,11 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                     executable_path: selected.path(),
                     executable_hash: selected.hash(),
                     executable_mode: selected.mode(),
-                    stdin: standard_stream_kind(0, io::stdin().is_terminal()),
+                    stdin: if stdin_source.is_some() {
+                        StreamKind::Pipe
+                    } else {
+                        standard_stream_kind(0, io::stdin().is_terminal())
+                    },
                     stdout: standard_stream_kind(1, io::stdout().is_terminal()),
                     stderr: standard_stream_kind(2, io::stderr().is_terminal()),
                 },
@@ -737,25 +932,32 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             } else {
                 None
             };
-            let invocation_service = match secret_use_output.ssh() {
-                Some(_) if !ssh_agent && !git_signing => None,
-                Some(ssh) => Some(
-                    invocation_service::InvocationService::start(
-                        secret_use_output.invocation(),
-                        ssh,
-                        upstream_agent_socket.as_deref(),
-                        invocation_service::ServiceOptions {
-                            ssh_agent,
-                            git_signing,
-                            ssh_passthrough,
-                            quiet: output == OutputMode::Quiet,
-                            verbose: output == OutputMode::Verbose,
-                        },
-                    )
-                    .map_err(CommandError::RunInvocationService)?,
-                ),
-                None => None,
+            let service_ssh = if ssh_agent || git_signing {
+                secret_use_output.ssh()
+            } else {
+                None
             };
+            let mut invocation_service =
+                if service_ssh.is_some() || secret_use_output.stdin_value().is_some() {
+                    Some(
+                        invocation_service::InvocationService::start(
+                            secret_use_output.invocation(),
+                            service_ssh,
+                            secret_use_output.stdin_value(),
+                            upstream_agent_socket.as_deref(),
+                            invocation_service::ServiceOptions {
+                                ssh_agent,
+                                git_signing,
+                                ssh_passthrough,
+                                quiet: output == OutputMode::Quiet,
+                                verbose: output == OutputMode::Verbose,
+                            },
+                        )
+                        .map_err(CommandError::RunInvocationService)?,
+                    )
+                } else {
+                    None
+                };
             let git_config_count = secret_use_output
                 .environment_variable("GIT_CONFIG_COUNT")
                 .map(OsString::from)
@@ -782,16 +984,22 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 return Err(CommandError::RunInterrupted);
             }
             if output == OutputMode::Verbose {
-                print_received_secrets(&secret_use_output);
+                print_received_secrets(&secret_use_output, stdin_source);
                 print_message(format_args!("Running command {program:?}."));
             }
             let program = program.clone();
+            let stdin = invocation_service
+                .as_mut()
+                .and_then(invocation_service::InvocationService::take_stdin);
             selected
                 .execute(
                     arguments,
-                    secret_use_output,
-                    additional_environment,
-                    removed_environment,
+                    CommandEnvironment::new(
+                        secret_use_output,
+                        additional_environment,
+                        removed_environment,
+                    ),
+                    stdin,
                     &signal_state,
                     blocked_signals,
                 )
@@ -1332,7 +1540,7 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
         }
         CommandError::RunInvocationService(source) if output != OutputMode::Quiet => {
             print_message(format_args!(
-                "Agentknock couldn't prepare SSH access for the command: {source}."
+                "Agentknock couldn't prepare secret delivery for the command: {source}."
             ));
             print_message("The command didn't run.");
         }
@@ -1884,15 +2092,21 @@ fn print_progress(progress: SecretUseProgress) {
     print_message(progress_message(progress));
 }
 
-fn print_received_secrets(secret_use_output: &SecretUseOutput) {
+fn print_received_secrets(secret_use_output: &SecretUseOutput, stdin_source: Option<(&str, &str)>) {
     let mut names = secret_use_output.environment_variable_names().peekable();
     if names.peek().is_none() {
-        print_message("The device returned no environment variables.");
+        print_message("No variables will be added to the command environment.");
     } else {
-        print_message("Received these environment variables:");
+        print_message("These variables will be added to the command environment:");
         for name in names {
             print_message(format_args!("- {name}"));
         }
+    }
+    if let Some((secret, variable)) = stdin_source {
+        print_message(format_args!(
+            "Environment variable {:?} from secret {:?} is available on standard input.",
+            variable, secret
+        ));
     }
     if let Some(ssh) = secret_use_output.ssh() {
         print_message(format_args!(
@@ -2030,14 +2244,22 @@ fn print_message(message: impl std::fmt::Display) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
+    use agentknock::{EnvironmentVariableOptions, SecretUseOptions};
     use clap::{Parser, error::ErrorKind};
 
     use super::{
         Cli, EnvironmentSecretInput, Operation, OutputMode, SecretUploadCommand, VariableFile,
         format_elapsed_time, progress_message, progress_report,
     };
+
+    fn secret_options<const N: usize>(names: [&str; N]) -> BTreeMap<String, SecretUseOptions> {
+        names
+            .into_iter()
+            .map(|name| (name.into(), SecretUseOptions::default()))
+            .collect()
+    }
 
     #[test]
     fn parses_run_command() {
@@ -2061,10 +2283,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (
                 Operation::Run {
-                    secrets: BTreeSet::from(["cf-wrangler".into(), "gh-token".into()]),
+                    secrets: secret_options(["cf-wrangler", "gh-token"]),
                     git_signing: false,
                     reason: Some("needed by the deployment agent".into()),
                     ssh_agent: false,
@@ -2083,10 +2305,10 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "-s", "github", "--", "true"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (
                 Operation::Run {
-                    secrets: BTreeSet::from(["github".into()]),
+                    secrets: secret_options(["github"]),
                     git_signing: true,
                     reason: None,
                     ssh_agent: true,
@@ -2096,6 +2318,98 @@ mod tests {
                 OutputMode::Normal,
             )
         );
+    }
+
+    #[test]
+    fn parses_environment_delivery_options() {
+        let cli = Cli::try_parse_from([
+            "agentknock",
+            "-s",
+            "github",
+            "-s",
+            "cloudflare",
+            "--only-env",
+            "github",
+            "GH_TOKEN",
+            "--only-env",
+            "github",
+            "GH_HOST",
+            "--rename-env",
+            "github",
+            "GH_HOST",
+            "GITHUB_HOST",
+            "--stdin",
+            "github",
+            "GH_TOKEN",
+            "--omit-env",
+            "cloudflare",
+            "CF_ACCOUNT_ID",
+            "--",
+            "true",
+        ])
+        .unwrap();
+
+        let (operation, _) = cli.into_operation().unwrap();
+        let Operation::Run { secrets, .. } = operation else {
+            panic!("expected run operation");
+        };
+        assert_eq!(
+            secrets["github"],
+            SecretUseOptions {
+                environment: EnvironmentVariableOptions {
+                    only: Some(BTreeSet::from(["GH_HOST".into(), "GH_TOKEN".into()])),
+                    omit: BTreeSet::new(),
+                    rename: BTreeMap::from([("GH_HOST".into(), "GITHUB_HOST".into())]),
+                    stdin: Some("GH_TOKEN".into()),
+                },
+            }
+        );
+        assert_eq!(
+            secrets["cloudflare"],
+            SecretUseOptions {
+                environment: EnvironmentVariableOptions {
+                    omit: BTreeSet::from(["CF_ACCOUNT_ID".into()]),
+                    ..EnvironmentVariableOptions::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_environment_delivery_combinations() {
+        let cases = [
+            vec!["--only-env", "other", "TOKEN"],
+            vec!["--only-env", "test", "TOKEN", "--omit-env", "test", "OTHER"],
+            vec![
+                "--only-env",
+                "test",
+                "TOKEN",
+                "--rename-env",
+                "test",
+                "OTHER",
+                "RENAMED",
+            ],
+            vec![
+                "--rename-env",
+                "test",
+                "TOKEN",
+                "RENAMED",
+                "--stdin",
+                "test",
+                "TOKEN",
+            ],
+        ];
+
+        for options in cases {
+            let arguments = [
+                vec!["agentknock", "-s", "test"],
+                options,
+                vec!["--", "true"],
+            ]
+            .concat();
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(cli.into_operation().is_err());
+        }
     }
 
     #[test]
@@ -2116,9 +2430,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(normal.into_operation().1, OutputMode::Normal);
-        assert_eq!(quiet.into_operation().1, OutputMode::Quiet);
-        assert_eq!(verbose.into_operation().1, OutputMode::Verbose);
+        assert_eq!(normal.into_operation().unwrap().1, OutputMode::Normal);
+        assert_eq!(quiet.into_operation().unwrap().1, OutputMode::Quiet);
+        assert_eq!(verbose.into_operation().unwrap().1, OutputMode::Verbose);
     }
 
     #[test]
@@ -2187,7 +2501,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (
                 Operation::StartPairing("pairing-address-name".into()),
                 OutputMode::Normal,
@@ -2200,7 +2514,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "pairing", "status"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (Operation::ShowPairingStatus, OutputMode::Normal)
         );
     }
@@ -2232,7 +2546,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "pairing", "finish"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (Operation::FinishPairing, OutputMode::Normal)
         );
     }
@@ -2242,7 +2556,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "pairing", "abort"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (Operation::AbortPairing, OutputMode::Normal)
         );
     }
@@ -2252,7 +2566,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "pairing", "remove"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (
                 Operation::RemovePairing { force: false },
                 OutputMode::Normal
@@ -2265,7 +2579,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "pairing", "remove", "--force"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (Operation::RemovePairing { force: true }, OutputMode::Normal)
         );
     }
@@ -2275,7 +2589,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "secret", "list"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (Operation::ListSecrets, OutputMode::Normal)
         );
     }
@@ -2302,7 +2616,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (
                 Operation::UploadSecret(SecretUploadCommand {
                     name: "github".into(),
@@ -2338,7 +2652,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (
                 Operation::UploadSecret(SecretUploadCommand {
                     name: "production-ssh".into(),
@@ -2378,6 +2692,9 @@ mod tests {
                     "The `--` separator is required",
                     "doesn't invoke a shell",
                     "Repeat this option",
+                    "When this option is used for a secret",
+                    "stored variable is delivered to the command as NEW_VARIABLE",
+                    "without adding a newline",
                     "passing other SSH keys through",
                     "Do not provide an SSH agent",
                     "Do not provide Git signing",
@@ -2613,7 +2930,7 @@ mod tests {
         let cli = Cli::try_parse_from(["agentknock", "pairing", "start", "help"]).unwrap();
 
         assert_eq!(
-            cli.into_operation(),
+            cli.into_operation().unwrap(),
             (Operation::StartPairing("help".into()), OutputMode::Normal,)
         );
     }
