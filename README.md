@@ -404,7 +404,7 @@ You can repeat and combine `--from-env`, `--from-env-file`, `--from-file`, and
 `--from-prompt`. Use `--from-env-file -` to read dotenv data from standard
 input, or `--from-file NAME=-` to read one value from standard input.
 
-To upload an unencrypted SSH private key in OpenSSH private-key format:
+To upload an SSH private key in OpenSSH private-key format:
 
 ```sh
 agentknock secret upload git-signing \
@@ -414,6 +414,15 @@ agentknock secret upload git-signing \
 
 Use `--from-ssh-key -` to read the key from standard input. An SSH-key source
 cannot be combined with environment-variable sources.
+
+Agentknock rejects an encrypted private key unless you explicitly provide its
+passphrase source. To enter the passphrase without displaying it, add
+`--passphrase-prompt`. For a noninteractive upload, use
+`--passphrase-env NAME` to read the passphrase from an environment variable.
+Agentknock removes the passphrase protection locally and sends only the
+resulting passphrase-free OpenSSH key. Agentknock's end-to-end encryption
+protects the key in transit, and the mobile app stores it encrypted. The
+passphrase is never sent to the mobile app.
 
 An upload is a proposal, not an immediate change to the secrets on the mobile
 device. The command finishes after the mobile app confirms receipt of the

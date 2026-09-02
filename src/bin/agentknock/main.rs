@@ -32,7 +32,9 @@ use agentknock::{
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{CommandEnvironment, SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
+use ssh_key::{LineEnding, PrivateKey};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LAUNCHER_DEPTH: usize = 4;
@@ -360,9 +362,10 @@ enum SecretCommand {
     /// Upload a secret to the paired device.
     ///
     /// Build an environment-variable or SSH-key secret from local data and upload it to the paired
-    /// device. The command completes after the device confirms that it stored the upload. The
-    /// secret remains unavailable until you approve the upload on the device. Agentknock doesn't
-    /// wait for that decision.
+    /// device. Agentknock protects the upload with end-to-end encryption, and the device stores
+    /// accepted secrets encrypted. The command completes after the device confirms that it stored
+    /// the upload. The secret remains unavailable until you approve the upload on the device.
+    /// Agentknock doesn't wait for that decision.
     ///
     /// Without `--replace` or `--update`, the upload uses Create mode. Use `--replace` to upload
     /// the complete replacement for an existing secret. Use `--update` to upload only the fields
@@ -413,23 +416,45 @@ struct SecretUploadCommand {
 
     /// Read an SSH private key from a file.
     ///
-    /// The key must be unencrypted and use OpenSSH private-key format. Use `-` to read the key
-    /// from standard input. This option can't be combined with an environment variable source.
+    /// The key must use OpenSSH private-key format. Use `-` to read the key from standard input.
+    /// This option can't be combined with an environment variable source. To decrypt an encrypted
+    /// key, use `--passphrase-prompt` or `--passphrase-env`. Agentknock removes the passphrase
+    /// protection locally. The uploaded OpenSSH key has no passphrase, but the upload itself is
+    /// end-to-end encrypted. Agentknock never sends the passphrase.
     #[arg(
         long,
         value_name = "PATH",
         value_parser = parse_path,
-        required_unless_present = "environment_sources",
-        conflicts_with = "environment_sources"
+        group = "secret_sources",
+        conflicts_with_all = ["from_env", "from_file", "from_prompt", "from_env_file"]
     )]
     from_ssh_key: Option<PathBuf>,
+
+    /// Prompt for the SSH private key passphrase.
+    ///
+    /// Agentknock reads the passphrase from the controlling terminal without displaying it. This
+    /// option requires `--from-ssh-key` and can't be combined with `--passphrase-env`.
+    #[arg(long, requires = "from_ssh_key", conflicts_with = "passphrase_env")]
+    passphrase_prompt: bool,
+
+    /// Read the SSH private key passphrase from an environment variable.
+    ///
+    /// This option requires `--from-ssh-key` and can't be combined with `--passphrase-prompt`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = parse_environment_name,
+        requires = "from_ssh_key",
+        conflicts_with = "passphrase_prompt"
+    )]
+    passphrase_env: Option<String>,
 
     #[command(flatten, next_help_heading = "Environment variable sources")]
     environment: EnvironmentSecretInput,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
-#[group(id = "environment_sources", multiple = true)]
+#[group(id = "secret_sources", required = true, multiple = true)]
 struct EnvironmentSecretInput {
     /// Read an environment variable from the current process environment.
     ///
@@ -561,6 +586,26 @@ enum SecretInputError {
     #[error("couldn't read environment variable {name:?} from the terminal: {source}")]
     Prompt {
         name: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("couldn't {operation} SSH private key {source_name}: {source}")]
+    SshPrivateKey {
+        operation: &'static str,
+        source_name: String,
+        #[source]
+        source: ssh_key::Error,
+    },
+
+    #[error("SSH private key {source_name} is encrypted")]
+    EncryptedSshPrivateKey { source_name: String },
+
+    #[error("SSH private key {source_name} isn't encrypted, so it doesn't need a passphrase")]
+    UnencryptedSshPrivateKey { source_name: String },
+
+    #[error("couldn't read the SSH private key passphrase from the terminal: {source}")]
+    SshPassphrasePrompt {
         #[source]
         source: io::Error,
     },
@@ -1145,7 +1190,11 @@ fn read_secret(
     };
 
     if let Some(path) = command.from_ssh_key {
-        let private_key = read_secret_source(&path)?;
+        let private_key = read_ssh_private_key(
+            &path,
+            command.passphrase_prompt,
+            command.passphrase_env.as_deref(),
+        )?;
         return Ok((
             SecretUpload::Ssh {
                 name: command.name,
@@ -1174,15 +1223,7 @@ fn read_secret(
 
     let mut variables = BTreeMap::new();
     for name in command.environment.from_env {
-        let value = match env::var(&name) {
-            Ok(value) => value,
-            Err(env::VarError::NotPresent) => {
-                return Err(SecretInputError::MissingEnvironmentVariable { name });
-            }
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err(SecretInputError::NonUtf8EnvironmentVariable { name });
-            }
-        };
+        let value = read_environment_variable(&name)?;
         insert_environment_variable(&mut variables, name, value)?;
     }
     for source in command.environment.from_file {
@@ -1228,6 +1269,69 @@ fn read_secret(
         },
         mode,
     ))
+}
+
+fn read_ssh_private_key(
+    path: &Path,
+    passphrase_prompt: bool,
+    passphrase_env: Option<&str>,
+) -> Result<String, SecretInputError> {
+    let source_name = secret_source_name(path);
+    let encoded = read_secret_source(path)?;
+    let private_key =
+        PrivateKey::from_openssh(&encoded).map_err(|source| SecretInputError::SshPrivateKey {
+            operation: "read",
+            source_name: source_name.clone(),
+            source,
+        })?;
+    let passphrase_requested = passphrase_prompt || passphrase_env.is_some();
+
+    if !private_key.is_encrypted() {
+        return if passphrase_requested {
+            Err(SecretInputError::UnencryptedSshPrivateKey { source_name })
+        } else {
+            Ok(encoded)
+        };
+    }
+    if !passphrase_requested {
+        return Err(SecretInputError::EncryptedSshPrivateKey { source_name });
+    }
+
+    let passphrase = if let Some(name) = passphrase_env {
+        Zeroizing::new(read_environment_variable(name)?)
+    } else {
+        Zeroizing::new(
+            rpassword::prompt_password("SSH private key passphrase: ")
+                .map_err(|source| SecretInputError::SshPassphrasePrompt { source })?,
+        )
+    };
+    let private_key = private_key
+        .decrypt(passphrase.as_bytes())
+        .map_err(|source| SecretInputError::SshPrivateKey {
+            operation: "decrypt",
+            source_name: source_name.clone(),
+            source,
+        })?;
+    private_key
+        .to_openssh(LineEnding::LF)
+        .map(|encoded| encoded.to_string())
+        .map_err(|source| SecretInputError::SshPrivateKey {
+            operation: "encode",
+            source_name,
+            source,
+        })
+}
+
+fn read_environment_variable(name: &str) -> Result<String, SecretInputError> {
+    match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Err(SecretInputError::MissingEnvironmentVariable {
+            name: name.to_owned(),
+        }),
+        Err(env::VarError::NotUnicode(_)) => Err(SecretInputError::NonUtf8EnvironmentVariable {
+            name: name.to_owned(),
+        }),
+    }
 }
 
 fn read_secret_source(path: &Path) -> Result<String, SecretInputError> {
@@ -1582,6 +1686,11 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             print_plain_error(format_args!(
                 "Agentknock couldn't prepare the secret upload: {error}."
             ));
+            if matches!(error, SecretInputError::EncryptedSshPrivateKey { .. }) {
+                print_plain_error(
+                    "Suggested action: Use --passphrase-prompt or --passphrase-env <NAME>.",
+                );
+            }
         }
         CommandError::UploadSecret(error) => print_upload_error(error),
     }
@@ -2624,6 +2733,8 @@ mod tests {
                     replace: false,
                     update: true,
                     from_ssh_key: None,
+                    passphrase_prompt: false,
+                    passphrase_env: None,
                     environment: EnvironmentSecretInput {
                         from_env: vec!["GH_TOKEN".into()],
                         from_file: vec![VariableFile {
@@ -2648,6 +2759,7 @@ mod tests {
             "production-ssh",
             "--from-ssh-key",
             "/tmp/id_ed25519",
+            "--passphrase-prompt",
         ])
         .unwrap();
 
@@ -2660,6 +2772,8 @@ mod tests {
                     replace: false,
                     update: false,
                     from_ssh_key: Some("/tmp/id_ed25519".into()),
+                    passphrase_prompt: true,
+                    passphrase_env: None,
                     environment: EnvironmentSecretInput {
                         from_env: Vec::new(),
                         from_file: Vec::new(),
@@ -2769,6 +2883,9 @@ mod tests {
                     "Use `--replace`",
                     "At most one input can read from standard input",
                     "SSH-key source can't be combined",
+                    "To decrypt an encrypted key",
+                    "controlling terminal without displaying it",
+                    "passphrase from an environment variable",
                     "Environment variable sources:",
                     "without trimming whitespace",
                     "Examples:",
@@ -2805,6 +2922,16 @@ mod tests {
         let error = Cli::try_parse_from(["agentknock", "secret", "upload", "github"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        let error = error.to_string();
+        for source in [
+            "--from-env",
+            "--from-file",
+            "--from-prompt",
+            "--from-env-file",
+            "--from-ssh-key",
+        ] {
+            assert!(error.contains(source), "missing {source:?} from:\n{error}");
+        }
     }
 
     #[test]
@@ -2835,6 +2962,24 @@ mod tests {
             "/tmp/id_ed25519",
             "--from-env",
             "TOKEN",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rejects_conflicting_ssh_key_passphrase_sources() {
+        let error = Cli::try_parse_from([
+            "agentknock",
+            "secret",
+            "upload",
+            "ssh",
+            "--from-ssh-key",
+            "/tmp/key",
+            "--passphrase-prompt",
+            "--passphrase-env",
+            "SSH_KEY_PASSPHRASE",
         ])
         .unwrap_err();
 
