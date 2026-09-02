@@ -74,7 +74,10 @@ pub enum SecretUpload {
         name: String,
         /// The proposed description.
         description: Option<String>,
-        /// An unencrypted private key in OpenSSH format.
+        /// A passphrase-free private key in OpenSSH format.
+        ///
+        /// The client-device protocol encrypts the upload. A passphrase used to decrypt the source
+        /// key is not sent to the device.
         private_key: String,
     },
 }

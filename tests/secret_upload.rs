@@ -149,15 +149,26 @@ async fn uploads_an_environment_secret_from_multiple_sources() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn uploads_an_ssh_private_key() {
+async fn uploads_an_unencrypted_ssh_private_key() {
+    uploads_an_ssh_private_key(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decrypts_an_ssh_private_key_with_an_environment_passphrase() {
+    uploads_an_ssh_private_key(Some("test passphrase")).await;
+}
+
+async fn uploads_an_ssh_private_key(passphrase: Option<&str>) {
     let home = TestHome::active();
     let key_path = home.path().join("id_ed25519");
-    let private_key = concat!(
-        "-----BEGIN OPENSSH PRIVATE KEY-----\n",
-        "example\n",
-        "-----END OPENSSH PRIVATE KEY-----\n",
-    );
-    fs::write(&key_path, private_key).unwrap();
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", passphrase.unwrap_or(""), "-f"])
+        .arg(&key_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let public_key =
+        ssh_key::PublicKey::read_openssh_file(&key_path.with_extension("pub")).unwrap();
 
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
@@ -169,26 +180,23 @@ async fn uploads_an_ssh_private_key() {
         let (mut context, key, plaintext) =
             open_request(&device_private_key, &request_id, &frame["payload"]);
         assert_eq!(
-            plaintext,
-            json!({
-                "app_info": {
-                    "name": "agentknock",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "lib_info": {
-                    "name": "agentknock",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "method": "SecretUpload",
-                "mode": "CREATE",
-                "secret": {
-                    "name": "production-ssh",
-                    "description": "Production host access",
-                    "type": "ssh",
-                    "private_key": private_key,
-                },
-            })
+            plaintext["app_info"],
+            json!({"name": "agentknock", "version": env!("CARGO_PKG_VERSION")})
         );
+        assert_eq!(
+            plaintext["lib_info"],
+            json!({"name": "agentknock", "version": env!("CARGO_PKG_VERSION")})
+        );
+        assert_eq!(plaintext["method"], "SecretUpload");
+        assert_eq!(plaintext["mode"], "CREATE");
+        assert_eq!(plaintext["secret"]["name"], "production-ssh");
+        assert_eq!(plaintext["secret"]["description"], "Production host access");
+        assert_eq!(plaintext["secret"]["type"], "ssh");
+        let uploaded_key =
+            ssh_key::PrivateKey::from_openssh(plaintext["secret"]["private_key"].as_str().unwrap())
+                .unwrap();
+        assert!(!uploaded_key.is_encrypted());
+        assert_eq!(uploaded_key.public_key(), &public_key);
 
         send_json(
             &mut socket,
@@ -230,7 +238,8 @@ async fn uploads_an_ssh_private_key() {
     })
     .await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
         .env("HOME", home.path())
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
@@ -241,9 +250,13 @@ async fn uploads_an_ssh_private_key() {
             "Production host access",
             "--from-ssh-key",
             key_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+        ]);
+    if let Some(passphrase) = passphrase {
+        command
+            .env("SSH_KEY_PASSPHRASE", passphrase)
+            .args(["--passphrase-env", "SSH_KEY_PASSPHRASE"]);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -252,9 +265,39 @@ async fn uploads_an_ssh_private_key() {
     assert!(
         !String::from_utf8(output.stderr)
             .unwrap()
-            .contains(private_key)
+            .contains("test passphrase")
     );
     server.await.unwrap();
+}
+
+#[test]
+fn rejects_an_encrypted_ssh_private_key_without_a_passphrase_source() {
+    let home = TestHome::active();
+    let key_path = home.path().join("id_ed25519");
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "test passphrase", "-f"])
+        .arg(&key_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .args([
+            "secret",
+            "upload",
+            "production-ssh",
+            "--from-ssh-key",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("is encrypted"));
+    assert!(stderr.contains("Use --passphrase-prompt or --passphrase-env <NAME>"));
+    assert!(!stderr.contains("test passphrase"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
