@@ -415,6 +415,12 @@ agentknock secret upload git-signing \
 Use `--from-ssh-key -` to read the key from standard input. An SSH-key source
 cannot be combined with environment-variable sources.
 
+`ssh-keygen` can convert a legacy PEM key to OpenSSH format in place:
+
+```sh
+ssh-keygen -p -f ~/.ssh/id_rsa
+```
+
 Agentknock rejects an encrypted private key unless you explicitly provide its
 passphrase source. To enter the passphrase without displaying it, add
 `--passphrase-prompt`. For a noninteractive upload, use

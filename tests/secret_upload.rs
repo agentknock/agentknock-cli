@@ -300,6 +300,50 @@ fn rejects_an_encrypted_ssh_private_key_without_a_passphrase_source() {
     assert!(!stderr.contains("test passphrase"));
 }
 
+#[test]
+fn explains_how_to_convert_a_legacy_pem_ssh_private_key() {
+    let home = TestHome::active();
+    let key_path = home.path().join("id_rsa");
+    let status = Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "rsa",
+            "-b",
+            "2048",
+            "-m",
+            "PEM",
+            "-N",
+            "test passphrase",
+            "-f",
+        ])
+        .arg(&key_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .args([
+            "secret",
+            "upload",
+            "production-ssh",
+            "--from-ssh-key",
+            key_path.to_str().unwrap(),
+            "--passphrase-env",
+            "SSH_KEY_PASSPHRASE",
+        ])
+        .env("SSH_KEY_PASSPHRASE", "test passphrase")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("uses legacy PEM format"));
+    assert!(stderr.contains("ssh-keygen -p -f <PATH>"));
+    assert!(!stderr.contains("test passphrase"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn updates_an_environment_variable_from_standard_input() {
     let home = TestHome::active();
