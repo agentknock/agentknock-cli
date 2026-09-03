@@ -1,6 +1,6 @@
 [package]
 name = "agentknock"
-version = "0.4.0"
+version = "0.4.1"
 categories = ["authentication", "command-line-utilities", "cryptography"]
 documentation = "https://docs.rs/crate/agentknock/latest"
 edition = "2024"
