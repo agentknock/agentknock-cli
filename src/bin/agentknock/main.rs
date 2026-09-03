@@ -416,11 +416,12 @@ struct SecretUploadCommand {
 
     /// Read an SSH private key from a file.
     ///
-    /// The key must use OpenSSH private-key format. Use `-` to read the key from standard input.
-    /// This option can't be combined with an environment variable source. To decrypt an encrypted
-    /// key, use `--passphrase-prompt` or `--passphrase-env`. Agentknock removes the passphrase
-    /// protection locally. The uploaded OpenSSH key has no passphrase, but the upload itself is
-    /// end-to-end encrypted. Agentknock never sends the passphrase.
+    /// The key must use OpenSSH private-key format. Convert a legacy PEM key by running
+    /// `ssh-keygen -p -f` with the key path. Use `-` to read the key from standard input. This
+    /// option can't be combined with an environment variable source. To decrypt an encrypted key,
+    /// use `--passphrase-prompt` or `--passphrase-env`. Agentknock removes the passphrase protection
+    /// locally. The uploaded OpenSSH key has no passphrase, but the upload itself is end-to-end
+    /// encrypted. Agentknock never sends the passphrase.
     #[arg(
         long,
         value_name = "PATH",
@@ -597,6 +598,11 @@ enum SecretInputError {
         #[source]
         source: ssh_key::Error,
     },
+
+    #[error(
+        "SSH private key {source_name} uses legacy PEM format, which Agentknock doesn't support"
+    )]
+    LegacyPemSshPrivateKey { source_name: String },
 
     #[error("SSH private key {source_name} is encrypted")]
     EncryptedSshPrivateKey { source_name: String },
@@ -1278,6 +1284,9 @@ fn read_ssh_private_key(
 ) -> Result<String, SecretInputError> {
     let source_name = secret_source_name(path);
     let encoded = read_secret_source(path)?;
+    if uses_legacy_pem_private_key_format(&encoded) {
+        return Err(SecretInputError::LegacyPemSshPrivateKey { source_name });
+    }
     let private_key =
         PrivateKey::from_openssh(&encoded).map_err(|source| SecretInputError::SshPrivateKey {
             operation: "read",
@@ -1320,6 +1329,12 @@ fn read_ssh_private_key(
             source_name,
             source,
         })
+}
+
+fn uses_legacy_pem_private_key_format(encoded: &str) -> bool {
+    encoded.starts_with("-----BEGIN RSA PRIVATE KEY-----")
+        || encoded.starts_with("-----BEGIN DSA PRIVATE KEY-----")
+        || encoded.starts_with("-----BEGIN EC PRIVATE KEY-----")
 }
 
 fn read_environment_variable(name: &str) -> Result<String, SecretInputError> {
@@ -1686,10 +1701,18 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             print_plain_error(format_args!(
                 "Agentknock couldn't prepare the secret upload: {error}."
             ));
-            if matches!(error, SecretInputError::EncryptedSshPrivateKey { .. }) {
-                print_plain_error(
-                    "Suggested action: Use --passphrase-prompt or --passphrase-env <NAME>.",
-                );
+            match error {
+                SecretInputError::EncryptedSshPrivateKey { .. } => {
+                    print_plain_error(
+                        "Suggested action: Use --passphrase-prompt or --passphrase-env <NAME>.",
+                    );
+                }
+                SecretInputError::LegacyPemSshPrivateKey { .. } => {
+                    print_plain_error(
+                        "Suggested action: Convert the key in place with ssh-keygen -p -f <PATH>, then try again.",
+                    );
+                }
+                _ => {}
             }
         }
         CommandError::UploadSecret(error) => print_upload_error(error),
