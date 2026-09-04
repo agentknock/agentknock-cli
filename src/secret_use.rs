@@ -3,8 +3,6 @@ use std::{
     fmt,
     future::Future,
     io,
-    path::Path,
-    pin::Pin,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -13,13 +11,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    Client,
-    config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing_from},
-    crypto::{self, Session},
-    pairing::RotationError,
-    protocol::{self, Method, Response},
+    Client, RequestProgress,
+    config::ConfigurationError,
+    protocol::Method,
     secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
-    websocket::{self, RelayExchange},
+    websocket,
 };
 
 const INVOCATION_TOKEN_LENGTH: usize = 32;
@@ -180,31 +176,6 @@ pub struct SshSecretUse {
 pub struct SecretUseInvocation {
     id: String,
     token: [u8; INVOCATION_TOKEN_LENGTH],
-}
-
-/// A stage reported while an invocation request is running.
-///
-/// A completed exchange reports `Preparing`, `WaitingForDelivery`, optionally
-/// one or more `WaitingForResponse` updates, `Completing`, and `Completed`, in
-/// that order. A request can still return a device denial after reporting
-/// `Completed`; other failures stop without reporting `Completed`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SecretUseProgress {
-    /// Agentknock is reading local state and preparing the protected request.
-    Preparing,
-
-    /// The request is waiting to be delivered to the device.
-    WaitingForDelivery,
-
-    /// The device has received the request but hasn't returned a decision.
-    WaitingForResponse,
-
-    /// Agentknock is validating the response and handing off the completion.
-    Completing,
-
-    /// The exchange and completion handoff finished successfully.
-    Completed,
 }
 
 impl SecretUseOutput {
@@ -447,17 +418,10 @@ impl Client {
         mut progress: P,
     ) -> Result<SecretUseOutput, RequestError>
     where
-        P: FnMut(SecretUseProgress),
+        P: FnMut(RequestProgress),
     {
-        tokio::pin!(cancellation);
-        progress(SecretUseProgress::Preparing);
+        progress(RequestProgress::Preparing);
         validate_secret_options(request.secrets).map_err(RequestError::other)?;
-        self.maybe_rotate_psk().map_err(|error| match error {
-            RotationError::Configuration(error) => RequestError::Configuration(error),
-            RotationError::Other(error) => RequestError::Other(error),
-        })?;
-        let pairing_path = self.pairing_path()?;
-        let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
         let mut invocation_token = [0_u8; INVOCATION_TOKEN_LENGTH];
         getrandom::fill(&mut invocation_token).map_err(RequestError::other)?;
@@ -489,184 +453,28 @@ impl Client {
             },
         };
         let secrets = secret_options_message(request.secrets);
-        let exchange_request = InvocationExchangeRequest {
-            message: InvocationRequestPayload {
-                method: Method::Invocation,
-                secrets,
-                reason: request.reason,
-                operation,
-                launcher_chain: request.launcher_chain,
-                invocation_token: BASE64_STANDARD.encode(invocation_token),
-            },
-            secrets: request.secrets,
+        let payload = InvocationRequestPayload {
+            method: Method::Invocation,
+            secrets,
+            reason: request.reason,
+            operation,
+            launcher_chain: request.launcher_chain,
+            invocation_token: BASE64_STANDARD.encode(invocation_token),
         };
-
-        message_exchange(
-            self,
-            &pairing_path,
-            &pairing,
-            invocation,
-            &exchange_request,
-            cancellation.as_mut(),
-            &mut progress,
+        self.approval_exchange(
+            request_id,
+            &payload,
+            cancellation,
+            progress,
+            |response: ApprovedInvocation| {
+                let secrets = response
+                    .secrets
+                    .ok_or_else(|| io::Error::other("approved response doesn't contain secrets"))?;
+                secret_use_output_from_secrets(secrets, request.secrets, invocation)
+            },
         )
         .await
     }
-}
-
-async fn message_exchange<C, P>(
-    client: &Client,
-    pairing_path: &Path,
-    pairing: &Pairing,
-    invocation: SecretUseInvocation,
-    exchange_request: &InvocationExchangeRequest<'_>,
-    mut cancellation: Pin<&mut C>,
-    progress: &mut P,
-) -> Result<SecretUseOutput, RequestError>
-where
-    C: Future<Output = ()> + ?Sized,
-    P: FnMut(SecretUseProgress),
-{
-    let request_id = invocation
-        .id
-        .parse::<Ulid>()
-        .expect("a generated invocation identifier is a ULID");
-    let plaintext = client
-        .encode(&exchange_request.message)
-        .map_err(RequestError::other)?;
-    let mut session = Session::new(pairing, &request_id).map_err(RequestError::other)?;
-    let request = session
-        .seal_request(&plaintext)
-        .map_err(RequestError::other)?;
-    let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
-
-    progress(SecretUseProgress::WaitingForDelivery);
-    let response = match tokio::select! {
-        biased;
-        _ = cancellation.as_mut() => {
-            if relay.request_was_sent() {
-                complete_cancelled(client, &mut session, &mut relay).await;
-            }
-            return Err(RequestError::Interrupted);
-        }
-        response = relay.request(&request, || {
-            progress(SecretUseProgress::WaitingForResponse);
-        }) => response,
-    } {
-        Ok(response) => response,
-        Err(error) => {
-            let abort_reason = abort_reason(&error);
-            let error = RequestError::from(error);
-            let completion = seal_aborted(client, &mut session, abort_reason, error.to_string());
-            if let Some(completion) = completion {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.as_mut() => {
-                        let _ = relay.complete_briefly(&completion).await;
-                        return Err(RequestError::Interrupted);
-                    }
-                    _ = relay.complete(&completion) => {}
-                }
-            }
-            return Err(error);
-        }
-    };
-    progress(SecretUseProgress::Completing);
-    let response = session
-        .open_response(response)
-        .map_err(RequestError::other)
-        .and_then(|plaintext| {
-            if let Some(rotation_key) = pairing.rotation_key() {
-                clear_rotation_key(pairing_path, rotation_key)?;
-            }
-            protocol::decode_response(&plaintext).map_err(RequestError::other)
-        });
-    let (completion_result, exchange_result) = match response {
-        Ok(Response::Error(error)) => {
-            if let Some(completion) = protocol::seal_error_completion(client, &mut session, &error)
-            {
-                let _ = relay.complete_briefly(&completion).await;
-            }
-            return Err(RequestError::DeviceRejected {
-                code: error.code,
-                message: error.message,
-            });
-        }
-        Err(error) => (
-            InvocationResult::Aborted {
-                reason: InvocationAbortReason::InvalidResponse,
-                message: error.to_string(),
-            },
-            Err(error),
-        ),
-        Ok(Response::Message(result)) => match result {
-            InvocationResult::Approved {
-                secrets: Some(secrets),
-            } => {
-                match secret_use_output_from_secrets(secrets, exchange_request.secrets, invocation)
-                {
-                    Ok(secret_use_output) => (
-                        InvocationResult::Approved { secrets: None },
-                        Ok(secret_use_output),
-                    ),
-                    Err(error) => (
-                        InvocationResult::Aborted {
-                            reason: InvocationAbortReason::InvalidResponse,
-                            message: error.to_string(),
-                        },
-                        Err(error.into()),
-                    ),
-                }
-            }
-            InvocationResult::Approved { secrets: None } => (
-                InvocationResult::Aborted {
-                    reason: InvocationAbortReason::InvalidResponse,
-                    message: "approved response doesn't contain secrets".into(),
-                },
-                Err(RequestError::other(
-                    "approved response doesn't contain secrets",
-                )),
-            ),
-            InvocationResult::Denied { reason, message } => (
-                InvocationResult::Denied {
-                    reason,
-                    message: message.clone(),
-                },
-                Err(RequestError::Denied { reason, message }),
-            ),
-            InvocationResult::Aborted { .. } => (
-                InvocationResult::Aborted {
-                    reason: InvocationAbortReason::InvalidResponse,
-                    message: "received an ABORTED result in a response".into(),
-                },
-                Err(RequestError::other(
-                    "received an ABORTED result in a response",
-                )),
-            ),
-        },
-    };
-
-    let plaintext = client
-        .encode(&completion_result)
-        .map_err(RequestError::other)?;
-    let completion = session
-        .seal_completion(&plaintext)
-        .map_err(RequestError::other)?;
-    let interrupted = tokio::select! {
-        biased;
-        _ = cancellation.as_mut() => true,
-        result = relay.complete(&completion) => {
-            result?;
-            progress(SecretUseProgress::Completed);
-            false
-        }
-    };
-    if interrupted {
-        let _ = relay.complete_briefly(&completion).await;
-        return Err(RequestError::Interrupted);
-    }
-
-    exchange_result
 }
 
 fn secret_use_output_from_secrets(
@@ -865,40 +673,6 @@ fn validate_returned_variables(
     Ok(())
 }
 
-fn abort_reason(error: &websocket::Error) -> InvocationAbortReason {
-    match error {
-        websocket::Error::RetriesExhausted { .. } => InvocationAbortReason::TimedOut,
-        websocket::Error::UnexpectedStatus(status) if (400..500).contains(status) => {
-            InvocationAbortReason::ClientError
-        }
-        _ => InvocationAbortReason::InvalidResponse,
-    }
-}
-
-fn seal_aborted(
-    client: &Client,
-    session: &mut Session,
-    reason: InvocationAbortReason,
-    message: String,
-) -> Option<crypto::Completion> {
-    let Ok(plaintext) = client.encode(&InvocationResult::Aborted { reason, message }) else {
-        return None;
-    };
-    session.seal_completion(&plaintext).ok()
-}
-
-async fn complete_cancelled(client: &Client, session: &mut Session, relay: &mut RelayExchange) {
-    let Some(completion) = seal_aborted(
-        client,
-        session,
-        InvocationAbortReason::Cancelled,
-        RequestError::Interrupted.to_string(),
-    ) else {
-        return;
-    };
-    let _ = relay.complete_briefly(&completion).await;
-}
-
 impl From<websocket::Error> for RequestError {
     fn from(error: websocket::Error) -> Self {
         match error {
@@ -928,11 +702,6 @@ struct InvocationRequestPayload<'a> {
     operation: InvocationOperationMessage<'a>,
     launcher_chain: &'a [String],
     invocation_token: String,
-}
-
-struct InvocationExchangeRequest<'a> {
-    message: InvocationRequestPayload<'a>,
-    secrets: &'a BTreeMap<String, SecretUseOptions>,
 }
 
 #[derive(Serialize)]
@@ -1014,32 +783,9 @@ impl From<StreamKind> for StreamKindMessage {
     }
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
-enum InvocationResult {
-    Approved {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        secrets:
-            Option<BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>>,
-    },
-    Denied {
-        reason: DenialReason,
-        message: String,
-    },
-    Aborted {
-        reason: InvocationAbortReason,
-        message: String,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum InvocationAbortReason {
-    Cancelled,
-    TimedOut,
-    InvalidResponse,
-    ClientError,
-    Other,
+#[derive(Deserialize)]
+struct ApprovedInvocation {
+    secrets: Option<BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>>,
 }
 
 #[cfg(test)]

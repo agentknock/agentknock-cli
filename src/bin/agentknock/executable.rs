@@ -299,21 +299,17 @@ impl SelectedExecutable {
 }
 
 fn install_standard_input(stdin: ChildStdout) -> io::Result<()> {
-    let source = stdin.into_raw_fd();
+    let source = stdin.as_raw_fd();
     if source == libc::STDIN_FILENO {
+        // Leave descriptor 0 open when ownership becomes process-wide.
+        let _ = stdin.into_raw_fd();
         return Ok(());
     }
     // SAFETY: source is an owned, live pipe descriptor and dup2 atomically
     // replaces the process's standard-input descriptor.
     if unsafe { libc::dup2(source, libc::STDIN_FILENO) } == -1 {
-        let error = io::Error::last_os_error();
-        // SAFETY: ownership of source was transferred from stdin above.
-        let _ = unsafe { libc::close(source) };
-        return Err(error);
+        return Err(io::Error::last_os_error());
     }
-    // SAFETY: dup2 copied source to standard input, and ownership of source was
-    // transferred from stdin above.
-    let _ = unsafe { libc::close(source) };
     Ok(())
 }
 

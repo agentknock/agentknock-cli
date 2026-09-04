@@ -7,28 +7,20 @@ use std::{
     os::unix::ffi::OsStringExt as _,
 };
 
-pub fn parent_id(process: libc::pid_t) -> io::Result<libc::pid_t> {
-    parent_id_impl(process)
-}
-
-pub fn executable_path(process: libc::pid_t) -> io::Result<PathBuf> {
-    executable_path_impl(process)
-}
-
 #[cfg(target_os = "linux")]
-fn parent_id_impl(process: libc::pid_t) -> io::Result<libc::pid_t> {
+pub fn parent_id(process: libc::pid_t) -> io::Result<libc::pid_t> {
     let status = std::fs::read_to_string(format!("/proc/{process}/status"))?;
     parse_parent_id(&status)
         .ok_or_else(|| io::Error::other(format!("process {process} has no parent process")))
 }
 
 #[cfg(target_os = "linux")]
-fn executable_path_impl(process: libc::pid_t) -> io::Result<PathBuf> {
+pub fn executable_path(process: libc::pid_t) -> io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{process}/exe"))
 }
 
 #[cfg(target_os = "macos")]
-fn parent_id_impl(process: libc::pid_t) -> io::Result<libc::pid_t> {
+pub fn parent_id(process: libc::pid_t) -> io::Result<libc::pid_t> {
     let mut information = MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: information points to a buffer of the size supplied to proc_pidinfo.
@@ -56,7 +48,7 @@ fn parent_id_impl(process: libc::pid_t) -> io::Result<libc::pid_t> {
 }
 
 #[cfg(target_os = "macos")]
-fn executable_path_impl(process: libc::pid_t) -> io::Result<PathBuf> {
+pub fn executable_path(process: libc::pid_t) -> io::Result<PathBuf> {
     let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: buffer is writable for the size supplied to proc_pidpath.
     let result =

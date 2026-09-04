@@ -115,7 +115,6 @@ struct OutgoingMessage {
     encoded: String,
     sent: bool,
     acknowledged: bool,
-    delivered: bool,
 }
 
 impl RelayExchange {
@@ -228,7 +227,7 @@ impl RelayExchange {
                 Some(incoming) => incoming,
                 None => continue,
             };
-            match self.validate(incoming)? {
+            match incoming {
                 IncomingFrame::Ack {
                     kind: MessageKind::Request,
                     ..
@@ -240,7 +239,6 @@ impl RelayExchange {
                     ..
                 } => {
                     self.request_mut().acknowledged = true;
-                    self.request_mut().delivered = true;
                     delivered();
                 }
                 IncomingFrame::Message {
@@ -249,7 +247,6 @@ impl RelayExchange {
                     ..
                 } => {
                     self.request_mut().acknowledged = true;
-                    self.request_mut().delivered = true;
                     delivered();
                     if self.response.is_none() {
                         self.response = Some(payload);
@@ -271,26 +268,6 @@ impl RelayExchange {
                     if matches!(exchange, ExchangeState::Settled | ExchangeState::Expired) {
                         return Err(Error::MissingResponse);
                     }
-                }
-                IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
-                IncomingFrame::Error {
-                    error,
-                    message,
-                    retryable,
-                    retry_after_ms,
-                    ..
-                } => {
-                    if !retryable {
-                        return Err(Error::RelayRejected {
-                            code: error,
-                            message,
-                        });
-                    }
-                    self.socket = None;
-                    retry.last_error = format!("relay requested retry: {error}: {message}");
-                    retry
-                        .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
-                        .await?;
                 }
                 _ => {}
             }
@@ -353,7 +330,7 @@ impl RelayExchange {
                 let Some(incoming) = self.receive(&mut retry).await? else {
                     continue;
                 };
-                match self.validate(incoming)? {
+                match incoming {
                     IncomingFrame::Ack {
                         kind: MessageKind::Request,
                         ..
@@ -365,7 +342,6 @@ impl RelayExchange {
                         ..
                     } => {
                         self.request_mut().acknowledged = true;
-                        self.request_mut().delivered = true;
                     }
                     IncomingFrame::Message {
                         kind: MessageKind::Response,
@@ -373,31 +349,10 @@ impl RelayExchange {
                         ..
                     } => {
                         self.request_mut().acknowledged = true;
-                        self.request_mut().delivered = true;
                         self.response.get_or_insert(payload);
                         if !self.send_ack(MessageKind::Response, &mut retry).await? {
                             continue;
                         }
-                    }
-                    IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
-                    IncomingFrame::Error {
-                        error,
-                        message,
-                        retryable,
-                        retry_after_ms,
-                        ..
-                    } => {
-                        if !retryable {
-                            return Err(Error::RelayRejected {
-                                code: error,
-                                message,
-                            });
-                        }
-                        self.socket = None;
-                        retry.last_error = format!("relay requested retry: {error}: {message}");
-                        retry
-                            .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
-                            .await?;
                     }
                     _ => {}
                 }
@@ -412,12 +367,11 @@ impl RelayExchange {
             let Some(incoming) = self.receive(&mut retry).await? else {
                 continue;
             };
-            match self.validate(incoming)? {
+            match incoming {
                 IncomingFrame::Ack {
                     kind: MessageKind::Completion,
                     ..
                 } => {
-                    self.completion_mut().acknowledged = true;
                     return Ok(());
                 }
                 IncomingFrame::Message {
@@ -435,28 +389,7 @@ impl RelayExchange {
                         MessageState::Accepted | MessageState::Delivered | MessageState::Discarded,
                     ..
                 } => {
-                    self.completion_mut().acknowledged = true;
                     return Ok(());
-                }
-                IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
-                IncomingFrame::Error {
-                    error,
-                    message,
-                    retryable,
-                    retry_after_ms,
-                    ..
-                } => {
-                    if !retryable {
-                        return Err(Error::RelayRejected {
-                            code: error,
-                            message,
-                        });
-                    }
-                    self.socket = None;
-                    retry.last_error = format!("relay requested retry: {error}: {message}");
-                    retry
-                        .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
-                        .await?;
                 }
                 _ => {}
             }
@@ -677,10 +610,34 @@ impl RelayExchange {
                 ));
             };
             let incoming: IncomingFrame = serde_json::from_str(text).map_err(Error::InvalidJson)?;
-            if !incoming.is_retryable_error() {
-                retry.succeeded();
+            let incoming = self.validate(incoming)?;
+            match incoming {
+                IncomingFrame::Error {
+                    error,
+                    message,
+                    retryable,
+                    retry_after_ms,
+                    ..
+                } => {
+                    if !retryable {
+                        return Err(Error::RelayRejected {
+                            code: error,
+                            message,
+                        });
+                    }
+                    self.socket = None;
+                    retry.last_error = format!("relay requested retry: {error}: {message}");
+                    retry
+                        .failed(Duration::from_millis(retry_after_ms.unwrap_or(1000)))
+                        .await?;
+                    return Ok(None);
+                }
+                IncomingFrame::Inactive { kind, .. } => return Err(Error::Inactive { kind }),
+                incoming => {
+                    retry.succeeded();
+                    return Ok(Some(incoming));
+                }
             }
-            return Ok(Some(incoming));
         }
     }
 
@@ -710,7 +667,6 @@ impl RelayExchange {
             MessageState::Accepted => self.request_mut().acknowledged = true,
             MessageState::Delivered => {
                 self.request_mut().acknowledged = true;
-                self.request_mut().delivered = true;
                 delivered();
             }
             MessageState::Absent | MessageState::Discarded => {}
@@ -795,7 +751,6 @@ impl OutgoingMessage {
             encoded,
             sent: false,
             acknowledged: false,
-            delivered: false,
         })
     }
 }
@@ -924,16 +879,6 @@ enum IncomingFrame {
 }
 
 impl IncomingFrame {
-    fn is_retryable_error(&self) -> bool {
-        matches!(
-            self,
-            Self::Error {
-                retryable: true,
-                ..
-            }
-        )
-    }
-
     fn client_id(&self) -> Option<&str> {
         match self {
             Self::Ack { client_id, .. }

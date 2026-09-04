@@ -11,7 +11,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE},
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
@@ -284,10 +284,10 @@ pub enum ConfigurationError {
 }
 
 pub(crate) fn read_pending_pairing(path: &Path) -> Result<Pairing, ConfigurationError> {
-    let (path, contents) = read_pending_pairing_file(path, None)?;
+    let contents = read_pending_pairing_file(path, None)?;
     let pairing: Pairing =
         serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
-            path: path.clone(),
+            path: path.to_owned(),
             source,
         })?;
     Ok(pairing)
@@ -296,16 +296,11 @@ pub(crate) fn read_pending_pairing(path: &Path) -> Result<Pairing, Configuration
 pub(crate) fn read_pairing_status(
     path: &Path,
 ) -> Result<Option<StoredPairingStatus>, ConfigurationError> {
-    let contents = match read_pairing_value(path) {
-        Ok(contents) => contents,
+    let pairing: Pairing = match read_pairing_file(path) {
+        Ok(pairing) => pairing,
         Err(ConfigurationError::NoPairing { .. }) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let pairing: Pairing =
-        serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
-            path: path.to_owned(),
-            source,
-        })?;
 
     Ok(Some(if pairing.pending {
         StoredPairingStatus::Pending
@@ -315,14 +310,10 @@ pub(crate) fn read_pairing_status(
 }
 
 pub(crate) fn ensure_pairing_absent(path: &Path) -> Result<(), ConfigurationError> {
-    ensure_pairing_path_absent(path)
-}
-
-fn ensure_pairing_path_absent(path: &Path) -> Result<(), ConfigurationError> {
     match path.try_exists() {
         Ok(false) => Ok(()),
         Ok(true) => {
-            let pairing = read_pairing_value(path)?;
+            let pairing: Value = read_pairing_file(path)?;
             if pairing.get("pending") == Some(&Value::Bool(true)) {
                 Err(ConfigurationError::PairingPending {
                     path: path.to_owned(),
@@ -351,40 +342,20 @@ pub(crate) fn write_pending_pairing(
         source,
     })?;
     let directory = lock_directory(&directory_path)?;
-    ensure_pairing_path_absent(path)?;
+    ensure_pairing_absent(path)?;
     let rotated_at = current_timestamp()?;
-    let contents = serde_json::to_vec_pretty(&PendingPairingFile {
-        pending: true,
-        device_id: pairing.device_id,
-        client_id: pairing.client_id,
-        client_token: &pairing.client_token,
-        client_psk: &pairing.client_psk,
-        device_key: &pairing.device_key,
-        rotated_at,
-    })
-    .map_err(|source| ConfigurationError::Invalid {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut options = AtomicWriteFile::options();
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .map_err(|source| ConfigurationError::Access {
-            path: path.to_owned(),
-            source,
-        })?;
-    file.write_all(&contents)
-        .and_then(|()| file.write_all(b"\n"))
-        .map_err(|source| ConfigurationError::Access {
-            path: path.to_owned(),
-            source,
-        })?;
-    file.commit().map_err(|source| ConfigurationError::Access {
-        path: path.to_owned(),
-        source,
-    })?;
+    write_pairing_file(
+        path,
+        &PendingPairingFile {
+            pending: true,
+            device_id: pairing.device_id,
+            client_id: pairing.client_id,
+            client_token: &pairing.client_token,
+            client_psk: &pairing.client_psk,
+            device_key: &pairing.device_key,
+            rotated_at,
+        },
+    )?;
     sync_directory(&directory, &directory_path)
 }
 
@@ -394,7 +365,7 @@ pub(crate) fn clear_rotation_key(
 ) -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let (path, mut pairing) = read_pairing_file(pairing_path)?;
+    let mut pairing: Value = read_pairing_file(pairing_path)?;
     if pairing.get("rotation_key").and_then(Value::as_str) != Some(rotation_key) {
         return Ok(());
     }
@@ -402,7 +373,7 @@ pub(crate) fn clear_rotation_key(
         .as_object_mut()
         .expect("pairing is a JSON object")
         .remove("rotation_key");
-    write_pairing_file(&path, &pairing)?;
+    write_pairing_file(pairing_path, &pairing)?;
     sync_directory(&directory, directory_path)
 }
 
@@ -424,7 +395,7 @@ pub(crate) fn lock_pairing_if_rotated_before(
 fn lock_pairing(path: &Path) -> Result<LockedPairing, ConfigurationError> {
     let directory_path = path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let contents = read_pairing_value(path)?;
+    let contents: Value = read_pairing_file(path)?;
     let pairing = parse_pairing(path, contents.clone())?;
 
     Ok(LockedPairing {
@@ -468,12 +439,12 @@ pub(crate) fn finish_pending_pairing(
 ) -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let (path, mut pairing) = read_pending_pairing_file(pairing_path, Some(expected_client_id))?;
+    let mut pairing = read_pending_pairing_file(pairing_path, Some(expected_client_id))?;
     pairing
         .as_object_mut()
         .expect("pending pairing is a JSON object")
         .remove("pending");
-    write_pairing_file(&path, &pairing)?;
+    write_pairing_file(pairing_path, &pairing)?;
     sync_directory(&directory, directory_path)
 }
 
@@ -483,8 +454,11 @@ pub(crate) fn abort_pending_pairing(
 ) -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let (path, _) = read_pending_pairing_file(pairing_path, expected_client_id)?;
-    fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })?;
+    read_pending_pairing_file(pairing_path, expected_client_id)?;
+    fs::remove_file(pairing_path).map_err(|source| ConfigurationError::Access {
+        path: pairing_path.to_owned(),
+        source,
+    })?;
     sync_directory(&directory, directory_path)
 }
 
@@ -527,52 +501,51 @@ pub(crate) fn remove_active_pairing(
 ) -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let (path, contents) = match read_pairing_file(pairing_path) {
+    let pairing: Pairing = match read_pairing_file(pairing_path) {
         Ok(pairing) => pairing,
         Err(ConfigurationError::NoPairing { .. }) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let pairing: Pairing =
-        serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
-            path: path.clone(),
-            source,
-        })?;
     if pairing.pending
         || pairing.device_id_bytes() != expected_device_id
         || pairing.client_id_bytes() != expected_client_id
     {
-        return Err(ConfigurationError::PairingChanged { path });
+        return Err(ConfigurationError::PairingChanged {
+            path: pairing_path.to_owned(),
+        });
     }
 
-    fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })?;
+    fs::remove_file(pairing_path).map_err(|source| ConfigurationError::Access {
+        path: pairing_path.to_owned(),
+        source,
+    })?;
     sync_directory(&directory, directory_path)
 }
 
 fn read_pending_pairing_file(
     path: &Path,
     expected_client_id: Option<&str>,
-) -> Result<(PathBuf, Value), ConfigurationError> {
-    let (path, pairing) = read_pairing_file(path)?;
+) -> Result<Value, ConfigurationError> {
+    let pairing: Value = read_pairing_file(path)?;
     if pairing.get("pending") != Some(&Value::Bool(true)) {
-        return Err(ConfigurationError::PairingNotPending { path });
+        return Err(ConfigurationError::PairingNotPending {
+            path: path.to_owned(),
+        });
     }
     // Each pairing attempt has a fresh client ID. A delayed operation must
     // not activate or delete a replacement attempt.
     if let Some(expected) = expected_client_id
         && pairing.get("client_id").and_then(Value::as_str) != Some(expected)
     {
-        return Err(ConfigurationError::PairingChanged { path });
+        return Err(ConfigurationError::PairingChanged {
+            path: path.to_owned(),
+        });
     }
 
-    Ok((path, pairing))
+    Ok(pairing)
 }
 
-fn read_pairing_file(path: &Path) -> Result<(PathBuf, Value), ConfigurationError> {
-    let pairing = read_pairing_value(path)?;
-    Ok((path.to_owned(), pairing))
-}
-
-fn read_pairing_value(path: &Path) -> Result<Value, ConfigurationError> {
+fn read_pairing_file<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigurationError> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -588,15 +561,13 @@ fn read_pairing_value(path: &Path) -> Result<Value, ConfigurationError> {
         }
     };
     validate_permissions(&file, path)?;
-    let pairing: Value =
-        serde_json::from_reader(file).map_err(|source| ConfigurationError::Invalid {
-            path: path.to_owned(),
-            source,
-        })?;
-    Ok(pairing)
+    serde_json::from_reader(file).map_err(|source| ConfigurationError::Invalid {
+        path: path.to_owned(),
+        source,
+    })
 }
 
-fn write_pairing_file(path: &Path, pairing: &Value) -> Result<(), ConfigurationError> {
+fn write_pairing_file(path: &Path, pairing: &impl Serialize) -> Result<(), ConfigurationError> {
     let contents =
         serde_json::to_vec_pretty(pairing).map_err(|source| ConfigurationError::Invalid {
             path: path.to_owned(),
@@ -647,28 +618,7 @@ fn sync_directory(directory: &File, path: &Path) -> Result<(), ConfigurationErro
 }
 
 pub(crate) fn read_pairing_from(path: &Path) -> Result<Pairing, ConfigurationError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(ConfigurationError::NoPairing {
-                path: path.to_owned(),
-            });
-        }
-        Err(source) => {
-            return Err(ConfigurationError::Access {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    };
-
-    validate_permissions(&file, path)?;
-
-    let pairing = serde_json::from_reader(file).map_err(|source| ConfigurationError::Invalid {
-        path: path.to_owned(),
-        source,
-    })?;
-    validate_pairing(path, pairing)
+    validate_pairing(path, read_pairing_file(path)?)
 }
 
 fn parse_pairing(path: &Path, contents: Value) -> Result<Pairing, ConfigurationError> {
