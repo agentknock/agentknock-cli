@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
 
@@ -58,7 +58,7 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
 
@@ -119,9 +119,9 @@ jobs:
       - name: Install Nix
         run: |
           curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            https://releases.nixos.org/nix/nix-2.35.1/install \
+            https://releases.nixos.org/nix/nix-2.35.2/install \
             --output nix-install
-          echo "34e0ef63ec1f3e552e15069660afd9a0a23f69009e340c33067595252888286c  nix-install" \
+          echo "9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c  nix-install" \
             | sha256sum --check
           sh nix-install --daemon --no-channel-add --yes
           echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
@@ -161,9 +161,9 @@ jobs:
       - name: Install Nix
         run: |
           curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            https://releases.nixos.org/nix/nix-2.35.1/install \
+            https://releases.nixos.org/nix/nix-2.35.2/install \
             --output nix-install
-          echo "34e0ef63ec1f3e552e15069660afd9a0a23f69009e340c33067595252888286c  nix-install" \
+          echo "9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c  nix-install" \
             | shasum -a 256 --check
           sh nix-install --daemon --no-channel-add --yes
           echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
@@ -241,7 +241,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
 
@@ -327,11 +327,11 @@ jobs:
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
           startsWith(github.head_ref, 'release-plz-')
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260 # v0.5.132
         with:
           command: release
           dry_run: true
-          version: 0.3.160
+          version: 0.3.161
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -387,9 +387,9 @@ jobs:
 
       - name: Prepare or publish release
         id: release-plz
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260 # v0.5.132
         with:
-          version: 0.3.160
+          version: 0.3.161
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -452,7 +452,7 @@ jobs:
           path: ${{ runner.temp }}/npm
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
