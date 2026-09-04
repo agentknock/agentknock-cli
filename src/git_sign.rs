@@ -231,17 +231,17 @@ where
     };
 
     progress(GitSignProgress::Completing);
-    let plaintext = session
+    let response = session
         .open_response(response)
-        .map_err(RequestError::other)?;
-    if let Some(rotation_key) = pairing.rotation_key() {
-        clear_rotation_key(pairing_path, rotation_key)?;
-    }
-    let result: GitSignResult = match protocol::decode_response(&plaintext)
-        .map_err(RequestError::other)?
-    {
-        Response::Message(result) => result,
-        Response::Error(error) => {
+        .map_err(RequestError::other)
+        .and_then(|plaintext| {
+            if let Some(rotation_key) = pairing.rotation_key() {
+                clear_rotation_key(pairing_path, rotation_key)?;
+            }
+            protocol::decode_response(&plaintext).map_err(RequestError::other)
+        });
+    let (completion_result, exchange_result) = match response {
+        Ok(Response::Error(error)) => {
             if let Some(completion) = protocol::seal_error_completion(client, &mut session, &error)
             {
                 let _ = relay.complete_briefly(&completion).await;
@@ -251,39 +251,46 @@ where
                 message: error.message,
             });
         }
-    };
-
-    let (completion_result, exchange_result) = match result {
-        GitSignResult::Approved {
-            signature: Some(signature),
-        } if valid_ssh_signature_envelope(&signature) => {
-            (GitSignResult::Approved { signature: None }, Ok(signature))
-        }
-        GitSignResult::Approved { .. } => (
+        Err(error) => (
             GitSignResult::Aborted {
                 reason: GitSignAbortReason::InvalidResponse,
-                message: "approved response doesn't contain a valid SSH signature envelope".into(),
+                message: error.to_string(),
             },
-            Err(RequestError::other(
-                "approved response doesn't contain a valid SSH signature envelope",
-            )),
+            Err(error),
         ),
-        GitSignResult::Denied { reason, message } => (
-            GitSignResult::Denied {
-                reason,
-                message: message.clone(),
-            },
-            Err(RequestError::Denied { reason, message }),
-        ),
-        GitSignResult::Aborted { .. } => (
-            GitSignResult::Aborted {
-                reason: GitSignAbortReason::InvalidResponse,
-                message: "received an ABORTED result in a response".into(),
-            },
-            Err(RequestError::other(
-                "received an ABORTED result in a response",
-            )),
-        ),
+        Ok(Response::Message(result)) => match result {
+            GitSignResult::Approved {
+                signature: Some(signature),
+            } if valid_ssh_signature_envelope(&signature) => {
+                (GitSignResult::Approved { signature: None }, Ok(signature))
+            }
+            GitSignResult::Approved { .. } => (
+                GitSignResult::Aborted {
+                    reason: GitSignAbortReason::InvalidResponse,
+                    message: "approved response doesn't contain a valid SSH signature envelope"
+                        .into(),
+                },
+                Err(RequestError::other(
+                    "approved response doesn't contain a valid SSH signature envelope",
+                )),
+            ),
+            GitSignResult::Denied { reason, message } => (
+                GitSignResult::Denied {
+                    reason,
+                    message: message.clone(),
+                },
+                Err(RequestError::Denied { reason, message }),
+            ),
+            GitSignResult::Aborted { .. } => (
+                GitSignResult::Aborted {
+                    reason: GitSignAbortReason::InvalidResponse,
+                    message: "received an ABORTED result in a response".into(),
+                },
+                Err(RequestError::other(
+                    "received an ABORTED result in a response",
+                )),
+            ),
+        },
     };
 
     let plaintext = client

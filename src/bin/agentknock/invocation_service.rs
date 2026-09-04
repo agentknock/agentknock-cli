@@ -52,6 +52,7 @@ const QUIET_GIT_SIGN_HELPER_NAME: &str = "git-sign-quiet";
 const GIT_SIGNATURE_NAMESPACE: &str = "git";
 const SOCKET_NAME: &str = "service.sock";
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize, Serialize)]
 struct StartupRequest {
@@ -653,7 +654,16 @@ async fn serve(service: PreparedService) -> io::Result<()> {
             result = accept_optional(&listener) => Some(Connection::Helper(result?)),
             result = accept_optional(&agent_listener) => Some(Connection::Agent(result?)),
             Some(()) = connections.next(), if !connections.is_empty() => None,
-            result = wait_for_process(&owner) => return result,
+            result = wait_for_process(&owner) => {
+                drop(listener);
+                drop(agent_listener);
+                // Let active exchanges send canceled completions, but don't
+                // wait indefinitely for a relay or an idle local connection.
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+                    while connections.next().await.is_some() {}
+                }).await;
+                return result;
+            },
         };
         let Some(connection) = connection else {
             continue;
@@ -745,7 +755,10 @@ async fn handle_connection(
         .ok_or_else(|| io::Error::other("invocation helper has no process identifier"))?;
     require_descendant(peer_pid, context.owner_pid)?;
     let mut input = Vec::new();
-    connection.read_to_end(&mut input).await?;
+    tokio::select! {
+        result = connection.read_to_end(&mut input) => { result?; }
+        result = wait_for_process(owner) => return result,
+    }
     let request: HelperRequest = serde_json::from_slice(&input).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1268,8 +1281,10 @@ fn ssh_progress_message(progress: SshAuthenticationProgress) -> &'static str {
         SshAuthenticationProgress::WaitingForResponse => {
             "Waiting for the device to approve SSH authentication."
         }
-        SshAuthenticationProgress::Completing => "The device approved SSH authentication.",
-        SshAuthenticationProgress::Completed => "SSH authentication is approved.",
+        SshAuthenticationProgress::Completing => {
+            "SSH authentication response received. Confirming receipt."
+        }
+        SshAuthenticationProgress::Completed => "SSH authentication request complete.",
         _ => "Waiting for SSH authentication approval.",
     }
 }
@@ -1283,8 +1298,8 @@ fn progress_message(progress: GitSignProgress) -> &'static str {
         GitSignProgress::WaitingForResponse => {
             "Waiting for the device to approve the Git signature."
         }
-        GitSignProgress::Completing => "The device approved the Git signature.",
-        GitSignProgress::Completed => "Git signing is approved.",
+        GitSignProgress::Completing => "Git signing response received. Confirming receipt.",
+        GitSignProgress::Completed => "Git signing request complete.",
         _ => "Waiting for Git signing approval.",
     }
 }

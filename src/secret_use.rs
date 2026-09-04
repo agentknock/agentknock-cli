@@ -572,17 +572,17 @@ where
         }
     };
     progress(SecretUseProgress::Completing);
-    let plaintext = session
+    let response = session
         .open_response(response)
-        .map_err(RequestError::other)?;
-    if let Some(rotation_key) = pairing.rotation_key() {
-        clear_rotation_key(pairing_path, rotation_key)?;
-    }
-    let result: InvocationResult = match protocol::decode_response(&plaintext)
-        .map_err(RequestError::other)?
-    {
-        Response::Message(result) => result,
-        Response::Error(error) => {
+        .map_err(RequestError::other)
+        .and_then(|plaintext| {
+            if let Some(rotation_key) = pairing.rotation_key() {
+                clear_rotation_key(pairing_path, rotation_key)?;
+            }
+            protocol::decode_response(&plaintext).map_err(RequestError::other)
+        });
+    let (completion_result, exchange_result) = match response {
+        Ok(Response::Error(error)) => {
             if let Some(completion) = protocol::seal_error_completion(client, &mut session, &error)
             {
                 let _ = relay.complete_briefly(&completion).await;
@@ -592,48 +592,58 @@ where
                 message: error.message,
             });
         }
-    };
-    let (completion_result, exchange_result) = match result {
-        InvocationResult::Approved {
-            secrets: Some(secrets),
-        } => match secret_use_output_from_secrets(secrets, exchange_request.secrets, invocation) {
-            Ok(secret_use_output) => (
-                InvocationResult::Approved { secrets: None },
-                Ok(secret_use_output),
-            ),
-            Err(error) => (
+        Err(error) => (
+            InvocationResult::Aborted {
+                reason: InvocationAbortReason::InvalidResponse,
+                message: error.to_string(),
+            },
+            Err(error),
+        ),
+        Ok(Response::Message(result)) => match result {
+            InvocationResult::Approved {
+                secrets: Some(secrets),
+            } => {
+                match secret_use_output_from_secrets(secrets, exchange_request.secrets, invocation)
+                {
+                    Ok(secret_use_output) => (
+                        InvocationResult::Approved { secrets: None },
+                        Ok(secret_use_output),
+                    ),
+                    Err(error) => (
+                        InvocationResult::Aborted {
+                            reason: InvocationAbortReason::InvalidResponse,
+                            message: error.to_string(),
+                        },
+                        Err(error.into()),
+                    ),
+                }
+            }
+            InvocationResult::Approved { secrets: None } => (
                 InvocationResult::Aborted {
                     reason: InvocationAbortReason::InvalidResponse,
-                    message: error.to_string(),
+                    message: "approved response doesn't contain secrets".into(),
                 },
-                Err(error.into()),
+                Err(RequestError::other(
+                    "approved response doesn't contain secrets",
+                )),
+            ),
+            InvocationResult::Denied { reason, message } => (
+                InvocationResult::Denied {
+                    reason,
+                    message: message.clone(),
+                },
+                Err(RequestError::Denied { reason, message }),
+            ),
+            InvocationResult::Aborted { .. } => (
+                InvocationResult::Aborted {
+                    reason: InvocationAbortReason::InvalidResponse,
+                    message: "received an ABORTED result in a response".into(),
+                },
+                Err(RequestError::other(
+                    "received an ABORTED result in a response",
+                )),
             ),
         },
-        InvocationResult::Approved { secrets: None } => (
-            InvocationResult::Aborted {
-                reason: InvocationAbortReason::InvalidResponse,
-                message: "approved response doesn't contain secrets".into(),
-            },
-            Err(RequestError::other(
-                "approved response doesn't contain secrets",
-            )),
-        ),
-        InvocationResult::Denied { reason, message } => (
-            InvocationResult::Denied {
-                reason,
-                message: message.clone(),
-            },
-            Err(RequestError::Denied { reason, message }),
-        ),
-        InvocationResult::Aborted { .. } => (
-            InvocationResult::Aborted {
-                reason: InvocationAbortReason::InvalidResponse,
-                message: "received an ABORTED result in a response".into(),
-            },
-            Err(RequestError::other(
-                "received an ABORTED result in a response",
-            )),
-        ),
     };
 
     let plaintext = client

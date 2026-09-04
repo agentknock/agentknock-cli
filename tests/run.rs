@@ -16,7 +16,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures_util::SinkExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio_websockets::Message;
@@ -1870,6 +1870,40 @@ async fn signal_before_response_sends_an_aborted_completion() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_device_error_sends_an_aborted_completion() {
+    check_aborted_response(
+        json!({
+            "error": "UNSUPPORTED_METHOD",
+            "message": "The requested operation is not supported.",
+        }),
+        false,
+        "CLIENT_ERROR",
+        "UNSUPPORTED_METHOD",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_invocation_response_sends_an_aborted_completion() {
+    check_aborted_response(
+        json!({"result": "UNKNOWN_RESULT"}),
+        false,
+        "INVALID_RESPONSE",
+        "UNKNOWN_RESULT",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthentic_invocation_response_sends_an_aborted_completion() {
+    check_aborted_response(json!({}), true, "INVALID_RESPONSE", "decrypt").await;
+}
+
+async fn check_aborted_response(
+    response: Value,
+    corrupt_ciphertext: bool,
+    reason: &'static str,
+    expected_error: &str,
+) {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
@@ -1879,6 +1913,10 @@ async fn authenticated_device_error_sends_an_aborted_completion() {
         let request_id = request["request_id"].as_str().unwrap().to_owned();
         let (mut context, key, _) =
             open_request(&device_private_key, &request_id, &request["payload"]);
+        let mut response = encrypt_response(&context, &key, &response);
+        if corrupt_ciphertext {
+            response["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into();
+        }
         send_json(
             &mut socket,
             json!({
@@ -1896,14 +1934,7 @@ async fn authenticated_device_error_sends_an_aborted_completion() {
                 "client_id": client_id,
                 "request_id": request_id,
                 "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &json!({
-                        "error": "UNSUPPORTED_METHOD",
-                        "message": "The requested operation is not supported.",
-                    }),
-                ),
+                "payload": response,
             }),
         )
         .await;
@@ -1911,7 +1942,7 @@ async fn authenticated_device_error_sends_an_aborted_completion() {
         let completion = receive_json(&mut socket).await;
         let plaintext = open_completion(&mut context, &completion["payload"]);
         assert_eq!(plaintext["result"], "ABORTED");
-        assert_eq!(plaintext["reason"], "CLIENT_ERROR");
+        assert_eq!(plaintext["reason"], reason);
         send_json(
             &mut socket,
             json!({
@@ -1934,7 +1965,7 @@ async fn authenticated_device_error_sends_an_aborted_completion() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("UNSUPPORTED_METHOD"));
+    assert!(stderr.contains(expected_error), "{stderr}");
     assert!(stderr.contains("The command didn't run."));
     server.await.unwrap();
 }
@@ -2035,4 +2066,82 @@ fn interrupt(child: &std::process::Child) {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_bounds_the_entire_completion_handoff() {
+    // Neither a missing request ack nor a missing completion ack may prolong cancellation.
+    for acknowledge_request in [false, true] {
+        let home = TestHome::active();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (relay_url, server) = websocket_server(move |listener| async move {
+            let (_, mut socket) = accept(&listener).await;
+            let request = receive_json(&mut socket).await;
+            if acknowledge_request {
+                send_json(&mut socket, json!({
+                    "type": "ack",
+                    "client_id": request["client_id"],
+                    "request_id": request["request_id"],
+                    "kind": "request",
+                })).await;
+            }
+            ready_tx.send(()).unwrap();
+            // Keep the transport healthy without acknowledging the handoff.
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(100));
+            let mut saw_completion = false;
+            loop {
+                tokio::select! {
+                    message = socket.next() => match message {
+                        Some(Ok(message)) if message.is_text() => {
+                            let message: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
+                            assert_eq!(message["kind"], "completion");
+                            saw_completion = true;
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break,
+                    },
+                    _ = heartbeat.tick() => {
+                        if socket.send(Message::ping(Vec::new())).await.is_err() { break; }
+                    }
+                }
+            }
+            assert_eq!(saw_completion, acknowledge_request);
+        }).await;
+        let mut child = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_agentknock"))
+                .env("HOME", home.path())
+                .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+                .args(["-s", "test", "--", "env"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        interrupt(&child.0);
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while child.0.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancellation exceeded the brief completion budget");
+        assert!(!child.0.wait().unwrap().success());
+        let mut stdout = String::new();
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert!(
+            stdout.is_empty(),
+            "the command must not run after cancellation"
+        );
+        server.await.unwrap();
+    }
 }
