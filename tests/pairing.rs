@@ -85,6 +85,15 @@ fn reports_local_pairing_status() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_while_starting_pairing_discards_local_state() {
+    cancel_start_pairing(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_pairing_start_preserves_a_replacement_pairing() {
+    cancel_start_pairing(true).await;
+}
+
+async fn cancel_start_pairing(replace_pairing: bool) {
     let home = TestHome::empty();
     let pairing_path = home.pairing_path();
     let device_public_key = home.device_public_key.clone();
@@ -123,6 +132,12 @@ async fn signal_while_starting_pairing_discards_local_state() {
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
         assert_eq!(receive_json(&mut socket).await["kind"], "completion");
         assert!(pairing_path.exists());
+        if replace_pairing {
+            let mut replacement: Value =
+                serde_json::from_slice(&fs::read(&pairing_path).unwrap()).unwrap();
+            replacement["client_id"] = support::CLIENT_ID.into();
+            fs::write(&pairing_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        }
         ready_sender.send(()).unwrap();
         release_receiver
             .recv_timeout(Duration::from_secs(5))
@@ -144,12 +159,68 @@ async fn signal_while_starting_pairing_discards_local_state() {
     let output = child.wait_with_output().unwrap();
 
     assert!(!output.status.success());
-    assert!(!home.pairing_path().exists());
+    assert_eq!(home.pairing_path().exists(), replace_pairing);
+    if replace_pairing {
+        let replacement: Value =
+            serde_json::from_slice(&fs::read(home.pairing_path()).unwrap()).unwrap();
+        assert_eq!(replacement["client_id"], support::CLIENT_ID);
+        assert_eq!(replacement["pending"], true);
+    }
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("canceled pairing")
     );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_finish_does_not_activate_a_replacement_pairing() {
+    let home = TestHome::pending();
+    let device_private_key = home.device_private_key.clone();
+    let pairing_path = home.pairing_path();
+    let replacement_id = Ulid::generate().to_string();
+    let expected_id = replacement_id.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let (context, key, _) = open_request(
+            &device_private_key,
+            request["request_id"].as_str().unwrap(),
+            &request["payload"],
+        );
+        // Simulate aborting and restarting pairing while finish awaits its response.
+        let mut replacement: Value =
+            serde_json::from_slice(&fs::read(&pairing_path).unwrap()).unwrap();
+        replacement["client_id"] = replacement_id.into();
+        fs::write(&pairing_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message",
+                "client_id": request["client_id"],
+                "request_id": request["request_id"],
+                "kind": "response",
+                "payload": encrypt_response(&context, &key, &json!({"result": "ACCEPTED"})),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["pairing", "finish"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("changed during the operation"));
+    let replacement: Value =
+        serde_json::from_slice(&fs::read(home.pairing_path()).unwrap()).unwrap();
+    assert_eq!(replacement["client_id"], expected_id);
+    assert_eq!(replacement["pending"], true);
     server.await.unwrap();
 }
 

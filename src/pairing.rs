@@ -160,7 +160,7 @@ impl Client {
             result = relay.complete(&completion) => result.map_err(RequestError::from),
         };
         if let Err(error) = result {
-            let _ = abort_pending_pairing(&pairing_path);
+            let _ = abort_pending_pairing(&pairing_path, Some(&client_id.to_string()));
             return Err(error);
         }
         progress(PairingProgress::Completed);
@@ -257,7 +257,7 @@ impl Client {
         let completion = session
             .seal_completion(&plaintext)
             .map_err(RequestError::other)?;
-        finish_pending_pairing(&pairing_path)?;
+        finish_pending_pairing(&pairing_path, &pairing.client_id())?;
         let interrupted = tokio::select! {
             biased;
             _ = cancellation.as_mut() => true,
@@ -285,7 +285,7 @@ impl Client {
     /// [`ConfigurationError::PairingNotPending`] if the pairing is active, or
     /// another configuration error if the pending state can't be removed.
     pub fn abort_pairing(&self) -> Result<(), ConfigurationError> {
-        abort_pending_pairing(&self.pairing_path()?)
+        abort_pending_pairing(&self.pairing_path()?, None)
     }
 
     /// Deletes the local pairing without contacting the device.

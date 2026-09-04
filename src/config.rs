@@ -284,7 +284,7 @@ pub enum ConfigurationError {
 }
 
 pub(crate) fn read_pending_pairing(path: &Path) -> Result<Pairing, ConfigurationError> {
-    let (path, contents) = read_pending_pairing_file(path)?;
+    let (path, contents) = read_pending_pairing_file(path, None)?;
     let pairing: Pairing =
         serde_json::from_value(contents).map_err(|source| ConfigurationError::Invalid {
             path: path.clone(),
@@ -462,10 +462,13 @@ impl LockedPairing {
     }
 }
 
-pub(crate) fn finish_pending_pairing(pairing_path: &Path) -> Result<(), ConfigurationError> {
+pub(crate) fn finish_pending_pairing(
+    pairing_path: &Path,
+    expected_client_id: &str,
+) -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let (path, mut pairing) = read_pending_pairing_file(pairing_path)?;
+    let (path, mut pairing) = read_pending_pairing_file(pairing_path, Some(expected_client_id))?;
     pairing
         .as_object_mut()
         .expect("pending pairing is a JSON object")
@@ -474,10 +477,13 @@ pub(crate) fn finish_pending_pairing(pairing_path: &Path) -> Result<(), Configur
     sync_directory(&directory, directory_path)
 }
 
-pub(crate) fn abort_pending_pairing(pairing_path: &Path) -> Result<(), ConfigurationError> {
+pub(crate) fn abort_pending_pairing(
+    pairing_path: &Path,
+    expected_client_id: Option<&str>,
+) -> Result<(), ConfigurationError> {
     let directory_path = pairing_path.parent().expect("pairing path has a parent");
     let directory = lock_directory(directory_path)?;
-    let (path, _) = read_pending_pairing_file(pairing_path)?;
+    let (path, _) = read_pending_pairing_file(pairing_path, expected_client_id)?;
     fs::remove_file(&path).map_err(|source| ConfigurationError::Access { path, source })?;
     sync_directory(&directory, directory_path)
 }
@@ -542,10 +548,20 @@ pub(crate) fn remove_active_pairing(
     sync_directory(&directory, directory_path)
 }
 
-fn read_pending_pairing_file(path: &Path) -> Result<(PathBuf, Value), ConfigurationError> {
+fn read_pending_pairing_file(
+    path: &Path,
+    expected_client_id: Option<&str>,
+) -> Result<(PathBuf, Value), ConfigurationError> {
     let (path, pairing) = read_pairing_file(path)?;
     if pairing.get("pending") != Some(&Value::Bool(true)) {
         return Err(ConfigurationError::PairingNotPending { path });
+    }
+    // Each pairing attempt has a fresh client ID. A delayed operation must
+    // not activate or delete a replacement attempt.
+    if let Some(expected) = expected_client_id
+        && pairing.get("client_id").and_then(Value::as_str) != Some(expected)
+    {
+        return Err(ConfigurationError::PairingChanged { path });
     }
 
     Ok((path, pairing))
