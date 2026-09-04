@@ -11,6 +11,7 @@
 mod client;
 mod config;
 mod crypto;
+mod exchange;
 mod git_sign;
 mod pairing;
 mod protocol;
