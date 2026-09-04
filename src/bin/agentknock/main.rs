@@ -679,20 +679,6 @@ fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
 }
 
 impl Cli {
-    fn duplicate_secret(&self) -> Option<&str> {
-        let command = match &self.command {
-            None => &self.run,
-            Some(Command::Run(command)) => command,
-            Some(Command::Pairing { .. } | Command::Secret { .. }) => return None,
-        };
-        let mut seen = BTreeSet::new();
-        command
-            .secrets
-            .iter()
-            .find(|secret| !seen.insert(secret.as_str()))
-            .map(String::as_str)
-    }
-
     fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
         match self.command {
             None => self.run.into_operation(),
@@ -748,12 +734,15 @@ impl RunCommand {
     }
 
     fn secret_options(&self) -> Result<BTreeMap<String, SecretUseOptions>, RunOptionsError> {
-        let mut secrets = self
-            .secrets
-            .iter()
-            .cloned()
-            .map(|secret| (secret, SecretUseOptions::default()))
-            .collect::<BTreeMap<_, _>>();
+        let mut secrets = BTreeMap::new();
+        for secret in &self.secrets {
+            if secrets
+                .insert(secret.clone(), SecretUseOptions::default())
+                .is_some()
+            {
+                return Err(RunOptionsError::DuplicateSecret(secret.clone()));
+            }
+        }
 
         for [secret, variable] in self.only_env.as_chunks::<2>().0 {
             validate_run_environment_name(variable)?;
@@ -763,7 +752,7 @@ impl RunCommand {
                 .get_or_insert_with(BTreeSet::new)
                 .insert(variable.clone())
             {
-                return Err(RunOptionsError(format!(
+                return Err(RunOptionsError::Environment(format!(
                     "environment variable {variable:?} was selected more than once from secret {secret:?}"
                 )));
             }
@@ -772,7 +761,7 @@ impl RunCommand {
             validate_run_environment_name(variable)?;
             let options = environment_options(&mut secrets, "--omit-env", secret)?;
             if !options.omit.insert(variable.clone()) {
-                return Err(RunOptionsError(format!(
+                return Err(RunOptionsError::Environment(format!(
                     "environment variable {variable:?} was omitted more than once from secret {secret:?}"
                 )));
             }
@@ -786,7 +775,7 @@ impl RunCommand {
                 .insert(variable.clone(), new_variable.clone())
                 .is_some()
             {
-                return Err(RunOptionsError(format!(
+                return Err(RunOptionsError::Environment(format!(
                     "environment variable {variable:?} was renamed more than once for secret {secret:?}"
                 )));
             }
@@ -815,8 +804,12 @@ impl RunCommand {
 }
 
 #[derive(Debug, Error)]
-#[error("{0}")]
-struct RunOptionsError(String);
+enum RunOptionsError {
+    #[error("secret {0:?} was specified more than once")]
+    DuplicateSecret(String),
+    #[error("{0}")]
+    Environment(String),
+}
 
 fn environment_options<'a>(
     secrets: &'a mut BTreeMap<String, SecretUseOptions>,
@@ -824,7 +817,7 @@ fn environment_options<'a>(
     secret: &str,
 ) -> Result<&'a mut EnvironmentVariableOptions, RunOptionsError> {
     let Some(secret_options) = secrets.get_mut(secret) else {
-        return Err(RunOptionsError(format!(
+        return Err(RunOptionsError::Environment(format!(
             "{option} refers to secret {secret:?}, which wasn't selected with --secret"
         )));
     };
@@ -834,7 +827,7 @@ fn environment_options<'a>(
 fn validate_run_environment_name(name: &str) -> Result<(), RunOptionsError> {
     parse_environment_name(name)
         .map(drop)
-        .map_err(|message| RunOptionsError(format!("{message}: {name:?}")))
+        .map_err(|message| RunOptionsError::Environment(format!("{message}: {name:?}")))
 }
 
 fn validate_run_environment_options(
@@ -843,14 +836,14 @@ fn validate_run_environment_options(
     for (secret, secret_options) in secrets {
         let options = &secret_options.environment;
         if options.only.is_some() && !options.omit.is_empty() {
-            return Err(RunOptionsError(format!(
+            return Err(RunOptionsError::Environment(format!(
                 "--only-env and --omit-env can't be combined for secret {secret:?}"
             )));
         }
         if let Some(only) = &options.only {
             for variable in options.rename.keys().chain(options.stdin.iter()) {
                 if !only.contains(variable) {
-                    return Err(RunOptionsError(format!(
+                    return Err(RunOptionsError::Environment(format!(
                         "environment variable {variable:?} must also be selected with --only-env for secret {secret:?}"
                     )));
                 }
@@ -858,7 +851,7 @@ fn validate_run_environment_options(
         }
         for variable in options.rename.keys().chain(options.stdin.iter()) {
             if options.omit.contains(variable) {
-                return Err(RunOptionsError(format!(
+                return Err(RunOptionsError::Environment(format!(
                     "environment variable {variable:?} can't be both used and omitted for secret {secret:?}"
                 )));
             }
@@ -866,7 +859,7 @@ fn validate_run_environment_options(
         if let Some(variable) = &options.stdin
             && options.rename.contains_key(variable)
         {
-            return Err(RunOptionsError(format!(
+            return Err(RunOptionsError::Environment(format!(
                 "environment variable {variable:?} can't be both renamed and sent to standard input for secret {secret:?}"
             )));
         }
@@ -874,17 +867,15 @@ fn validate_run_environment_options(
     Ok(())
 }
 
-fn print_duplicate_secret(secret: &str) {
-    eprintln!("error: secret {secret:?} was specified more than once");
-    eprintln!();
-    eprintln!("Usage: agentknock [run] -s <SECRET> [-s <SECRET> ...] -- <COMMAND> [ARGUMENT]...");
-    eprintln!();
-    eprintln!("For more information, run 'agentknock run --help'.");
-}
-
 fn print_run_options_error(error: &RunOptionsError) {
     eprintln!("error: {error}");
     eprintln!();
+    if matches!(error, RunOptionsError::DuplicateSecret(_)) {
+        eprintln!(
+            "Usage: agentknock [run] -s <SECRET> [-s <SECRET> ...] -- <COMMAND> [ARGUMENT]..."
+        );
+        eprintln!();
+    }
     eprintln!("For more information, run 'agentknock run --help'.");
 }
 
@@ -902,10 +893,6 @@ fn main() -> ExitCode {
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
     let cli = Cli::parse_from(arguments);
-    if let Some(secret) = cli.duplicate_secret() {
-        print_duplicate_secret(secret);
-        return ExitCode::from(2);
-    }
     let (operation, output) = match cli.into_operation() {
         Ok(operation) => operation,
         Err(error) => {
@@ -1620,11 +1607,14 @@ fn print_pairing_status(status: PairingStatus) {
 }
 
 fn print_command_error(error: &CommandError, output: OutputMode) {
+    if output == OutputMode::Quiet {
+        return;
+    }
     match error {
-        CommandError::RunRequest(error) if output != OutputMode::Quiet => {
+        CommandError::RunRequest(error) => {
             print_run_request_error(error);
         }
-        CommandError::RunSelection { program, source } if output != OutputMode::Quiet => {
+        CommandError::RunSelection { program, source } => {
             match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message(format_args!("Command {program:?} wasn't found."));
@@ -1651,24 +1641,24 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                 _ => {}
             }
         }
-        CommandError::RunSignal(source) if output != OutputMode::Quiet => {
+        CommandError::RunSignal(source) => {
             print_message(format_args!(
                 "Agentknock couldn't configure signal handling: {source}."
             ));
             print_message("The command didn't run.");
         }
-        CommandError::RunInvocationService(source) if output != OutputMode::Quiet => {
+        CommandError::RunInvocationService(source) => {
             print_message(format_args!(
                 "Agentknock couldn't prepare secret delivery for the command: {source}."
             ));
             print_message("The command didn't run.");
         }
-        CommandError::RunInterrupted if output != OutputMode::Quiet => {
+        CommandError::RunInterrupted => {
             print_message(
                 "Agentknock received an interrupt or termination signal. The command didn't run.",
             );
         }
-        CommandError::RunProcess { program, source } if output != OutputMode::Quiet => {
+        CommandError::RunProcess { program, source } => {
             print_message(format_args!(
                 "The device approved the request, but Agentknock couldn't run command {program:?}: {source}."
             ));
@@ -1684,12 +1674,6 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
                 _ => {}
             }
         }
-        CommandError::RunRequest(_)
-        | CommandError::RunSelection { .. }
-        | CommandError::RunInvocationService(_)
-        | CommandError::RunSignal(_)
-        | CommandError::RunInterrupted
-        | CommandError::RunProcess { .. } => {}
         CommandError::StartPairing(error) => print_start_pairing_error(error),
         CommandError::PairingStatus(error) => print_pairing_status_error(error),
         CommandError::FinishPairing(error) => print_finish_pairing_error(error),
