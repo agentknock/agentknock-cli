@@ -30,6 +30,31 @@ pub struct Client {
     state_directory: Option<PathBuf>,
 }
 
+/// A stage reported while an operation exchanges messages with the device.
+///
+/// Updates proceed from preparation through delivery, response processing,
+/// and completion. Delivery updates can repeat. `Completed` means the exchange
+/// has finished, not that the device approved the request; the return value
+/// reports the operation's outcome. Failures can stop updates at any stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RequestProgress {
+    /// Agentknock is reading local state and preparing the request.
+    Preparing,
+
+    /// The request is waiting to be delivered to the device.
+    WaitingForDelivery,
+
+    /// The device has received the request but hasn't returned a response.
+    WaitingForResponse,
+
+    /// Agentknock is processing the response and handing off the completion.
+    Completing,
+
+    /// The exchange has finished.
+    Completed,
+}
+
 /// The state of the pairing stored on this client.
 ///
 /// This status describes local state only. It doesn't confirm that the relay

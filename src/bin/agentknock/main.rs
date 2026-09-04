@@ -4,39 +4,35 @@ compile_error!("the agentknock CLI currently supports Linux and macOS only");
 mod executable;
 mod git_repository;
 mod invocation_service;
+mod output;
 mod process_info;
 mod ssh_agent;
 
 use std::{
-    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
-    future::Future,
     io::{self, IsTerminal as _, Read as _},
     path::{Path, PathBuf},
     process::ExitCode,
-    rc::Rc,
     str::FromStr,
-    time::Duration,
 };
 
 use agentknock::{
     ApplicationInfo, Client, ConfigurationError, DenialReason, EnvironmentVariableOptions,
-    PairingProgress, PairingRemoveError, PairingSas, PairingStatus, RequestError, Secret,
-    SecretListProgress, SecretUpload, SecretUploadError, SecretUploadMode, SecretUploadProgress,
-    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseProgress, SecretUseRequest,
-    Secrets, StreamKind,
+    PairingRemoveError, PairingSas, PairingStatus, RequestError, RequestProgress, Secret,
+    SecretUpload, SecretUploadError, SecretUploadMode, SecretUseOperation, SecretUseOptions,
+    SecretUseOutput, SecretUseRequest, Secrets, StreamKind,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{CommandEnvironment, SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
+use output::{OutputMode, Progress, print_message};
 use ssh_key::{LineEnding, PrivateKey};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LAUNCHER_DEPTH: usize = 4;
 const RUN_EXAMPLES: &str = concat!(
     "Examples:\n",
@@ -508,13 +504,6 @@ enum Operation {
     UploadSecret(SecretUploadCommand),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OutputMode {
-    Normal,
-    Quiet,
-    Verbose,
-}
-
 #[derive(Clone, Copy)]
 enum PairingOperation {
     Start,
@@ -793,13 +782,7 @@ impl RunCommand {
     }
 
     fn output_mode(&self) -> OutputMode {
-        if self.quiet {
-            OutputMode::Quiet
-        } else if self.verbose {
-            OutputMode::Verbose
-        } else {
-            OutputMode::Normal
-        }
+        OutputMode::from_flags(self.quiet, self.verbose)
     }
 }
 
@@ -1106,53 +1089,35 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
 
 async fn start_pairing_for_cli(client: &Client, address: &str) -> Result<PairingSas, RequestError> {
     let mut signals = CommandSignals::new().map_err(RequestError::Other)?;
-    let progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&progress);
-    let request = client.start_pairing(address, signals.wait(), move |current| {
-        observed_progress.set(Some(current));
-    });
-    monitor_operation(request, progress, move |progress| {
-        pairing_progress_message(PairingOperation::Start, progress)
-    })
-    .await
+    let progress =
+        Progress::plain(|stage| pairing_progress_message(PairingOperation::Start, stage));
+    let request = client.start_pairing(address, signals.wait(), |stage| progress.observe(stage));
+    progress.monitor(request).await
 }
 
 async fn finish_pairing_for_cli(client: &Client) -> Result<(), RequestError> {
     let mut signals = CommandSignals::new().map_err(RequestError::Other)?;
-    let progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&progress);
-    let request = client.finish_pairing(signals.wait(), move |current| {
-        observed_progress.set(Some(current));
-    });
-    monitor_operation(request, progress, move |progress| {
-        pairing_progress_message(PairingOperation::Finish, progress)
-    })
-    .await
+    let progress =
+        Progress::plain(|stage| pairing_progress_message(PairingOperation::Finish, stage));
+    let request = client.finish_pairing(signals.wait(), |stage| progress.observe(stage));
+    progress.monitor(request).await
 }
 
 async fn remove_pairing_for_cli(client: &Client) -> Result<(), PairingRemoveError> {
     let mut signals = CommandSignals::new()
         .map_err(RequestError::Other)
         .map_err(PairingRemoveError::Request)?;
-    let progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&progress);
-    let request = client.remove_pairing(signals.wait(), move |current| {
-        observed_progress.set(Some(current));
-    });
-    monitor_operation(request, progress, move |progress| {
-        pairing_progress_message(PairingOperation::Remove, progress)
-    })
-    .await
+    let progress =
+        Progress::plain(|stage| pairing_progress_message(PairingOperation::Remove, stage));
+    let request = client.remove_pairing(signals.wait(), |stage| progress.observe(stage));
+    progress.monitor(request).await
 }
 
 async fn list_secrets_for_cli(client: &Client) -> Result<Secrets, RequestError> {
     let mut signals = CommandSignals::new().map_err(RequestError::Other)?;
-    let progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&progress);
-    let request = client.list_secrets(signals.wait(), move |current| {
-        observed_progress.set(Some(current));
-    });
-    monitor_operation(request, progress, secret_list_progress_message).await
+    let progress = Progress::plain(secret_list_progress_message);
+    let request = client.list_secrets(signals.wait(), |stage| progress.observe(stage));
+    progress.monitor(request).await
 }
 
 async fn upload_secret_for_cli(
@@ -1163,12 +1128,11 @@ async fn upload_secret_for_cli(
     let mut signals = CommandSignals::new()
         .map_err(RequestError::Other)
         .map_err(SecretUploadError::Request)?;
-    let progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&progress);
-    let request = client.upload_secret(secret, mode, signals.wait(), move |current| {
-        observed_progress.set(Some(current));
+    let progress = Progress::plain(secret_upload_progress_message);
+    let request = client.upload_secret(secret, mode, signals.wait(), |stage| {
+        progress.observe(stage)
     });
-    monitor_operation(request, progress, secret_upload_progress_message).await
+    progress.monitor(request).await
 }
 
 fn read_secret(
@@ -1377,138 +1341,78 @@ fn insert_environment_variable(
     Ok(())
 }
 
-async fn monitor_operation<T, E, F, P, M>(
-    request: F,
-    progress: Rc<Cell<Option<P>>>,
-    progress_message: M,
-) -> Result<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-    P: Copy,
-    M: Fn(P) -> &'static str,
-{
-    use tokio::time::{Instant, sleep};
-
-    tokio::pin!(request);
-    let started = Instant::now();
-    let heartbeat = sleep(PROGRESS_INTERVAL);
-    tokio::pin!(heartbeat);
-    loop {
-        tokio::select! {
-            biased;
-            result = request.as_mut() => return result,
-            _ = heartbeat.as_mut() => {
-                if let Some(progress) = progress.get() {
-                    eprintln!("{}", progress_report(progress_message(progress), started.elapsed()));
-                }
-                heartbeat.as_mut().reset(Instant::now() + PROGRESS_INTERVAL);
-            }
-        }
-    }
-}
-
-fn progress_report(message: &str, elapsed: Duration) -> String {
-    format!("{message} Elapsed time: {}.", format_elapsed_time(elapsed))
-}
-
-fn format_elapsed_time(elapsed: Duration) -> String {
-    let total_seconds = elapsed.as_secs();
-    let units = [
-        ("day", total_seconds / 86_400),
-        ("hour", total_seconds % 86_400 / 3_600),
-        ("minute", total_seconds % 3_600 / 60),
-        ("second", total_seconds % 60),
-    ];
-    let parts = units
-        .into_iter()
-        .filter(|(_, value)| *value != 0)
-        .map(|(unit, value)| {
-            let suffix = if value == 1 { "" } else { "s" };
-            format!("{value} {unit}{suffix}")
-        })
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        "0 seconds".into()
-    } else {
-        parts.join(" ")
-    }
-}
-
-fn secret_list_progress_message(progress: SecretListProgress) -> &'static str {
+fn secret_list_progress_message(progress: RequestProgress) -> &'static str {
     match progress {
-        SecretListProgress::Preparing => "Preparing the secret list request.",
-        SecretListProgress::WaitingForDelivery => {
+        RequestProgress::Preparing => "Preparing the secret list request.",
+        RequestProgress::WaitingForDelivery => {
             "Waiting for the device to receive the secret list request."
         }
-        SecretListProgress::WaitingForResponse => {
+        RequestProgress::WaitingForResponse => {
             "The device received the secret list request. Waiting for its response."
         }
-        SecretListProgress::Completing => {
-            "Secret list received. Confirming receipt with the device."
-        }
-        SecretListProgress::Completed => "Secret list request complete.",
+        RequestProgress::Completing => "Secret list received. Confirming receipt with the device.",
+        RequestProgress::Completed => "Secret list request complete.",
         _ => "Processing the secret list request.",
     }
 }
 
-fn secret_upload_progress_message(progress: SecretUploadProgress) -> &'static str {
+fn secret_upload_progress_message(progress: RequestProgress) -> &'static str {
     match progress {
-        SecretUploadProgress::Preparing => "Preparing the secret upload.",
-        SecretUploadProgress::WaitingForDelivery => {
+        RequestProgress::Preparing => "Preparing the secret upload.",
+        RequestProgress::WaitingForDelivery => {
             "Waiting for the device to receive the secret upload."
         }
-        SecretUploadProgress::WaitingForResponse => {
+        RequestProgress::WaitingForResponse => {
             "The device received the secret upload. Waiting for confirmation that it saved the upload."
         }
-        SecretUploadProgress::Completing => "Device response received. Confirming receipt.",
-        SecretUploadProgress::Completed => "Secret upload complete.",
+        RequestProgress::Completing => "Device response received. Confirming receipt.",
+        RequestProgress::Completed => "Secret upload complete.",
         _ => "Processing the secret upload.",
     }
 }
 
 fn pairing_progress_message(
     operation: PairingOperation,
-    progress: PairingProgress,
+    progress: RequestProgress,
 ) -> &'static str {
     match (operation, progress) {
-        (PairingOperation::Start, PairingProgress::Preparing) => "Preparing the pairing request.",
-        (PairingOperation::Start, PairingProgress::WaitingForDelivery) => {
+        (PairingOperation::Start, RequestProgress::Preparing) => "Preparing the pairing request.",
+        (PairingOperation::Start, RequestProgress::WaitingForDelivery) => {
             "Waiting for the device to receive the pairing request."
         }
-        (PairingOperation::Start, PairingProgress::WaitingForResponse) => {
+        (PairingOperation::Start, RequestProgress::WaitingForResponse) => {
             "The device received the pairing request. Waiting for its response."
         }
-        (PairingOperation::Start, PairingProgress::Completing) => {
+        (PairingOperation::Start, RequestProgress::Completing) => {
             "Pairing response received. Saving the pending pairing."
         }
-        (PairingOperation::Start, PairingProgress::Completed) => "Pairing request complete.",
-        (PairingOperation::Finish, PairingProgress::Preparing) => {
+        (PairingOperation::Start, RequestProgress::Completed) => "Pairing request complete.",
+        (PairingOperation::Finish, RequestProgress::Preparing) => {
             "Preparing the pairing confirmation."
         }
-        (PairingOperation::Finish, PairingProgress::WaitingForDelivery) => {
+        (PairingOperation::Finish, RequestProgress::WaitingForDelivery) => {
             "Waiting for the device to receive the pairing confirmation."
         }
-        (PairingOperation::Finish, PairingProgress::WaitingForResponse) => {
+        (PairingOperation::Finish, RequestProgress::WaitingForResponse) => {
             "The device received the pairing confirmation. Waiting for its response."
         }
-        (PairingOperation::Finish, PairingProgress::Completing) => {
+        (PairingOperation::Finish, RequestProgress::Completing) => {
             "Device response received. Processing the pairing confirmation."
         }
-        (PairingOperation::Finish, PairingProgress::Completed) => "Pairing activated.",
-        (PairingOperation::Remove, PairingProgress::Preparing) => {
+        (PairingOperation::Finish, RequestProgress::Completed) => "Pairing activated.",
+        (PairingOperation::Remove, RequestProgress::Preparing) => {
             "Preparing the pairing removal request."
         }
-        (PairingOperation::Remove, PairingProgress::WaitingForDelivery) => {
+        (PairingOperation::Remove, RequestProgress::WaitingForDelivery) => {
             "Waiting for the device to receive the pairing removal request."
         }
-        (PairingOperation::Remove, PairingProgress::WaitingForResponse) => {
+        (PairingOperation::Remove, RequestProgress::WaitingForResponse) => {
             "The device received the pairing removal request. Waiting for its response."
         }
-        (PairingOperation::Remove, PairingProgress::Completing) => {
+        (PairingOperation::Remove, RequestProgress::Completing) => {
             "Device response received. Processing the pairing removal."
         }
-        (PairingOperation::Remove, PairingProgress::Completed) => "Pairing removal complete.",
+        (PairingOperation::Remove, RequestProgress::Completed) => "Pairing removal complete.",
         (PairingOperation::Start, _) => "Processing the pairing request.",
         (PairingOperation::Finish, _) => "Processing the pairing confirmation.",
         (PairingOperation::Remove, _) => "Processing the pairing removal request.",
@@ -1549,33 +1453,13 @@ async fn request_run_secrets(
     output: OutputMode,
     signals: &mut CommandSignals,
 ) -> Result<SecretUseOutput, CommandError> {
-    use tokio::time::{Instant, sleep};
-
-    let current_progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&current_progress);
-    let request = client.request_secret_use(request, signals.wait(), move |progress| {
-        let changed = observed_progress.replace(Some(progress)) != Some(progress);
-        if changed && output == OutputMode::Verbose {
-            print_progress(progress);
-        }
-    });
-    tokio::pin!(request);
-    let started = Instant::now();
-    let heartbeat = sleep(PROGRESS_INTERVAL);
-    tokio::pin!(heartbeat);
-
-    loop {
-        tokio::select! {
-            biased;
-            result = request.as_mut() => return result.map_err(CommandError::RunRequest),
-            _ = heartbeat.as_mut(), if output != OutputMode::Quiet => {
-                if let Some(progress) = current_progress.get() {
-                    print_message(progress_report(progress_message(progress), started.elapsed()));
-                }
-                heartbeat.as_mut().reset(Instant::now() + PROGRESS_INTERVAL);
-            }
-        }
-    }
+    let progress = Progress::for_command(output, progress_message);
+    let request =
+        client.request_secret_use(request, signals.wait(), |stage| progress.observe(stage));
+    progress
+        .monitor(request)
+        .await
+        .map_err(CommandError::RunRequest)
 }
 
 fn print_start_pairing_success(sas: &PairingSas) {
@@ -2204,10 +2088,6 @@ fn print_plain_error(message: impl std::fmt::Display) {
     }
 }
 
-fn print_progress(progress: SecretUseProgress) {
-    print_message(progress_message(progress));
-}
-
 fn print_received_secrets(secret_use_output: &SecretUseOutput, stdin_source: Option<(&str, &str)>) {
     let mut names = secret_use_output.environment_variable_names().peekable();
     if names.peek().is_none() {
@@ -2339,22 +2219,16 @@ fn launcher_chain() -> Vec<String> {
     launchers
 }
 
-fn progress_message(progress: SecretUseProgress) -> &'static str {
+fn progress_message(progress: RequestProgress) -> &'static str {
     match progress {
-        SecretUseProgress::Preparing => "Preparing the request for the selected secrets.",
-        SecretUseProgress::WaitingForDelivery => "Waiting for the device to receive the request.",
-        SecretUseProgress::WaitingForResponse => {
+        RequestProgress::Preparing => "Preparing the request for the selected secrets.",
+        RequestProgress::WaitingForDelivery => "Waiting for the device to receive the request.",
+        RequestProgress::WaitingForResponse => {
             "The device received the request. Waiting for its response."
         }
-        SecretUseProgress::Completing => "Device response received. Confirming receipt.",
-        SecretUseProgress::Completed => "Request complete.",
+        RequestProgress::Completing => "Device response received. Confirming receipt.",
+        RequestProgress::Completed => "Request complete.",
         _ => "Processing the request.",
-    }
-}
-
-fn print_message(message: impl std::fmt::Display) {
-    for line in message.to_string().lines() {
-        eprintln!("AGENTKNOCK: {line}");
     }
 }
 
@@ -2367,7 +2241,7 @@ mod tests {
 
     use super::{
         Cli, EnvironmentSecretInput, Operation, OutputMode, SecretUploadCommand, VariableFile,
-        format_elapsed_time, progress_message, progress_report,
+        progress_message,
     };
 
     fn secret_options<const N: usize>(names: [&str; N]) -> BTreeMap<String, SecretUseOptions> {
@@ -2570,7 +2444,7 @@ mod tests {
 
     #[test]
     fn describes_secret_use_progress() {
-        use agentknock::SecretUseProgress::*;
+        use agentknock::RequestProgress::*;
 
         assert_eq!(
             progress_message(WaitingForDelivery),
@@ -2583,31 +2457,6 @@ mod tests {
         assert_eq!(
             progress_message(Completing),
             "Device response received. Confirming receipt."
-        );
-    }
-
-    #[test]
-    fn formats_elapsed_time_for_progress_reports() {
-        use std::time::Duration;
-
-        assert_eq!(format_elapsed_time(Duration::ZERO), "0 seconds");
-        assert_eq!(format_elapsed_time(Duration::from_secs(30)), "30 seconds");
-        assert_eq!(format_elapsed_time(Duration::from_secs(60)), "1 minute");
-        assert_eq!(
-            format_elapsed_time(Duration::from_secs(90)),
-            "1 minute 30 seconds"
-        );
-        assert_eq!(
-            format_elapsed_time(Duration::from_secs(3_661)),
-            "1 hour 1 minute 1 second"
-        );
-        assert_eq!(
-            format_elapsed_time(Duration::from_secs(90_061)),
-            "1 day 1 hour 1 minute 1 second"
-        );
-        assert_eq!(
-            progress_report("Waiting for the device.", Duration::from_secs(90)),
-            "Waiting for the device. Elapsed time: 1 minute 30 seconds."
         );
     }
 

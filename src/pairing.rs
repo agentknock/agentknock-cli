@@ -12,7 +12,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    Client, ConfigurationError, RequestError,
+    Client, ConfigurationError, RequestError, RequestProgress,
     config::{
         CanonicalUlid, LockedPairing, abort_pending_pairing, current_timestamp,
         ensure_pairing_absent, finish_pending_pairing, lock_pairing_if_rotated_before,
@@ -35,31 +35,6 @@ const PSK_ROTATION_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 /// groups, such as `1234 5678 9012`. The user must confirm the full displayed
 /// value against the value shown by the device before accepting the pairing.
 pub struct PairingSas(u64);
-
-/// A stage reported while a pairing operation is running.
-///
-/// A successful operation reports `Preparing`, `WaitingForDelivery`,
-/// optionally one or more `WaitingForResponse` updates, `Completing`, and
-/// `Completed`, in that order. An operation that fails stops without reporting
-/// `Completed`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum PairingProgress {
-    /// Agentknock is reading local state and preparing the protected request.
-    Preparing,
-
-    /// The request is waiting to be delivered to the device.
-    WaitingForDelivery,
-
-    /// The device has received the request but hasn't returned a response.
-    WaitingForResponse,
-
-    /// Agentknock is processing the response and handing off the completion.
-    Completing,
-
-    /// The operation has finished successfully.
-    Completed,
-}
 
 impl fmt::Display for PairingSas {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,7 +75,7 @@ impl Client {
         mut progress: P,
     ) -> Result<PairingSas, RequestError>
     where
-        P: FnMut(PairingProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
         if !is_valid_pairing_address(address) {
@@ -108,7 +83,7 @@ impl Client {
                 "pairing address must contain lowercase ASCII words separated by single hyphens",
             ));
         }
-        progress(PairingProgress::Preparing);
+        progress(RequestProgress::Preparing);
         let pairing_path = self.pairing_path()?;
         ensure_pairing_absent(&pairing_path)?;
         let client_secret = generate_client_secret().map_err(RequestError::other)?;
@@ -127,15 +102,15 @@ impl Client {
             version: PROTOCOL_VERSION,
             commitment: BASE64_STANDARD.encode(commitment),
         };
-        progress(PairingProgress::WaitingForDelivery);
+        progress(RequestProgress::WaitingForDelivery);
         let response: PairingResponse = tokio::select! {
             biased;
             _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
             response = relay.request(&request, || {
-                progress(PairingProgress::WaitingForResponse);
+                progress(RequestProgress::WaitingForResponse);
             }) => response?,
         };
-        progress(PairingProgress::Completing);
+        progress(RequestProgress::Completing);
         let contents = PairingMetadata {
             platform: std::env::consts::OS,
             architecture: std::env::consts::ARCH,
@@ -163,7 +138,7 @@ impl Client {
             let _ = abort_pending_pairing(&pairing_path, Some(&client_id.to_string()));
             return Err(error);
         }
-        progress(PairingProgress::Completed);
+        progress(RequestProgress::Completed);
         Ok(PairingSas(sas))
     }
 }
@@ -203,10 +178,10 @@ impl Client {
         mut progress: P,
     ) -> Result<(), RequestError>
     where
-        P: FnMut(PairingProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
-        progress(PairingProgress::Preparing);
+        progress(RequestProgress::Preparing);
         let pairing_path = self.pairing_path()?;
         let pairing = read_pending_pairing(&pairing_path)?;
         let request_id = Ulid::generate();
@@ -220,15 +195,15 @@ impl Client {
             .seal_request(&plaintext)
             .map_err(RequestError::other)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
-        progress(PairingProgress::WaitingForDelivery);
+        progress(RequestProgress::WaitingForDelivery);
         let response = tokio::select! {
             biased;
             _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
             response = relay.request(&request, || {
-                progress(PairingProgress::WaitingForResponse);
+                progress(RequestProgress::WaitingForResponse);
             }) => response?,
         };
-        progress(PairingProgress::Completing);
+        progress(RequestProgress::Completing);
         let plaintext = session
             .open_response(response)
             .map_err(RequestError::other)?;
@@ -269,7 +244,7 @@ impl Client {
         if interrupted {
             let _ = relay.complete_briefly(&completion).await;
         }
-        progress(PairingProgress::Completed);
+        progress(RequestProgress::Completed);
 
         Ok(())
     }
@@ -324,10 +299,10 @@ impl Client {
         mut progress: P,
     ) -> Result<(), PairingRemoveError>
     where
-        P: FnMut(PairingProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
-        progress(PairingProgress::Preparing);
+        progress(RequestProgress::Preparing);
         let pairing_path = self
             .pairing_path()
             .map_err(PairingRemoveError::Configuration)?;
@@ -346,7 +321,7 @@ impl Client {
             _ = cancellation.as_mut() => {},
             _ = relay.complete_briefly(&completion) => {},
         }
-        progress(PairingProgress::Completed);
+        progress(RequestProgress::Completed);
         Ok(())
     }
 }
@@ -358,7 +333,7 @@ async fn prepare_pairing_removal<P>(
     progress: &mut P,
 ) -> Result<(RelayExchange, crypto::Completion), RequestError>
 where
-    P: FnMut(PairingProgress),
+    P: FnMut(RequestProgress),
 {
     let request_id = Ulid::generate();
     let plaintext = client
@@ -371,15 +346,15 @@ where
         .seal_request(&plaintext)
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
-    progress(PairingProgress::WaitingForDelivery);
+    progress(RequestProgress::WaitingForDelivery);
     let response = tokio::select! {
         biased;
         _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
         response = relay.request(&request, || {
-            progress(PairingProgress::WaitingForResponse);
+            progress(RequestProgress::WaitingForResponse);
         }) => response?,
     };
-    progress(PairingProgress::Completing);
+    progress(RequestProgress::Completing);
     let plaintext = session
         .open_response(response)
         .map_err(RequestError::other)?;

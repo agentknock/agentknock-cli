@@ -13,7 +13,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    Client,
+    Client, RequestProgress,
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing_from},
     crypto::{self, Session},
     protocol::{self, Method, Response},
@@ -179,31 +179,6 @@ pub struct SshSecretUse {
 pub struct SecretUseInvocation {
     id: String,
     token: [u8; INVOCATION_TOKEN_LENGTH],
-}
-
-/// A stage reported while an invocation request is running.
-///
-/// A completed exchange reports `Preparing`, `WaitingForDelivery`, optionally
-/// one or more `WaitingForResponse` updates, `Completing`, and `Completed`, in
-/// that order. A request can still return a device denial after reporting
-/// `Completed`; other failures stop without reporting `Completed`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SecretUseProgress {
-    /// Agentknock is reading local state and preparing the protected request.
-    Preparing,
-
-    /// The request is waiting to be delivered to the device.
-    WaitingForDelivery,
-
-    /// The device has received the request but hasn't returned a decision.
-    WaitingForResponse,
-
-    /// Agentknock is validating the response and handing off the completion.
-    Completing,
-
-    /// The exchange and completion handoff finished successfully.
-    Completed,
 }
 
 impl SecretUseOutput {
@@ -446,10 +421,10 @@ impl Client {
         mut progress: P,
     ) -> Result<SecretUseOutput, RequestError>
     where
-        P: FnMut(SecretUseProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
-        progress(SecretUseProgress::Preparing);
+        progress(RequestProgress::Preparing);
         validate_secret_options(request.secrets).map_err(RequestError::other)?;
         self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
@@ -521,7 +496,7 @@ async fn message_exchange<C, P>(
 ) -> Result<SecretUseOutput, RequestError>
 where
     C: Future<Output = ()> + ?Sized,
-    P: FnMut(SecretUseProgress),
+    P: FnMut(RequestProgress),
 {
     let request_id = invocation
         .id
@@ -536,7 +511,7 @@ where
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
 
-    progress(SecretUseProgress::WaitingForDelivery);
+    progress(RequestProgress::WaitingForDelivery);
     let response = match tokio::select! {
         biased;
         _ = cancellation.as_mut() => {
@@ -546,7 +521,7 @@ where
             return Err(RequestError::Interrupted);
         }
         response = relay.request(&request, || {
-            progress(SecretUseProgress::WaitingForResponse);
+            progress(RequestProgress::WaitingForResponse);
         }) => response,
     } {
         Ok(response) => response,
@@ -567,7 +542,7 @@ where
             return Err(error);
         }
     };
-    progress(SecretUseProgress::Completing);
+    progress(RequestProgress::Completing);
     let response = session
         .open_response(response)
         .map_err(RequestError::other)
@@ -653,7 +628,7 @@ where
         _ = cancellation.as_mut() => true,
         result = relay.complete(&completion) => {
             result?;
-            progress(SecretUseProgress::Completed);
+            progress(RequestProgress::Completed);
             false
         }
     };

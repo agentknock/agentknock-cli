@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    Client, DenialReason, RequestError,
+    Client, DenialReason, RequestError, RequestProgress,
     config::{Pairing, clear_rotation_key, read_pairing_from},
     crypto::{self, Session},
     protocol::{self, Method, Response},
@@ -60,26 +60,6 @@ impl SshSignatureAlgorithm {
     }
 }
 
-/// A stage reported while an SSH authentication request is running.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SshAuthenticationProgress {
-    /// Agentknock is reading local state and preparing the protected request.
-    Preparing,
-
-    /// The request is waiting to be delivered to the device.
-    WaitingForDelivery,
-
-    /// The device has received the request but hasn't returned a decision.
-    WaitingForResponse,
-
-    /// Agentknock is validating the response and handing off the completion.
-    Completing,
-
-    /// The exchange and completion handoff finished successfully.
-    Completed,
-}
-
 impl Client {
     /// Requests an SSH authentication signature from a selected secret.
     ///
@@ -99,10 +79,10 @@ impl Client {
         mut progress: P,
     ) -> Result<Vec<u8>, RequestError>
     where
-        P: FnMut(SshAuthenticationProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
-        progress(SshAuthenticationProgress::Preparing);
+        progress(RequestProgress::Preparing);
         request
             .invocation_id
             .parse::<Ulid>()
@@ -149,7 +129,7 @@ async fn ssh_authentication_exchange<C, P>(
 ) -> Result<Vec<u8>, RequestError>
 where
     C: Future<Output = ()> + ?Sized,
-    P: FnMut(SshAuthenticationProgress),
+    P: FnMut(RequestProgress),
 {
     let plaintext = client
         .encode(&authentication.payload)
@@ -160,7 +140,7 @@ where
         .map_err(RequestError::other)?;
     let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
 
-    progress(SshAuthenticationProgress::WaitingForDelivery);
+    progress(RequestProgress::WaitingForDelivery);
     let response = match tokio::select! {
         biased;
         _ = cancellation.as_mut() => {
@@ -170,7 +150,7 @@ where
             return Err(RequestError::Interrupted);
         }
         response = relay.request(&request, || {
-            progress(SshAuthenticationProgress::WaitingForResponse);
+            progress(RequestProgress::WaitingForResponse);
         }) => response,
     } {
         Ok(response) => response,
@@ -192,7 +172,7 @@ where
         }
     };
 
-    progress(SshAuthenticationProgress::Completing);
+    progress(RequestProgress::Completing);
     let response = session
         .open_response(response)
         .map_err(RequestError::other)
@@ -260,7 +240,7 @@ where
         _ = cancellation.as_mut() => true,
         result = relay.complete(&completion) => {
             result?;
-            progress(SshAuthenticationProgress::Completed);
+            progress(RequestProgress::Completed);
             false
         }
     };

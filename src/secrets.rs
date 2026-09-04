@@ -5,7 +5,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::{
-    Client, RequestError,
+    Client, RequestError, RequestProgress,
     config::{ConfigurationError, clear_rotation_key, read_pairing_from},
     crypto::Session,
     protocol::{self, Method, Response},
@@ -103,56 +103,6 @@ pub enum SecretUploadMode {
     Update,
 }
 
-/// A stage reported while a secret-list request is running.
-///
-/// A successful operation reports `Preparing`, `WaitingForDelivery`,
-/// optionally one or more `WaitingForResponse` updates, `Completing`, and
-/// `Completed`, in that order. An operation that fails stops without reporting
-/// `Completed`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SecretListProgress {
-    /// Agentknock is reading local state and preparing the protected request.
-    Preparing,
-
-    /// The request is waiting to be delivered to the device.
-    WaitingForDelivery,
-
-    /// The device has received the request but hasn't returned a response.
-    WaitingForResponse,
-
-    /// Agentknock is validating the response and handing off the completion.
-    Completing,
-
-    /// The operation has finished successfully.
-    Completed,
-}
-
-/// A stage reported while a secret upload is running.
-///
-/// A completed exchange reports `Preparing`, `WaitingForDelivery`, optionally
-/// one or more `WaitingForResponse` updates, `Completing`, and `Completed`, in
-/// that order. A rejected upload can return an error after reporting
-/// `Completed`; other failures stop without reporting `Completed`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SecretUploadProgress {
-    /// Agentknock is reading local state and preparing the protected upload.
-    Preparing,
-
-    /// The upload is waiting to be delivered to the device.
-    WaitingForDelivery,
-
-    /// The device has received the upload but hasn't confirmed receipt.
-    WaitingForResponse,
-
-    /// Agentknock is validating the response and handing off the completion.
-    Completing,
-
-    /// The device confirmed receipt and the operation has finished.
-    Completed,
-}
-
 /// An error uploading a secret.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -205,10 +155,10 @@ impl Client {
         mut progress: P,
     ) -> Result<Secrets, RequestError>
     where
-        P: FnMut(SecretListProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
-        progress(SecretListProgress::Preparing);
+        progress(RequestProgress::Preparing);
         self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
@@ -224,15 +174,15 @@ impl Client {
             .map_err(RequestError::other)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
-        progress(SecretListProgress::WaitingForDelivery);
+        progress(RequestProgress::WaitingForDelivery);
         let response = tokio::select! {
             biased;
             _ = cancellation.as_mut() => return Err(RequestError::Interrupted),
             response = relay.request(&request, || {
-                progress(SecretListProgress::WaitingForResponse);
+                progress(RequestProgress::WaitingForResponse);
             }) => response?,
         };
-        progress(SecretListProgress::Completing);
+        progress(RequestProgress::Completing);
         let plaintext = session
             .open_response(response)
             .map_err(RequestError::other)?;
@@ -269,7 +219,7 @@ impl Client {
         if interrupted {
             let _ = relay.complete_briefly(&completion).await;
         }
-        progress(SecretListProgress::Completed);
+        progress(RequestProgress::Completed);
 
         response
             .secrets
@@ -308,10 +258,10 @@ impl Client {
         mut progress: P,
     ) -> Result<(), SecretUploadError>
     where
-        P: FnMut(SecretUploadProgress),
+        P: FnMut(RequestProgress),
     {
         tokio::pin!(cancellation);
-        progress(SecretUploadProgress::Preparing);
+        progress(RequestProgress::Preparing);
         self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
@@ -328,17 +278,17 @@ impl Client {
             .map_err(RequestError::other)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
-        progress(SecretUploadProgress::WaitingForDelivery);
+        progress(RequestProgress::WaitingForDelivery);
         let response = tokio::select! {
             biased;
             _ = cancellation.as_mut() => {
                 return Err(RequestError::Interrupted.into());
             }
             response = relay.request(&request, || {
-                progress(SecretUploadProgress::WaitingForResponse);
+                progress(RequestProgress::WaitingForResponse);
             }) => response?,
         };
-        progress(SecretUploadProgress::Completing);
+        progress(RequestProgress::Completing);
         let plaintext = session
             .open_response(response)
             .map_err(RequestError::other)?;
@@ -370,7 +320,7 @@ impl Client {
             _ = cancellation.as_mut() => {},
             _ = relay.complete_briefly(&completion) => {},
         }
-        progress(SecretUploadProgress::Completed);
+        progress(RequestProgress::Completed);
 
         match response {
             UploadResult::Received => Ok(()),

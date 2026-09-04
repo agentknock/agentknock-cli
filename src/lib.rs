@@ -20,22 +20,16 @@ mod secrets;
 mod ssh_authentication;
 mod websocket;
 
-pub use client::{ApplicationInfo, Client, PairingStatus};
+pub use client::{ApplicationInfo, Client, PairingStatus, RequestProgress};
 pub use config::ConfigurationError;
 pub use git_sign::{
-    GitSignChangeStatus, GitSignChangedPath, GitSignHead, GitSignProgress, GitSignRepository,
-    GitSignRequest,
+    GitSignChangeStatus, GitSignChangedPath, GitSignHead, GitSignRepository, GitSignRequest,
 };
-pub use pairing::{PairingProgress, PairingRemoveError, PairingSas};
+pub use pairing::{PairingRemoveError, PairingSas};
 pub use secret_use::{
     DenialReason, EnvironmentVariableOptions, ExecutableMode, RequestError, SecretUseInvocation,
-    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseProgress, SecretUseRequest,
-    SshSecretUse, StreamKind,
+    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseRequest, SshSecretUse,
+    StreamKind,
 };
-pub use secrets::{
-    Secret, SecretListProgress, SecretUpload, SecretUploadError, SecretUploadMode,
-    SecretUploadProgress, Secrets,
-};
-pub use ssh_authentication::{
-    SshAuthenticationProgress, SshAuthenticationRequest, SshSignatureAlgorithm,
-};
+pub use secrets::{Secret, SecretUpload, SecretUploadError, SecretUploadMode, Secrets};
+pub use ssh_authentication::{SshAuthenticationRequest, SshSignatureAlgorithm};

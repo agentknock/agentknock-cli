@@ -1,5 +1,4 @@
 use std::{
-    cell::Cell,
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
@@ -30,20 +29,18 @@ use std::sync::{
 use std::os::unix::fs::MetadataExt as _;
 
 use agentknock::{
-    ApplicationInfo, Client, GitSignProgress, GitSignRepository, GitSignRequest,
-    SecretUseInvocation, SshAuthenticationProgress, SshAuthenticationRequest, SshSecretUse,
+    ApplicationInfo, Client, GitSignRepository, GitSignRequest, RequestProgress,
+    SecretUseInvocation, SshAuthenticationRequest, SshSecretUse,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{
     FutureExt as _, StreamExt as _, future::LocalBoxFuture, stream::FuturesUnordered,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
-    time::{Instant, sleep},
-};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::git_repository::Repository;
+use crate::output::{OutputMode, Progress, print_message};
 use crate::ssh_agent::{Action as AgentAction, AgentConnection, SelectedIdentity};
 
 const INTERNAL_ARGUMENT: &str = "__invocation-service";
@@ -51,7 +48,6 @@ const GIT_SIGN_HELPER_NAME: &str = "git-sign";
 const QUIET_GIT_SIGN_HELPER_NAME: &str = "git-sign-quiet";
 const GIT_SIGNATURE_NAMESPACE: &str = "git";
 const SOCKET_NAME: &str = "service.sock";
-const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize, Serialize)]
@@ -809,8 +805,10 @@ async fn request_git_signature(
     data: &[u8],
     repository: Option<&GitSignRepository>,
 ) -> io::Result<String> {
-    let current_progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&current_progress);
+    let progress = Progress::for_command(
+        OutputMode::from_flags(context.quiet, context.verbose),
+        progress_message,
+    );
     let request = context.client.request_git_signature(
         GitSignRequest {
             invocation_id: &context.invocation_id,
@@ -822,33 +820,9 @@ async fn request_git_signature(
         async {
             let _ = wait_for_process(owner).await;
         },
-        |progress| {
-            let changed = observed_progress.replace(Some(progress)) != Some(progress);
-            if changed && context.verbose {
-                print_progress(progress);
-            }
-        },
+        |stage| progress.observe(stage),
     );
-    tokio::pin!(request);
-    let started = Instant::now();
-    let heartbeat = sleep(PROGRESS_INTERVAL);
-    tokio::pin!(heartbeat);
-
-    loop {
-        tokio::select! {
-            result = request.as_mut() => return result.map_err(io::Error::other),
-            _ = heartbeat.as_mut(), if !context.quiet => {
-                if let Some(progress) = current_progress.get() {
-                    print_message(format!(
-                        "{} ({} elapsed).",
-                        progress_message(progress),
-                        human_duration(started.elapsed()),
-                    ));
-                }
-                heartbeat.as_mut().reset(Instant::now() + PROGRESS_INTERVAL);
-            }
-        }
-    }
+    progress.monitor(request).await.map_err(io::Error::other)
 }
 
 async fn request_ssh_authentication(
@@ -858,8 +832,10 @@ async fn request_ssh_authentication(
     algorithm: agentknock::SshSignatureAlgorithm,
     message: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let current_progress = Rc::new(Cell::new(None));
-    let observed_progress = Rc::clone(&current_progress);
+    let progress = Progress::for_command(
+        OutputMode::from_flags(context.quiet, context.verbose),
+        ssh_progress_message,
+    );
     let request = context.client.request_ssh_authentication(
         SshAuthenticationRequest {
             invocation_id: &context.invocation_id,
@@ -871,33 +847,9 @@ async fn request_ssh_authentication(
         async {
             let _ = wait_for_process(owner).await;
         },
-        |progress| {
-            let changed = observed_progress.replace(Some(progress)) != Some(progress);
-            if changed && context.verbose {
-                print_ssh_progress(progress);
-            }
-        },
+        |stage| progress.observe(stage),
     );
-    tokio::pin!(request);
-    let started = Instant::now();
-    let heartbeat = sleep(PROGRESS_INTERVAL);
-    tokio::pin!(heartbeat);
-
-    loop {
-        tokio::select! {
-            result = request.as_mut() => return result.map_err(io::Error::other),
-            _ = heartbeat.as_mut(), if !context.quiet => {
-                if let Some(progress) = current_progress.get() {
-                    print_message(format!(
-                        "{} ({} elapsed).",
-                        ssh_progress_message(progress),
-                        human_duration(started.elapsed()),
-                    ));
-                }
-                heartbeat.as_mut().reset(Instant::now() + PROGRESS_INTERVAL);
-            }
-        }
-    }
+    progress.monitor(request).await.map_err(io::Error::other)
 }
 
 fn read_request() -> io::Result<StartupRequest> {
@@ -1264,63 +1216,33 @@ fn call_service(runtime_directory: &Path, request: &HelperRequest) -> io::Result
     }
 }
 
-fn print_progress(progress: GitSignProgress) {
-    print_message(progress_message(progress));
-}
-
-fn print_ssh_progress(progress: SshAuthenticationProgress) {
-    print_message(ssh_progress_message(progress));
-}
-
-fn ssh_progress_message(progress: SshAuthenticationProgress) -> &'static str {
+fn ssh_progress_message(progress: RequestProgress) -> &'static str {
     match progress {
-        SshAuthenticationProgress::Preparing => "Preparing the SSH authentication request.",
-        SshAuthenticationProgress::WaitingForDelivery => {
+        RequestProgress::Preparing => "Preparing the SSH authentication request.",
+        RequestProgress::WaitingForDelivery => {
             "Waiting to deliver the SSH authentication request to the device."
         }
-        SshAuthenticationProgress::WaitingForResponse => {
+        RequestProgress::WaitingForResponse => {
             "Waiting for the device to approve SSH authentication."
         }
-        SshAuthenticationProgress::Completing => {
-            "SSH authentication response received. Confirming receipt."
-        }
-        SshAuthenticationProgress::Completed => "SSH authentication request complete.",
+        RequestProgress::Completing => "SSH authentication response received. Confirming receipt.",
+        RequestProgress::Completed => "SSH authentication request complete.",
         _ => "Waiting for SSH authentication approval.",
     }
 }
 
-fn progress_message(progress: GitSignProgress) -> &'static str {
+fn progress_message(progress: RequestProgress) -> &'static str {
     match progress {
-        GitSignProgress::Preparing => "Preparing the Git signing request.",
-        GitSignProgress::WaitingForDelivery => {
+        RequestProgress::Preparing => "Preparing the Git signing request.",
+        RequestProgress::WaitingForDelivery => {
             "Waiting to deliver the Git signing request to the device."
         }
-        GitSignProgress::WaitingForResponse => {
+        RequestProgress::WaitingForResponse => {
             "Waiting for the device to approve the Git signature."
         }
-        GitSignProgress::Completing => "Git signing response received. Confirming receipt.",
-        GitSignProgress::Completed => "Git signing request complete.",
+        RequestProgress::Completing => "Git signing response received. Confirming receipt.",
+        RequestProgress::Completed => "Git signing request complete.",
         _ => "Waiting for Git signing approval.",
-    }
-}
-
-fn print_message(message: impl std::fmt::Display) {
-    for line in message.to_string().lines() {
-        eprintln!("AGENTKNOCK: {line}");
-    }
-}
-
-fn human_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds < 60 {
-        return format!("{seconds} seconds");
-    }
-    let minutes = seconds / 60;
-    let seconds = seconds % 60;
-    if seconds == 0 {
-        format!("{minutes} minutes")
-    } else {
-        format!("{minutes} minutes {seconds} seconds")
     }
 }
 
