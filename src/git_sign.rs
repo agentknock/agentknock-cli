@@ -8,7 +8,6 @@ use crate::{
     Client, DenialReason, RequestError,
     config::{Pairing, clear_rotation_key, read_pairing_from},
     crypto::{self, Session},
-    pairing::RotationError,
     protocol::{self, Method, Response},
     websocket::{self, RelayExchange},
 };
@@ -147,10 +146,7 @@ impl Client {
         if request.secret.is_empty() {
             return Err(RequestError::other("signing secret name is empty"));
         }
-        self.maybe_rotate_psk().map_err(|error| match error {
-            RotationError::Configuration(error) => RequestError::Configuration(error),
-            RotationError::Other(error) => RequestError::Other(error),
-        })?;
+        self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();

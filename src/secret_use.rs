@@ -16,7 +16,6 @@ use crate::{
     Client,
     config::{ConfigurationError, Pairing, clear_rotation_key, read_pairing_from},
     crypto::{self, Session},
-    pairing::RotationError,
     protocol::{self, Method, Response},
     secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
     websocket::{self, RelayExchange},
@@ -452,10 +451,7 @@ impl Client {
         tokio::pin!(cancellation);
         progress(SecretUseProgress::Preparing);
         validate_secret_options(request.secrets).map_err(RequestError::other)?;
-        self.maybe_rotate_psk().map_err(|error| match error {
-            RotationError::Configuration(error) => RequestError::Configuration(error),
-            RotationError::Other(error) => RequestError::Other(error),
-        })?;
+        self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();

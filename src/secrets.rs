@@ -8,7 +8,6 @@ use crate::{
     Client, RequestError,
     config::{ConfigurationError, clear_rotation_key, read_pairing_from},
     crypto::Session,
-    pairing::RotationError,
     protocol::{self, Method, Response},
     websocket::RelayExchange,
 };
@@ -210,7 +209,7 @@ impl Client {
     {
         tokio::pin!(cancellation);
         progress(SecretListProgress::Preparing);
-        self.prepare_request()?;
+        self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
@@ -313,7 +312,7 @@ impl Client {
     {
         tokio::pin!(cancellation);
         progress(SecretUploadProgress::Preparing);
-        self.prepare_request()?;
+        self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path()?;
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
@@ -377,14 +376,6 @@ impl Client {
             UploadResult::Received => Ok(()),
             UploadResult::Rejected { message } => Err(SecretUploadError::Rejected { message }),
         }
-    }
-
-    fn prepare_request(&self) -> Result<(), RequestError> {
-        self.maybe_rotate_psk().map_err(|error| match error {
-            RotationError::Configuration(error) => RequestError::Configuration(error),
-            RotationError::Other(error) => RequestError::Other(error),
-        })?;
-        Ok(())
     }
 }
 

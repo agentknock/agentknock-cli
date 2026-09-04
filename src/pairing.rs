@@ -407,12 +407,12 @@ where
 }
 
 impl Client {
-    pub(crate) fn maybe_rotate_psk(&self) -> Result<bool, RotationError> {
+    pub(crate) fn maybe_rotate_psk(&self) -> Result<bool, RequestError> {
         maybe_rotate_psk_at(&self.pairing_path()?, current_timestamp()?)
     }
 }
 
-fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RotationError> {
+fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RequestError> {
     let rotated_before = now.saturating_sub(PSK_ROTATION_INTERVAL_SECONDS);
     let pairing = read_pairing_from(path)?;
     if pairing.rotation_key().is_some() || !pairing.rotated_before(rotated_before) {
@@ -426,19 +426,10 @@ fn maybe_rotate_psk_at(path: &Path, now: u64) -> Result<bool, RotationError> {
     Ok(true)
 }
 
-fn rotate_locked(pairing: LockedPairing, rotated_at: u64) -> Result<(), RotationError> {
+fn rotate_locked(pairing: LockedPairing, rotated_at: u64) -> Result<(), RequestError> {
     let rotation = derive_psk_rotation(pairing.pairing()).map_err(io::Error::other)?;
     pairing.write_rotation(&rotation.client_psk, &rotation.rotation_key, rotated_at)?;
     Ok(())
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum RotationError {
-    #[error(transparent)]
-    Configuration(#[from] ConfigurationError),
-
-    #[error(transparent)]
-    Other(#[from] io::Error),
 }
 
 /// An error removing an active pairing.
