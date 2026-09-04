@@ -197,16 +197,15 @@ where
     };
 
     progress(SshAuthenticationProgress::Completing);
-    let response: Result<Response<SshAuthenticationResult>, RequestError> =
-        match session.open_response(response) {
-            Ok(plaintext) => {
-                if let Some(rotation_key) = pairing.rotation_key() {
-                    clear_rotation_key(pairing_path, rotation_key)?;
-                }
-                protocol::decode_response(&plaintext).map_err(RequestError::other)
+    let response = session
+        .open_response(response)
+        .map_err(RequestError::other)
+        .and_then(|plaintext| {
+            if let Some(rotation_key) = pairing.rotation_key() {
+                clear_rotation_key(pairing_path, rotation_key)?;
             }
-            Err(error) => Err(RequestError::other(error)),
-        };
+            protocol::decode_response(&plaintext).map_err(RequestError::other)
+        });
 
     let (completion_result, exchange_result) = match response {
         Ok(Response::Message(result)) => match result {

@@ -29,6 +29,7 @@ const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
 const MAXIMUM_FRAME_SIZE: usize = 256 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+const BRIEF_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const NORMAL_RETRY_POLICY: RetryPolicy = RetryPolicy {
     connection_timeout: Duration::from_secs(15),
     retry_delay: Duration::from_secs(1),
@@ -38,7 +39,7 @@ const NORMAL_RETRY_POLICY: RetryPolicy = RetryPolicy {
 const BRIEF_RETRY_POLICY: RetryPolicy = RetryPolicy {
     connection_timeout: Duration::from_secs(2),
     retry_delay: Duration::from_millis(250),
-    failure_timeout: Duration::from_secs(5),
+    failure_timeout: BRIEF_COMPLETION_TIMEOUT,
     maximum_failures: 2,
 };
 
@@ -308,8 +309,12 @@ impl RelayExchange {
     where
         C: Serialize + ?Sized,
     {
-        self.complete_with_policy(completion, BRIEF_RETRY_POLICY)
-            .await
+        tokio::time::timeout(
+            BRIEF_COMPLETION_TIMEOUT,
+            self.complete_with_policy(completion, BRIEF_RETRY_POLICY),
+        )
+        .await
+        .map_err(|_| Error::CompletionTimedOut)?
     }
 
     async fn complete_with_policy<C>(
@@ -1011,6 +1016,9 @@ pub(crate) enum Error {
 
     #[error("relay remained unavailable after {failures} consecutive failures: {last_error}")]
     RetriesExhausted { failures: usize, last_error: String },
+
+    #[error("timed out handing off the completion to the relay")]
+    CompletionTimedOut,
 
     #[error("WebSocket frame has {0} bytes, exceeding the 256 KiB limit")]
     FrameTooLarge(usize),

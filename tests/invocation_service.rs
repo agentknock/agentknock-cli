@@ -1,5 +1,7 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+mod support;
+
 use std::{
     fs,
     io::{Read as _, Write as _},
@@ -12,6 +14,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
+use support::{
+    TestHome, accept, encrypt_response, open_completion, open_request, receive_json, send_json,
+    websocket_server,
+};
 
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -612,5 +618,260 @@ fn wait_for_path(path: &Path, process: &mut Child) {
         );
         assert!(Instant::now() < deadline, "process didn't create a socket");
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SignatureKind {
+    Git,
+    Ssh,
+}
+
+impl SignatureKind {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Git => "GitSign",
+            Self::Ssh => "SshAuthenticate",
+        }
+    }
+}
+
+fn signature_service(
+    home: &TestHome,
+    relay: &str,
+    owner_pid: u32,
+) -> (ChildGuard, std::path::PathBuf) {
+    let mut command = service_command();
+    command
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay);
+    let mut service = ChildGuard(command.spawn().unwrap());
+    let ready = send_startup(
+        &mut service.0,
+        &json!({
+            "owner_pid": owner_pid,
+            "invocation_id": "01K00000000000000000000000",
+            "invocation_token": STARTUP,
+            "ssh": { "secret": "test-ssh", "public_key": PUBLIC_KEY },
+            "ssh_agent": true, "git_signing": true, "ssh_passthrough": false,
+            "quiet": false, "verbose": true,
+        }),
+    );
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let directory = ready["runtime_directory"].as_str().unwrap().into();
+    (service, directory)
+}
+
+fn request_signature(directory: &Path, kind: SignatureKind) -> bool {
+    match kind {
+        SignatureKind::Git => {
+            let mut connection = UnixStream::connect(directory.join("service.sock")).unwrap();
+            serde_json::to_writer(
+                &mut connection,
+                &json!({
+                    "operation": "sign", "public_key": PUBLIC_KEY,
+                    "message": BASE64_STANDARD.encode(b"test Git message"),
+                }),
+            )
+            .unwrap();
+            connection.shutdown(std::net::Shutdown::Write).unwrap();
+            let response: Value = serde_json::from_reader(connection).unwrap();
+            response["status"] == "signature"
+        }
+        SignatureKind::Ssh => {
+            fn string(output: &mut Vec<u8>, value: &[u8]) {
+                output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                output.extend_from_slice(value);
+            }
+            let key = BASE64_STANDARD
+                .decode(PUBLIC_KEY.split_whitespace().nth(1).unwrap())
+                .unwrap();
+            let mut message = Vec::new();
+            string(&mut message, b"test session identifier");
+            message.push(50); // SSH_MSG_USERAUTH_REQUEST
+            string(&mut message, b"test-user");
+            string(&mut message, b"ssh-connection");
+            string(&mut message, b"publickey");
+            message.push(1);
+            string(&mut message, b"ssh-ed25519");
+            string(&mut message, &key);
+            let mut packet = vec![13]; // SSH_AGENTC_SIGN_REQUEST
+            string(&mut packet, &key);
+            string(&mut packet, &message);
+            packet.extend_from_slice(&0u32.to_be_bytes());
+            let mut connection = UnixStream::connect(directory.join("agent.sock")).unwrap();
+            connection
+                .write_all(&(packet.len() as u32).to_be_bytes())
+                .unwrap();
+            connection.write_all(&packet).unwrap();
+            let mut length = [0; 4];
+            connection.read_exact(&mut length).unwrap();
+            let mut response = vec![0; u32::from_be_bytes(length) as usize];
+            connection.read_exact(&mut response).unwrap();
+            response[0] == 14 // SSH_AGENT_SIGN_RESPONSE
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn denied_signatures_are_not_reported_as_approved() {
+    for kind in [SignatureKind::Git, SignatureKind::Ssh] {
+        check_failed_signature(
+            kind,
+            json!({
+                "result": "DENIED", "reason": "POLICY_DENIED", "message": "Test denial",
+            }),
+            false,
+            "DENIED",
+            "POLICY_DENIED",
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_signature_responses_send_aborted_completions() {
+    for kind in [SignatureKind::Git, SignatureKind::Ssh] {
+        for corrupt in [false, true] {
+            check_failed_signature(
+                kind,
+                json!({"result": "UNKNOWN_RESULT"}),
+                corrupt,
+                "ABORTED",
+                "INVALID_RESPONSE",
+            )
+            .await;
+        }
+    }
+}
+
+async fn check_failed_signature(
+    kind: SignatureKind,
+    response: Value,
+    corrupt: bool,
+    result: &'static str,
+    reason: &'static str,
+) {
+    let home = TestHome::active();
+    let private_key = home.device_private_key.clone();
+    let (url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let (mut context, key, plaintext) = open_request(&private_key, request["request_id"].as_str().unwrap(), &request["payload"]);
+        assert_eq!(plaintext["method"], kind.method());
+        let mut response = encrypt_response(&context, &key, &response);
+        if corrupt { response["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into(); }
+        send_json(&mut socket, json!({
+            "type": "message", "client_id": request["client_id"], "request_id": request["request_id"],
+            "kind": "response", "payload": response,
+        })).await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        assert_eq!(completion["kind"], "completion");
+        let completion = open_completion(&mut context, &completion["payload"]);
+        assert_eq!(completion["result"], result);
+        assert_eq!(completion["reason"], reason);
+        send_json(&mut socket, json!({
+            "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "completion",
+        })).await;
+    }).await;
+    let (mut service, directory) = signature_service(&home, &url, std::process::id());
+    assert!(!request_signature(&directory, kind));
+    server.await.unwrap();
+    service.0.kill().unwrap();
+    service.0.wait().unwrap();
+    let mut stderr = String::new();
+    service
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("response received. Confirming receipt."),
+        "{stderr}"
+    );
+    assert!(stderr.contains("request complete."), "{stderr}");
+    assert!(!stderr.contains("device approved"), "{stderr}");
+    assert!(!stderr.contains("is approved"), "{stderr}");
+}
+
+#[test]
+fn signing_owner_probe() {
+    let Ok(kind) = std::env::var("AGENTKNOCK_TEST_SIGNING_OWNER") else {
+        return;
+    };
+    let kind = if kind == "git" {
+        SignatureKind::Git
+    } else {
+        SignatureKind::Ssh
+    };
+    let mut directory = String::new();
+    std::io::stdin().read_line(&mut directory).unwrap();
+    request_signature(Path::new(directory.trim()), kind);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_exit_allows_abort_completion_and_retry() {
+    for kind in [SignatureKind::Git, SignatureKind::Ssh] {
+        let home = TestHome::active();
+        let private_key = home.device_private_key.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let (url, server) = websocket_server(move |listener| async move {
+            let (_, mut socket) = accept(&listener).await;
+            let request = receive_json(&mut socket).await;
+            let (mut context, _, plaintext) = open_request(&private_key, request["request_id"].as_str().unwrap(), &request["payload"]);
+            assert_eq!(plaintext["method"], kind.method());
+            ready_tx.send(()).unwrap();
+            exited_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            send_json(&mut socket, json!({
+                "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "request",
+            })).await;
+            let completion = receive_json(&mut socket).await;
+            let plaintext = open_completion(&mut context, &completion["payload"]);
+            assert_eq!(plaintext["result"], "ABORTED");
+            assert_eq!(plaintext["reason"], "CANCELLED");
+            drop(socket); // Force a retry before the completion is acknowledged.
+            let (_, mut socket) = accept(&listener).await;
+            assert_eq!(receive_json(&mut socket).await["type"], "resume");
+            assert_eq!(receive_json(&mut socket).await, completion);
+            send_json(&mut socket, json!({
+                "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "completion",
+            })).await;
+        }).await;
+        let mut owner = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "signing_owner_probe", "--nocapture"])
+                .env(
+                    "AGENTKNOCK_TEST_SIGNING_OWNER",
+                    match kind {
+                        SignatureKind::Git => "git",
+                        SignatureKind::Ssh => "ssh",
+                    },
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (mut service, directory) = signature_service(&home, &url, owner.0.id());
+        writeln!(owner.0.stdin.take().unwrap(), "{}", directory.display()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+        exited_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), server)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_exit(&mut service.0);
+        assert!(!directory.exists());
     }
 }
