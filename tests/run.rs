@@ -1883,6 +1883,129 @@ async fn authenticated_device_error_sends_an_aborted_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_errors_retry_the_exact_request_and_completion() {
+    let home = TestHome::active();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap();
+        let request_id = request["request_id"].as_str().unwrap();
+        let retry = json!({
+            "type": "error", "client_id": client_id, "request_id": request_id,
+            "error": "TEMPORARILY_UNAVAILABLE", "message": "Try again.",
+            "retryable": true, "retry_after_ms": 0,
+        });
+        send_json(&mut socket, retry.clone()).await;
+        drop(socket);
+
+        let (_, mut socket) = accept(&listener).await;
+        assert_eq!(receive_json(&mut socket).await, request);
+        let (mut context, key, _) =
+            open_request(&device_private_key, request_id, &request["payload"]);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message", "client_id": client_id, "request_id": request_id,
+                "kind": "response", "payload": encrypt_response(&context, &key,
+                    &approved_environment("test", serde_json::Map::new())),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        assert_eq!(
+            open_completion(&mut context, &completion["payload"])["result"],
+            "APPROVED"
+        );
+        send_json(&mut socket, retry).await;
+        drop(socket);
+
+        let (_, mut socket) = accept(&listener).await;
+        assert_eq!(
+            receive_json(&mut socket).await,
+            json!({
+                "type": "resume", "client_id": client_id, "request_id": request_id,
+            })
+        );
+        assert_eq!(receive_json(&mut socket).await, completion);
+        send_json(&mut socket, json!({
+            "type": "ack", "client_id": client_id, "request_id": request_id, "kind": "completion",
+        })).await;
+    })
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["-s", "test", "--quiet", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_rejection_still_attempts_an_aborted_completion() {
+    let home = TestHome::active();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) =
+        websocket_server(move |listener| async move {
+            let (_, mut socket) = accept(&listener).await;
+            let request = receive_json(&mut socket).await;
+            let client_id = request["client_id"].as_str().unwrap();
+            let request_id = request["request_id"].as_str().unwrap();
+            let (mut context, _, _) =
+                open_request(&device_private_key, request_id, &request["payload"]);
+            send_json(&mut socket, json!({
+            "type": "ack", "client_id": client_id, "request_id": request_id, "kind": "request",
+        })).await;
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "error", "client_id": client_id, "request_id": request_id,
+                    "error": "REQUEST_REJECTED", "message": "Request rejected.", "retryable": false,
+                }),
+            )
+            .await;
+            let completion = receive_json(&mut socket).await;
+            assert_eq!(completion["kind"], "completion");
+            let plaintext = open_completion(&mut context, &completion["payload"]);
+            assert_eq!(plaintext["result"], "ABORTED");
+            assert_eq!(plaintext["reason"], "INVALID_RESPONSE");
+            assert!(
+                plaintext["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("REQUEST_REJECTED")
+            );
+            send_json(&mut socket, json!({
+            "type": "error", "client_id": client_id, "request_id": request_id,
+            "error": "COMPLETION_REJECTED", "message": "Completion rejected.", "retryable": false,
+        })).await;
+        })
+        .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+        .env("HOME", home.path())
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["-s", "test", "--", "echo", "must not run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("REQUEST_REJECTED"));
+    assert!(!stderr.contains("COMPLETION_REJECTED"));
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_invocation_response_sends_an_aborted_completion() {
     check_aborted_response(
         json!({"result": "UNKNOWN_RESULT"}),
