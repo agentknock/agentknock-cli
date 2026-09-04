@@ -14,7 +14,6 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitCode, Stdio},
-    rc::Rc,
     sync::mpsc,
     time::Duration,
 };
@@ -491,9 +490,7 @@ fn prepare() -> io::Result<PreparedService> {
             .expect("an SSH service has a runtime directory")
             .path()
             .join(SOCKET_NAME);
-        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
-        listener.set_nonblocking(true)?;
-        Some(tokio::net::UnixListener::from_std(listener)?)
+        Some(tokio::net::UnixListener::bind(&socket_path)?)
     } else {
         None
     };
@@ -504,9 +501,7 @@ fn prepare() -> io::Result<PreparedService> {
                 .expect("an SSH service has a runtime directory")
                 .path()
                 .join(crate::ssh_agent::SOCKET_NAME);
-            let listener = std::os::unix::net::UnixListener::bind(&agent_socket_path)?;
-            listener.set_nonblocking(true)?;
-            Some(tokio::net::UnixListener::from_std(listener)?)
+            Some(tokio::net::UnixListener::bind(&agent_socket_path)?)
         } else {
             None
         };
@@ -637,9 +632,7 @@ async fn serve(service: PreparedService) -> io::Result<()> {
         stdin: _,
         context,
     } = service;
-    let owner = Rc::new(owner);
-    let context = Rc::new(context);
-    let mut connections = FuturesUnordered::<LocalBoxFuture<'static, ()>>::new();
+    let mut connections = FuturesUnordered::<LocalBoxFuture<'_, ()>>::new();
 
     loop {
         enum Connection {
@@ -664,15 +657,15 @@ async fn serve(service: PreparedService) -> io::Result<()> {
         let Some(connection) = connection else {
             continue;
         };
-        let context = Rc::clone(&context);
-        let owner = Rc::clone(&owner);
+        let context = &context;
+        let owner = &owner;
         let handler = match connection {
             Connection::Helper(connection) => async move {
                 let ssh = context
                     .ssh
                     .as_ref()
                     .expect("a Git helper listener requires an SSH secret");
-                let _ = handle_connection(connection, &context, ssh, &owner).await;
+                let _ = handle_connection(connection, context, ssh, owner).await;
             }
             .boxed_local(),
             Connection::Agent(connection) => async move {
@@ -680,7 +673,7 @@ async fn serve(service: PreparedService) -> io::Result<()> {
                     .ssh
                     .as_ref()
                     .expect("an SSH agent listener requires an SSH secret");
-                let _ = handle_agent_connection(connection, &context, ssh, &owner).await;
+                let _ = handle_agent_connection(connection, context, ssh, owner).await;
             }
             .boxed_local(),
         };
