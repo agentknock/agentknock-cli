@@ -21,7 +21,7 @@ them. For example:
 1. Run a command with the `gh-token` secret:
 
    ```sh
-   agentknock -s gh-token -- gh pr merge 123
+   agentknock -s gh-token --reason "Merge the reviewed pull request" -- gh pr merge 123
    ```
 
 2. The paired mobile device displays the request. Approve the use of
@@ -224,10 +224,12 @@ Use `--only-env` to select a subset, or `--omit-env` to exclude variables:
 
 ```sh
 agentknock -s github \
+  --reason "Review open issues" \
   --only-env github GH_TOKEN \
   -- gh issue list
 
 agentknock -s development \
+  --reason "Test the changes locally" \
   --omit-env development DEBUG_TOKEN \
   -- ./run-development-server
 ```
@@ -240,6 +242,7 @@ environment:
 
 ```sh
 agentknock -s github \
+  --reason "Fetch GitHub data for the task" \
   --only-env github GH_TOKEN \
   --rename-env github GH_TOKEN GITHUB_TOKEN \
   -- ./command-expecting-github-token
@@ -249,6 +252,7 @@ Use `--stdin` to send one stored variable to the command's standard input:
 
 ```sh
 agentknock -s service-password \
+  --reason "Authenticate to the service for the task" \
   --only-env service-password PASSWORD \
   --stdin service-password PASSWORD \
   -- ./command-reading-a-password
@@ -276,13 +280,13 @@ keys.
 Use the SSH secret with a direct connection:
 
 ```sh
-agentknock -s production-ssh -- ssh example.com
+agentknock -s production-ssh --reason "Investigate the production service" -- ssh example.com
 ```
 
 The same setup works when Git uses an SSH remote:
 
 ```sh
-agentknock -s github-ssh -- git push
+agentknock -s github-ssh --reason "Push the changes for review" -- git push
 ```
 
 The command can select at most one SSH secret. Agentknock puts that key first
@@ -293,7 +297,8 @@ Use `--no-ssh-passthrough` when the temporary agent should not expose keys from
 the existing agent:
 
 ```sh
-agentknock --no-ssh-passthrough -s production-ssh -- ssh example.com
+agentknock --no-ssh-passthrough -s production-ssh \
+  --reason "Investigate the production service" -- ssh example.com
 ```
 
 This option also makes Git SSH signing fail if Git requests a different key.
@@ -315,11 +320,10 @@ commit or tag message for a separate decision. For commits, it also sends
 available repository, branch, and changed-path context to help identify the
 requested signature.
 
-Git must use SSH signing and request a signature. For example:
+With Git configured to sign commits using SSH, wrap your usual command:
 
 ```sh
-agentknock -s git-signing -- \
-  git -c gpg.format=ssh commit -S -m "Describe the change"
+agentknock -s git-signing --reason "Record the completed changes" -- git commit
 ```
 
 Use `--no-git-sign` when Agentknock should not provide Git signing. Agentknock
