@@ -22,16 +22,22 @@ functions:
   exporter/2,
   response_kdf/4
 
-rule EstablishActiveBinding:
-  [ Fr(~skD), Fr(~device_id), Fr(~client_id), Fr(~psk) ]
-  --[ ActiveBindingEstablished(~client_id, ~device_id,
-                              pk(~skD), ~psk) ]->
+rule RegisterDevice:
+  [ Fr(~skD), Fr(~device_id) ]
+  -->
   [ !DeviceIdentity(~device_id, ~skD),
     !PublicDevice(~device_id, pk(~skD)),
-    !ClientActive(~client_id, ~device_id, pk(~skD), ~psk),
-    !DeviceActive(~client_id, ~device_id, ~skD, ~psk),
+    Out(< 'device_public', ~device_id, pk(~skD) >) ]
+
+/* Independent bindings can share the same trusted device key. */
+rule EstablishActiveBinding:
+  [ !DeviceIdentity(device_id, skD), Fr(~client_id), Fr(~psk) ]
+  --[ ActiveBindingEstablished(~client_id, device_id,
+                              pk(skD), ~psk) ]->
+  [ !ClientActive(~client_id, device_id, pk(skD), ~psk),
+    !DeviceActive(~client_id, device_id, skD, ~psk),
     Out(< 'active_binding_public', ~client_id,
-          ~device_id, pk(~skD) >) ]
+          device_id, pk(skD) >) ]
 
 rule RevealDeviceKey:
   [ !DeviceIdentity(device_id, skD) ]
@@ -440,6 +446,44 @@ lemma C02_recorded_request_survives_psk_only_disclosure:
      & not (Ex #r. ClientExchangeContextRevealed(client_id, device_id,
                                                  request_id, ctx)@r)
      ==> not (Ex #k. K(request)@k)"
+
+/* Directly query all three recorded plaintexts, including the response and
+ * completion; PSK disclosure is strictly later than their creation. */
+lemma C02_recorded_exchange_survives_psk_only_disclosure:
+  "All client_id device_id request_id enc c0 ctx request response_msg response
+       c1 completion psk #s #r #c #d.
+       ClientRequestSent(client_id, device_id, request_id,
+                         enc, c0, ctx, request)@s
+     & DeviceResponseFixed(client_id, device_id, request_id,
+                           enc, ctx, response_msg, response)@r
+     & ClientCompletionSent(client_id, device_id, request_id,
+                            ctx, c1, completion)@c
+     & ClientPSKRevealed(client_id, device_id, psk)@d
+     & #s < #d & #r < #d & #c < #d
+     & not (Ex #x. DeviceKeyRevealed(device_id)@x)
+     & not (Ex #x. ClientExchangeContextRevealed(client_id, device_id,
+                                                 request_id, ctx)@x)
+     ==> not (Ex #k. K(request)@k)
+       & not (Ex #k. K(response)@k)
+       & not (Ex #k. K(completion)@k)"
+
+lemma C02_completed_exchange_then_psk_disclosure_executable:
+  exists-trace
+  "Ex client_id device_id request_id enc c0 ctx request response_msg response
+      completion psk #s #r #a #c #d.
+       ClientRequestSent(client_id, device_id, request_id,
+                         enc, c0, ctx, request)@s
+     & DeviceResponseFixed(client_id, device_id, request_id,
+                           enc, ctx, response_msg, response)@r
+     & ClientResponseAccepted(client_id, device_id, request_id,
+                              enc, ctx, response)@a
+     & DeviceCompletionAccepted(client_id, device_id, request_id,
+                                ctx, completion)@c
+     & ClientPSKRevealed(client_id, device_id, psk)@d
+     & #s < #r & #r < #a & #a < #c & #c < #d
+     & not (Ex #x. DeviceKeyRevealed(device_id)@x)
+     & not (Ex #x. ClientExchangeContextRevealed(client_id, device_id,
+                                                 request_id, ctx)@x)"
 
 lemma joint_device_key_and_psk_compromise_breaks_recorded_request:
   exists-trace

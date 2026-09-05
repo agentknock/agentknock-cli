@@ -1,5 +1,5 @@
 // Deliberate negative control for X03/X05.
-// The request and completion intentionally reuse one record key.  The relay
+// The request and completion intentionally reuse one key/nonce pair.  The relay
 // can swap record 0 and record 1 even in a single session.
 
 attacker[active]
@@ -21,22 +21,23 @@ Device -> Client: [device_public_key]
 
 principal Client[
 	generates request_id, request_kem_random
-	generates request_plaintext, completion_plaintext
+	knows public request_plaintext
+	generates completion_plaintext
 	request_kem_secret, request_enc = KEM_ENCAP(
 		device_public_key,
 		request_kem_random
 	)
 	request_info = CONCAT(version_info, device_id, request_id)
 	request_binding = CONCAT(hpke_psk_label, request_info, client_id)
-	// BUG: one output is reused for both record slots.
-	broken_record_key = HKDF(
+	// BUG: the sequence-zero nonce is reused for the completion.
+	broken_record_key, broken_record_nonce = HKDF(
 		CONCAT(request_kem_secret, client_psk),
 		request_binding,
 		hpke_schedule_label
 	)
-	request_ciphertext = AEAD_ENC(broken_record_key, request_plaintext, nil)
+	request_ciphertext = AEAD_ENC(broken_record_key, broken_record_nonce, request_plaintext, nil)
 	completion_ciphertext = AEAD_ENC(
-		broken_record_key,
+		broken_record_key, broken_record_nonce,
 		completion_plaintext,
 		nil
 	)
@@ -53,24 +54,26 @@ principal Device[
 		request_info_device,
 		client_id
 	)
-	broken_record_key_device = HKDF(
+	broken_record_key_device, broken_record_nonce_device = HKDF(
 		CONCAT(request_kem_secret_device, client_psk),
 		request_binding_device,
 		hpke_schedule_label
 	)
 	request_plaintext_device = AEAD_DEC(
-		broken_record_key_device,
+		broken_record_key_device, broken_record_nonce_device,
 		request_ciphertext,
 		nil
 	)?
 	completion_plaintext_device = AEAD_DEC(
-		broken_record_key_device,
+		broken_record_key_device, broken_record_nonce_device,
 		completion_ciphertext,
 		nil
 	)?
 ]
 
 queries[
+	// A known request also exposes the completion under nonce reuse.
+	confidentiality? completion_plaintext
 	equivalence? request_plaintext, request_plaintext_device
 	equivalence? completion_plaintext, completion_plaintext_device
 ]

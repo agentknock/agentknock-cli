@@ -1,0 +1,97 @@
+(**
+  C02 chosen-plaintext recorded-transcript experiment.
+
+  The two worlds have identical public metadata and replace only the three
+  protected plaintexts. The attacker chooses both tuples. Equal byte lengths
+  are an external premise: symbolic bitstrings do not encode length or timing.
+  This is a recorded-transcript experiment, not application-level privacy or
+  a claim about payload-dependent response behavior. No decryption/application
+  oracle is supplied. Arbitrarily many recordings share each binding and
+  arbitrarily many bindings share the device key.
+
+  The initial PSK is exported from a recorded honest base pairing. Every
+  ordinary recording uses fresh KEM randomness and a fresh request identifier.
+  Disclosure follows the recording; a concurrent recording may disclose the
+  same PSK earlier, so the PSK-only experiment also admits prior PSK knowledge.
+  The other modes are sensitivity controls, not intended security claims.
+*)
+
+type device_secret_key.
+type device_public_key.
+type ephemeral_secret_key.
+type encapsulated_key.
+type kem_secret.
+type psk.
+type hpke_context.
+type record_sequence.
+
+free network: channel.
+free version_v1: bitstring.
+free pairing_tag: bitstring.
+free request_tag: bitstring.
+free response_tag: bitstring.
+free completion_tag: bitstring.
+free psk_exporter_label: bitstring.
+free response_exporter_label: bitstring.
+free response_key_label: bitstring.
+free response_nonce_label: bitstring.
+free sequence_zero, sequence_one: record_sequence.
+
+fun device_public(device_secret_key): device_public_key.
+fun encapsulate(ephemeral_secret_key): encapsulated_key.
+fun kem_sender(ephemeral_secret_key, device_public_key): kem_secret.
+reduc forall esk: ephemeral_secret_key, skd: device_secret_key;
+  kem_receiver(encapsulate(esk), skd) = kem_sender(esk, device_public(skd)).
+fun hpke_info(bitstring, bitstring, bitstring): bitstring.
+fun hpke_base_context(kem_secret, bitstring): hpke_context.
+fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
+fun hpke_export_psk(hpke_context, bitstring): psk.
+fun hpke_export(hpke_context, bitstring): bitstring.
+fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
+reduc forall m: bitstring, ctx: hpke_context, seq: record_sequence;
+  hpke_open(hpke_seal(m, ctx, seq), ctx, seq) = m.
+fun response_kdf(bitstring, encapsulated_key, bitstring, bitstring): bitstring.
+fun response_seal(bitstring, bitstring, bitstring): bitstring.
+reduc forall m: bitstring, key: bitstring, nonce: bitstring;
+  response_open(response_seal(m, key, nonce), key, nonce) = m.
+
+let Record(
+  skd: device_secret_key, did: bitstring, cid: bitstring,
+  binding_psk: psk, release: channel
+) =
+  in(network, (request0: bitstring, response0: bitstring, completion0: bitstring,
+               request1: bitstring, response1: bitstring, completion1: bitstring));
+  new rid: bitstring;
+  new ephemeral: ephemeral_secret_key;
+  let enc = encapsulate(ephemeral) in
+  let ctx = hpke_psk_context(kem_sender(ephemeral, device_public(skd)),
+                             binding_psk, cid, hpke_info(version_v1, did, rid)) in
+  let request = hpke_seal(choice[request0, request1], ctx, sequence_zero) in
+  out(network, (request_tag, cid, rid, version_v1, enc, request));
+  new response_random: bitstring;
+  let exported = hpke_export(ctx, response_exporter_label) in
+  let key = response_kdf(exported, enc, response_random, response_key_label) in
+  let nonce = response_kdf(exported, enc, response_random, response_nonce_label) in
+  let response = response_seal(choice[response0, response1], key, nonce) in
+  out(network, (response_tag, cid, rid, response_random, response));
+  let completion = hpke_seal(choice[completion0, completion1], ctx, sequence_one) in
+  out(network, (completion_tag, cid, rid, completion));
+  out(release, (binding_psk, skd, ctx)).
+
+let RecordedBindings(release: channel) =
+  new skd: device_secret_key;
+  new did: bitstring;
+  out(network, (did, device_public(skd)));
+  !(
+    new cid: bitstring;
+    new pairing_ephemeral: ephemeral_secret_key;
+    new client_secret: bitstring;
+    new application: bitstring;
+    let base_ctx = hpke_base_context(kem_sender(pairing_ephemeral, device_public(skd)),
+                                     hpke_info(version_v1, did, cid)) in
+    let binding_psk = hpke_export_psk(base_ctx, psk_exporter_label) in
+    out(network, (pairing_tag, cid, encapsulate(pairing_ephemeral),
+                   hpke_seal(client_secret, base_ctx, sequence_zero),
+                   hpke_seal(application, base_ctx, sequence_one)));
+    !Record(skd, did, cid, binding_psk, release)
+  ).

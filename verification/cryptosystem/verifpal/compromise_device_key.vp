@@ -4,6 +4,7 @@
 attacker[active]
 
 principal Client[
+	knows public record_sequence_one
 	knows public version_info, hpke_base_label, hpke_psk_label
 	knows public hpke_schedule_label, psk_export_label, rotation_request_id
 	knows public device_id, client_id
@@ -11,6 +12,7 @@ principal Client[
 ]
 
 principal Device[
+	knows public record_sequence_one
 	knows public version_info, hpke_base_label, hpke_psk_label
 	knows public hpke_schedule_label, psk_export_label, rotation_request_id
 	knows public device_id, client_id
@@ -21,20 +23,22 @@ principal Device[
 Device -> Client: [device_public_key]
 
 principal Client[
-	generates pairing_kem_random
+	generates pairing_kem_random, client_secret
 	base_kem_secret, pairing_enc = KEM_ENCAP(
 		device_public_key,
 		pairing_kem_random
 	)
 	base_info = CONCAT(version_info, device_id, client_id)
 	base_context = HKDF(base_kem_secret, base_info, hpke_base_label)
-	base_record_key, base_exporter_root = HKDF(
+	base_record_key, base_record_nonce, base_exporter_root = HKDF(
 		base_context,
 		hpke_schedule_label,
 		nil
 	)
 	initial_psk = HKDF(base_exporter_root, psk_export_label, nil)
-	pairing_ciphertext = AEAD_ENC(base_record_key, pairing_plaintext, nil)
+	base_application_nonce = CONCAT(base_record_nonce, record_sequence_one)
+	secret_ciphertext = AEAD_ENC(base_record_key, base_record_nonce, client_secret, nil)
+	pairing_ciphertext = AEAD_ENC(base_record_key, base_application_nonce, pairing_plaintext, nil)
 
 	generates request0_id, request0_kem_random, request0_plaintext
 	request0_kem_secret, request0_enc = KEM_ENCAP(
@@ -43,12 +47,12 @@ principal Client[
 	)
 	request0_info = CONCAT(version_info, device_id, request0_id)
 	request0_binding = CONCAT(hpke_psk_label, request0_info, client_id)
-	request0_key = HKDF(
+	request0_key, request0_nonce = HKDF(
 		CONCAT(request0_kem_secret, initial_psk),
 		request0_binding,
 		hpke_schedule_label
 	)
-	request0_ciphertext = AEAD_ENC(request0_key, request0_plaintext, nil)
+	request0_ciphertext = AEAD_ENC(request0_key, request0_nonce, request0_plaintext, nil)
 
 	generates rotation_kem_random
 	rotation_kem_secret, rotation_enc = KEM_ENCAP(
@@ -57,12 +61,12 @@ principal Client[
 	)
 	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
 	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
-	rotation_context = HKDF(
+	_, _, rotation_exporter_root = HKDF(
 		CONCAT(rotation_kem_secret, initial_psk),
 		rotation_binding,
 		hpke_schedule_label
 	)
-	successor_psk = HKDF(rotation_context, psk_export_label, nil)
+	successor_psk = HKDF(rotation_exporter_root, psk_export_label, nil)
 
 	generates request1_id, request1_kem_random, request1_plaintext
 	request1_kem_secret, request1_enc = KEM_ENCAP(
@@ -71,15 +75,15 @@ principal Client[
 	)
 	request1_info = CONCAT(version_info, device_id, request1_id)
 	request1_binding = CONCAT(hpke_psk_label, request1_info, client_id)
-	request1_key = HKDF(
+	request1_key, request1_nonce = HKDF(
 		CONCAT(request1_kem_secret, successor_psk),
 		request1_binding,
 		hpke_schedule_label
 	)
-	request1_ciphertext = AEAD_ENC(request1_key, request1_plaintext, nil)
+	request1_ciphertext = AEAD_ENC(request1_key, request1_nonce, request1_plaintext, nil)
 ]
 
-Client -> Device: pairing_enc, pairing_ciphertext
+Client -> Device: pairing_enc, secret_ciphertext, pairing_ciphertext
 Client -> Device: request0_id, request0_enc, request0_ciphertext
 Client -> Device: rotation_enc
 Client -> Device: request1_id, request1_enc, request1_ciphertext

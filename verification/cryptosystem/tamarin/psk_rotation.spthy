@@ -38,6 +38,12 @@ rule EstablishActiveBinding:
                   ~psk0, 'none', 'none'),
     Out(< 'binding_public', ~client_id, device_id, pk(skD) >) ]
 
+/* A malicious current holder may synthesize arbitrary network requests. */
+rule RevealCurrentPSK:
+  [ DeviceBinding(client_id, device_id, skD, current, flag, previous) ]
+  --[ CurrentPSKRevealed(client_id, device_id, current) ]->
+  [ DeviceBinding(client_id, device_id, skD, current, flag, previous), Out(current) ]
+
 /* A client rotates only from the no-pending state. */
 rule ClientStartsRotation:
   let rinfo = hpke_info('agentknock-v1', device_id,
@@ -392,17 +398,9 @@ lemma R05_previous_request_does_not_rotate:
                                         prior_current, new, other_rotation,
                                         rctx, ctx2, prev)@j)"
 
-lemma R08_second_rotation_replaces_previous_state:
-  "All client_id device_id rid old new renc rctx ctx previous_state #i.
-       DeviceCandidateAdopted(client_id, device_id, rid,
-                             old, new, renc, rctx,
-                             ctx, previous_state)@i
-     ==> (Ex #j. DeviceBindingChanged(client_id, device_id,
-                                     old, new)@j & #j = #i)"
+/* ----------------------- Derived successor separation ---------------- */
 
-/* ----------------- Active binding, invalidation, isolation (R09) ------- */
-
-lemma R09_rotation_changes_only_selected_binding:
+lemma derived_successor_differs_from_predecessor:
   "All client_id device_id old new #i.
        DeviceBindingChanged(client_id, device_id, old, new)@i
      ==> not (old = new)"

@@ -3,11 +3,12 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cryptosystem_dir=$(cd -- "$script_dir/.." && pwd)
+(cd "$cryptosystem_dir/../.." && sha256sum -c "$cryptosystem_dir/SPECIFICATION.sha256")
 if [[ -n ${PROVERIF:-} ]]; then
   proverif_bin=$PROVERIF
 else
   proverif_store=$(
-    nix build "path:$cryptosystem_dir#proverif" --no-link --print-out-paths
+    nix build "path:$cryptosystem_dir#proverif" --cores 2 --max-jobs 1 --no-link --print-out-paths
   )
   proverif_bin=$proverif_store/bin/proverif
 fi
@@ -44,6 +45,9 @@ models=(
   negative_missing_context_binding
   negative_missing_record_sequence
   negative_missing_version_binding
+  recorded_exchange_psk_disclosure
+  recorded_exchange_device_key_disclosure
+  recorded_exchange_context_disclosure
 )
 
 declare -A expected=(
@@ -51,33 +55,37 @@ declare -A expected=(
   [pairing_activation]='false true true true true true true true true'
   [rotation_step]='false true true true true true true true true'
   [version_binding]='false true'
-  [psk_compromise]='true false'
+  [psk_compromise]='true true true false false'
   [device_key_compromise]='false false false'
   [address_offline_guess]='false'
   [negative_pairing_mitm]='false false'
   [negative_missing_context_binding]='false'
   [negative_missing_record_sequence]='false'
   [negative_missing_version_binding]='false'
+  [recorded_exchange_psk_disclosure]='equivalent'
+  [recorded_exchange_device_key_disclosure]='distinguisher'
+  [recorded_exchange_context_disclosure]='distinguisher'
 )
 
+ulimit -v 2097152
+exec 9>/tmp/agentknock-cryptosystem-proverif.lock
+flock -n 9 || { echo 'another Agentknock ProVerif runner is active' >&2; exit 1; }
+python3 -B "$cryptosystem_dir/check_results.py" inventory proverif "$script_dir" "${models[@]}"
 output_file=$(mktemp)
 trap 'rm -f -- "$output_file"' EXIT
 
 printf '%s\n' "$actual_banner"
 for model in "${models[@]}"; do
   printf '\n## %s.pv\n' "$model"
-  "$proverif_bin" "$script_dir/$model.pv" >"$output_file" 2>&1
-  actual=$(
-    sed -n '/Verification summary:/,/^---/p' "$output_file" |
-      sed -nE 's/^(Query|Weak secret).* is (true|false)\.?$/\2/p' |
-      paste -sd ' ' -
-  )
-  if [[ $actual != "${expected[$model]}" ]]; then
-    printf 'Unexpected verdict vector for %s.pv\nExpected: %s\nActual:   %s\n' \
-      "$model" "${expected[$model]}" "$actual" >&2
-    sed -n '/Verification summary:/,/^---/p' "$output_file" >&2
+  args=()
+  if [[ $model == recorded_exchange_* ]]; then
+    args=(-lib "$script_dir/recorded_exchange")
+  fi
+  if ! timeout --kill-after=10s 3m "$proverif_bin" "${args[@]}" "$script_dir/$model.pv" >"$output_file" 2>&1; then
+    cat "$output_file" >&2
     exit 1
   fi
+  python3 -B "$cryptosystem_dir/check_results.py" proverif "$output_file" "${expected[$model]}"
   if $full_output; then
     sed -n '1,$p' "$output_file"
   else

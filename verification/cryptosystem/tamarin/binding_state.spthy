@@ -1,0 +1,187 @@
+/*
+ * Agentknock v1: unbounded device-binding lifecycle (R04-R09, C04).
+ *
+ * Successful cryptographic authentication is overapproximated: every input
+ * may request a successor. The free successor(current, seed) constructor
+ * abstracts the injective current-bound exporter, retaining the full nested
+ * lineage rather than assuming independently fresh successor keys. Exact HPKE
+ * schedules and candidate authentication remain in psk_rotation.spthy and the
+ * independent cryptographic models. Arbitrarily many bindings and rotations
+ * share one device; map isolation is checked in binding_isolation.spthy.
+ *
+ * A fresh deadline token denotes one fixed overlap, not a clock or duration.
+ * Expiry is an external transition; ordinary use cannot replace that token.
+ * Atomic persistence and real deadline enforcement remain O03/O05.
+ */
+
+theory Agentknock_Binding_State
+begin
+
+functions: successor/2
+
+rule RegisterDevice:
+  [ Fr(~device_id) ]
+  -->
+  [ !Device(~device_id), Out(~device_id) ]
+
+rule EstablishApprovedPendingBinding:
+  [ !Device(device_id), Fr(~client_id), Fr(~generation) ]
+  --[ BindingCreated(~client_id, device_id, ~generation) ]->
+  [ Binding(~client_id, device_id, 'pending', ~generation, 'none', 'none'),
+    Out(~client_id) ]
+
+rule ActivateBinding:
+  [ Binding(client_id, device_id, 'pending', generation, 'none', 'none') ]
+  --[ BindingActivated(client_id, device_id, generation),
+      BindingMutation(client_id, device_id) ]->
+  [ Binding(client_id, device_id, 'active', generation, 'none', 'none') ]
+
+rule RejectPendingBinding:
+  [ Binding(client_id, device_id, 'pending', generation, 'none', 'none') ]
+  --[ BindingRejected(client_id, device_id),
+      BindingMutation(client_id, device_id) ]->
+  [ Binding(client_id, device_id, 'rejected', generation, 'none', 'none') ]
+
+rule RotateActiveBinding:
+  let new_generation = successor(current_generation, rotation_seed)
+  in
+  [ Binding(client_id, device_id, 'active', current_generation, previous, deadline),
+    In(rotation_seed), Fr(~next_deadline) ]
+  --[ BindingStateUsed(client_id, device_id, current_generation, previous, deadline),
+      ActiveBindingUsed(client_id, device_id),
+      RotationAdopted(client_id, device_id, current_generation, new_generation, ~next_deadline),
+      BindingMutation(client_id, device_id) ]->
+  [ Binding(client_id, device_id, 'active', new_generation,
+             <'previous', current_generation>, ~next_deadline) ]
+
+rule AcceptUnderCurrentPSK:
+  [ Binding(client_id, device_id, 'active', current_generation, previous, deadline),
+    In(<request_id, ignored_rotation>) ]
+  --[ BindingStateUsed(client_id, device_id, current_generation, previous, deadline),
+      ActiveBindingUsed(client_id, device_id),
+      CurrentRequestAccepted(client_id, device_id, request_id, current_generation),
+      RequestAccepted(client_id, device_id, request_id, current_generation) ]->
+  [ Binding(client_id, device_id, 'active', current_generation, previous, deadline) ]
+
+rule AcceptUnderPreviousPSK:
+  [ Binding(client_id, device_id, 'active', current_generation,
+             <'previous', old_generation>, deadline),
+    In(<request_id, ignored_rotation>) ]
+  --[ BindingStateUsed(client_id, device_id, current_generation, <'previous', old_generation>, deadline),
+      ActiveBindingUsed(client_id, device_id),
+      PreviousRequestAccepted(client_id, device_id, request_id,
+                              current_generation, old_generation, deadline),
+      RequestAccepted(client_id, device_id, request_id, old_generation) ]->
+  [ Binding(client_id, device_id, 'active', current_generation,
+             <'previous', old_generation>, deadline) ]
+
+rule ExpirePreviousPSK:
+  [ Binding(client_id, device_id, 'active', current_generation,
+             <'previous', old_generation>, deadline) ]
+  --[ BindingStateUsed(client_id, device_id, current_generation, <'previous', old_generation>, deadline),
+      ActiveBindingUsed(client_id, device_id),
+      PreviousPSKExpired(client_id, device_id, old_generation, deadline),
+      BindingMutation(client_id, device_id) ]->
+  [ Binding(client_id, device_id, 'active', current_generation, 'none', 'none') ]
+
+rule InvalidateBinding:
+  [ Binding(client_id, device_id, 'active', current_generation, previous, deadline) ]
+  --[ BindingStateUsed(client_id, device_id, current_generation, previous, deadline),
+      ActiveBindingUsed(client_id, device_id),
+      BindingInvalidated(client_id, device_id),
+      BindingMutation(client_id, device_id) ]->
+  [ Binding(client_id, device_id, 'invalid', current_generation, 'none', 'none') ]
+
+lemma R05_overlap_expiry_and_replacement_executable:
+  exists-trace
+  "Ex cid did p0 p1 p2 d1 d2 rid1 rid2 #start #a #b #c #d #e.
+       BindingCreated(cid, did, p0)@start
+     & RotationAdopted(cid, did, p0, p1, d1)@a
+     & PreviousRequestAccepted(cid, did, rid1, p1, p0, d1)@b
+     & PreviousPSKExpired(cid, did, p0, d1)@c
+     & RotationAdopted(cid, did, p1, p2, d2)@d
+     & PreviousRequestAccepted(cid, did, rid2, p2, p1, d2)@e
+     & #a < #b & #b < #c & #c < #d & #d < #e
+     & (All #u. ActiveBindingUsed(cid, did)@u
+          ==> #u = #a | #u = #b | #u = #c | #u = #d | #u = #e)"
+
+
+lemma invalidated_binding_never_used_again [reuse, use_induction]:
+  "All cid did #i #j. BindingInvalidated(cid, did)@i & ActiveBindingUsed(cid, did)@j
+     ==> #j < #i | #j = #i"
+
+lemma R09_no_new_request_acceptance_after_invalidation:
+  "All client_id device_id rid generation #i #j.
+       BindingInvalidated(client_id, device_id)@i
+     & RequestAccepted(client_id, device_id, rid, generation)@j
+     ==> #j < #i"
+
+lemma active_use_requires_activation [reuse, use_induction]:
+  "All cid did #i. ActiveBindingUsed(cid, did)@i
+     ==> Ex initial #a. BindingActivated(cid, did, initial)@a & #a < #i"
+
+lemma rejection_excludes_activation [reuse]:
+  "All cid did initial #i #j. BindingRejected(cid, did)@i
+     & BindingActivated(cid, did, initial)@j ==> F"
+
+lemma R09_only_active_bindings_rotate:
+  "All client_id device_id old new deadline #i.
+       RotationAdopted(client_id, device_id, old, new, deadline)@i
+     ==> (Ex initial #a. BindingActivated(client_id, device_id, initial)@a
+                          & #a < #i)
+       & not (Ex #r. BindingRejected(client_id, device_id)@r)
+       & not (Ex #r. BindingInvalidated(client_id, device_id)@r & #r < #i)"
+
+lemma previous_state_has_rotation [reuse, use_induction]:
+  "All cid did current old deadline #i.
+       BindingStateUsed(cid, did, current, <'previous', old>, deadline)@i
+     ==> Ex #r. RotationAdopted(cid, did, old, current, deadline)@r & #r < #i"
+
+lemma retired_generation_never_used [reuse, use_induction]:
+  "All cid did old new deadline previous later_deadline #i #j.
+       RotationAdopted(cid, did, old, new, deadline)@i
+     & BindingStateUsed(cid, did, old, previous, later_deadline)@j
+     ==> #j < #i | #j = #i"
+
+lemma expired_overlap_never_used [reuse, use_induction]:
+  "All cid did current old deadline #i #j.
+       PreviousPSKExpired(cid, did, old, deadline)@i
+     & BindingStateUsed(cid, did, current, <'previous', old>, deadline)@j
+     ==> #j < #i | #j = #i"
+
+lemma C04_one_successor_per_device_generation [reuse]:
+  "All client_id device_id old new1 new2 d1 d2 #i #j.
+       RotationAdopted(client_id, device_id, old, new1, d1)@i
+     & RotationAdopted(client_id, device_id, old, new2, d2)@j
+     ==> #i = #j & new1 = new2"
+
+lemma R08_previous_is_predecessor_of_current_generation:
+  "All client_id device_id rid current old deadline #i.
+       PreviousRequestAccepted(client_id, device_id, rid, current, old, deadline)@i
+     ==> (Ex #r. RotationAdopted(client_id, device_id, old, current, deadline)@r
+                  & #r < #i)
+       & not (Ex #e. PreviousPSKExpired(client_id, device_id, old, deadline)@e
+                      & #e < #i)"
+
+lemma R05_expired_previous_never_authenticates_later:
+  "All client_id device_id old deadline rid current later_deadline #i #j.
+       PreviousPSKExpired(client_id, device_id, old, deadline)@i
+     & PreviousRequestAccepted(client_id, device_id, rid, current, old, later_deadline)@j
+     ==> #j < #i"
+
+lemma R05_retired_generation_never_becomes_current:
+  "All client_id device_id old new deadline rid #i #j.
+       RotationAdopted(client_id, device_id, old, new, deadline)@i
+     & CurrentRequestAccepted(client_id, device_id, rid, old)@j
+     ==> #j < #i"
+
+lemma R05_second_rotation_retires_older_generation:
+  "All client_id device_id p0 p1 p2 d1 d2 rid current deadline #i #j #k.
+       RotationAdopted(client_id, device_id, p0, p1, d1)@i
+     & RotationAdopted(client_id, device_id, p1, p2, d2)@j
+     & PreviousRequestAccepted(client_id, device_id, rid, current, p0, deadline)@k
+     & #i < #j
+     ==> #k < #j"
+
+
+end

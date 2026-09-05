@@ -1,0 +1,357 @@
+{
+  "compromise_device_key": {
+    "explicit": {
+      "queries": [
+        "confidentiality? pairing_plaintext",
+        "confidentiality? initial_psk",
+        "confidentiality? request0_plaintext",
+        "confidentiality? successor_psk",
+        "confidentiality? request1_plaintext"
+      ],
+      "codes": {
+        "1": "c1c1c1c1c1",
+        "2": "c1c1c1c1c1",
+        "4": "c1c1c1c1c1",
+        "8": "c1c1c1c1c1"
+      }
+    },
+    "auto": {
+      "queries": [
+        "confidentiality? pairing_plaintext",
+        "confidentiality? device_private_key",
+        "confidentiality? pairing_kem_random",
+        "confidentiality? client_secret",
+        "confidentiality? request0_id",
+        "confidentiality? request0_kem_random",
+        "confidentiality? request0_plaintext",
+        "confidentiality? rotation_kem_random",
+        "confidentiality? request1_id",
+        "confidentiality? request1_kem_random",
+        "confidentiality? request1_plaintext",
+        "authentication? Device -> Client: device_public_key",
+        "freshness? device_public_key",
+        "freshness? request0_id",
+        "freshness? request1_id"
+      ],
+      "codes": {
+        "1": "c1c1c1c1c1c1c1c1c1c1c1a0f1f0f0",
+        "2": "c1c1c1c1c1c1c1c1c1c1c1a0f1f0f0"
+      }
+    }
+  },
+  "compromise_psk": {
+    "explicit": {
+      "queries": [
+        "confidentiality? request_plaintext",
+        "confidentiality? response_plaintext",
+        "confidentiality? completion_plaintext",
+        "equivalence? request_plaintext, request_plaintext_device",
+        "equivalence? response_plaintext, response_plaintext_client",
+        "equivalence? completion_plaintext, completion_plaintext_device"
+      ],
+      "codes": {
+        "1": "c0c0c0e0e0e0",
+        "2": "c0c0c0e1e1e1",
+        "4": "c0c0c0e1e1e1",
+        "8": "c0c0c0e1e1e1"
+      }
+    },
+    "auto": {
+      "queries": [
+        "confidentiality? client_psk",
+        "confidentiality? device_private_key",
+        "confidentiality? request_id",
+        "confidentiality? request_kem_random",
+        "confidentiality? request_plaintext",
+        "confidentiality? completion_plaintext",
+        "confidentiality? response_plaintext",
+        "confidentiality? response_random",
+        "authentication? Device -> Client: device_public_key",
+        "authentication? Client -> Device: request_id",
+        "authentication? Client -> Device: request_enc",
+        "authentication? Client -> Device: request_ciphertext",
+        "authentication? Device -> Client: response_random",
+        "authentication? Device -> Client: response_ciphertext",
+        "authentication? Client -> Device: completion_ciphertext",
+        "freshness? device_public_key",
+        "freshness? request_id",
+        "freshness? request_enc",
+        "freshness? request_ciphertext",
+        "freshness? response_random",
+        "freshness? response_ciphertext",
+        "freshness? completion_ciphertext"
+      ],
+      "codes": {
+        "1": "c1c0c1c0c0c0c0c1a0a0a0a0a1a0a0f1f0f0f0f1f0f0",
+        "2": "c1c0c1c0c0c0c0c1a0a1a1a1a1a0a1f1f0f0f0f1f0f0"
+      }
+    }
+  },
+  "negative_missing_request_id": {
+    "explicit": {
+      "queries": [
+        "equivalence? sent_record, accepted_record"
+      ],
+      "codes": {
+        "1": "e1",
+        "2": "e1",
+        "4": "e1",
+        "8": "e1"
+      }
+    }
+  },
+  "negative_record_nonce_reuse": {
+    "explicit": {
+      "queries": [
+        "confidentiality? completion_plaintext",
+        "equivalence? request_plaintext, request_plaintext_device",
+        "equivalence? completion_plaintext, completion_plaintext_device"
+      ],
+      "codes": {
+        "1": "c1e1e1",
+        "2": "c1e1e1",
+        "4": "c1e1e1",
+        "8": "c1e1e1"
+      }
+    }
+  },
+  "negative_rotation_candidate_pre_gate": {
+    "explicit": {
+      "queries": [
+        "equivalence? successor_psk, candidate_psk"
+      ],
+      "codes": {
+        "1": "e1",
+        "2": "e1",
+        "4": "e1",
+        "8": "e1"
+      }
+    }
+  },
+  "paired_exchange": {
+    "explicit": {
+      "queries": [
+        "confidentiality? request_plaintext",
+        "confidentiality? response_plaintext",
+        "confidentiality? completion_plaintext",
+        "authentication? Client -> Device: request_ciphertext",
+        "authentication? Device -> Client: response_ciphertext",
+        "authentication? Client -> Device: completion_ciphertext",
+        "equivalence? request_plaintext, request_plaintext_device",
+        "equivalence? response_plaintext, response_plaintext_client",
+        "equivalence? completion_plaintext, completion_plaintext_device",
+        "freshness? request_ciphertext",
+        "freshness? response_ciphertext",
+        "freshness? completion_ciphertext"
+      ],
+      "codes": {
+        "1": "c0c0c0a0a0a0e0e0e0f0f0f0",
+        "2": "c0c0c0a1a0a1e1e1e1f0f0f0",
+        "4": "c0c0c0a1a0a1e1e1e1f0f0f0",
+        "8": "c0c0c0a1a0a1e1e1e1f0f0f0"
+      }
+    },
+    "auto": {
+      "queries": [
+        "confidentiality? client_psk",
+        "confidentiality? device_private_key",
+        "confidentiality? request_id",
+        "confidentiality? request_kem_random",
+        "confidentiality? request_plaintext",
+        "confidentiality? completion_plaintext",
+        "confidentiality? response_plaintext",
+        "confidentiality? response_random",
+        "authentication? Device -> Client: device_public_key",
+        "authentication? Client -> Device: request_id",
+        "authentication? Client -> Device: request_enc",
+        "authentication? Client -> Device: request_ciphertext",
+        "authentication? Device -> Client: response_random",
+        "authentication? Device -> Client: response_ciphertext",
+        "authentication? Client -> Device: completion_ciphertext",
+        "freshness? device_public_key",
+        "freshness? request_id",
+        "freshness? request_enc",
+        "freshness? request_ciphertext",
+        "freshness? response_random",
+        "freshness? response_ciphertext",
+        "freshness? completion_ciphertext"
+      ],
+      "codes": {
+        "1": "c0c0c1c0c0c0c0c1a0a0a0a0a1a0a0f1f0f0f0f1f0f0",
+        "2": "c0c0c1c0c0c0c0c1a0a1a1a1a1a0a1f1f0f0f0f1f0f0"
+      }
+    }
+  },
+  "pairing_activation": {
+    "explicit": {
+      "queries": [
+        "confidentiality? client_secret",
+        "confidentiality? pairing_application",
+        "equivalence? device_public_key_view, received_device_public_key_view",
+        "confidentiality? activation_request_plaintext",
+        "confidentiality? activation_response_plaintext",
+        "confidentiality? activation_completion_plaintext",
+        "authentication? Client -> Device: activation_request_ciphertext",
+        "authentication? Device -> Client: activation_response_ciphertext",
+        "authentication? Client -> Device: activation_completion_ciphertext",
+        "equivalence? activation_request_plaintext, activation_request_plaintext_device",
+        "equivalence? activation_response_plaintext, activation_response_plaintext_client",
+        "equivalence? activation_completion_plaintext, activation_completion_plaintext_device"
+      ],
+      "codes": {
+        "1": "c1c1e1c0c0c0a0a0a0e0e0e0",
+        "2": "c1c1e1c0c0c0a0a0a0e0e0e0",
+        "4": "c1c1e1c0c0c0a0a0a0e0e0e0"
+      }
+    },
+    "auto": {
+      "queries": [
+        "confidentiality? client_id",
+        "confidentiality? client_secret",
+        "confidentiality? pairing_application",
+        "confidentiality? device_private_key",
+        "confidentiality? device_id",
+        "confidentiality? device_random",
+        "confidentiality? pairing_kem_random",
+        "confidentiality? activation_request_id",
+        "confidentiality? activation_kem_random",
+        "confidentiality? activation_request_plaintext",
+        "confidentiality? activation_completion_plaintext",
+        "confidentiality? activation_response_plaintext",
+        "confidentiality? activation_response_random",
+        "authentication? Client -> Device: client_id",
+        "authentication? Client -> Device: commitment",
+        "authentication? Device -> Client: device_public_key",
+        "authentication? Device -> Client: device_id",
+        "authentication? Device -> Client: device_random",
+        "authentication? Client -> Device: pairing_enc",
+        "authentication? Client -> Device: secret_ciphertext",
+        "authentication? Client -> Device: pairing_application_ciphertext",
+        "authentication? Client -> Device: sas_client",
+        "authentication? Device -> Client: sas_device",
+        "authentication? Client -> Device: activation_request_id",
+        "authentication? Client -> Device: activation_enc",
+        "authentication? Client -> Device: activation_request_ciphertext",
+        "authentication? Device -> Client: activation_response_random",
+        "authentication? Device -> Client: activation_response_ciphertext",
+        "authentication? Client -> Device: activation_completion_ciphertext",
+        "freshness? client_id",
+        "freshness? commitment",
+        "freshness? device_public_key",
+        "freshness? device_id",
+        "freshness? device_random",
+        "freshness? pairing_enc",
+        "freshness? secret_ciphertext",
+        "freshness? pairing_application_ciphertext",
+        "freshness? sas_client",
+        "freshness? sas_device",
+        "freshness? activation_request_id",
+        "freshness? activation_enc",
+        "freshness? activation_request_ciphertext",
+        "freshness? activation_response_random",
+        "freshness? activation_response_ciphertext",
+        "freshness? activation_completion_ciphertext"
+      ],
+      "codes": {
+        "1": "c1c1c1c0c1c1c1c1c0c0c0c0c1a0a0a0a0a1a0a0a1a0a0a0a0a0a1a0a0f0f0f1f0f1f0f0f1f0f0f0f0f0f1f0f0",
+        "2": "c1c1c1c0c1c1c1c1c0c0c0c0c1a0a1a0a0a1a0a0a1a0a0a0a0a0a1a0a0f0f0f1f0f1f0f0f1f0f0f0f0f0f1f0f0"
+      }
+    }
+  },
+  "psk_holder_authority": {
+    "explicit": {
+      "queries": [
+        "equivalence? chosen_plaintext0, chosen_plaintext0_device",
+        "equivalence? chosen_plaintext1, chosen_plaintext1_device"
+      ],
+      "codes": {
+        "1": "e0e0",
+        "2": "e1e1",
+        "4": "e1e1",
+        "8": "e1e1"
+      }
+    },
+    "auto": {
+      "queries": [
+        "confidentiality? current_psk",
+        "confidentiality? device_private_key",
+        "confidentiality? request0_id",
+        "confidentiality? request0_kem_random",
+        "confidentiality? chosen_plaintext0",
+        "confidentiality? rotation_kem_random",
+        "confidentiality? request1_id",
+        "confidentiality? request1_kem_random",
+        "confidentiality? chosen_plaintext1",
+        "authentication? Device -> Pskholder: device_public_key",
+        "authentication? Pskholder -> Device: request0_id",
+        "authentication? Pskholder -> Device: request0_enc",
+        "authentication? Pskholder -> Device: request0_ciphertext",
+        "authentication? Pskholder -> Device: rotation_enc",
+        "authentication? Pskholder -> Device: request1_id",
+        "authentication? Pskholder -> Device: request1_enc",
+        "authentication? Pskholder -> Device: request1_ciphertext",
+        "freshness? device_public_key",
+        "freshness? request0_id",
+        "freshness? request0_enc",
+        "freshness? request0_ciphertext",
+        "freshness? rotation_enc",
+        "freshness? request1_id",
+        "freshness? request1_enc",
+        "freshness? request1_ciphertext"
+      ],
+      "codes": {
+        "1": "c0c0c1c0c0c0c1c0c0a0a1a1a0a1a1a1a0f1f1f1f0f1f1f1f0",
+        "2": "c0c0c1c0c0c0c1c0c0a0a1a1a1a1a1a1a1f1f1f1f0f1f1f1f0"
+      }
+    }
+  },
+  "rotation": {
+    "explicit": {
+      "queries": [
+        "confidentiality? successor_psk",
+        "confidentiality? request_plaintext",
+        "confidentiality? response_plaintext",
+        "authentication? Client -> Device: request_ciphertext",
+        "authentication? Device -> Client: response_ciphertext",
+        "equivalence? request_plaintext, request_plaintext_device",
+        "equivalence? response_plaintext, response_plaintext_client"
+      ],
+      "codes": {
+        "1": "c0c0c0a0a0e0e0",
+        "2": "c0c0c0a1a0e1e1",
+        "4": "c0c0c0a1a0e1e1",
+        "8": "c0c0c0a1a0e1e1"
+      }
+    },
+    "auto": {
+      "queries": [
+        "confidentiality? current_psk",
+        "confidentiality? device_private_key",
+        "confidentiality? rotation_kem_random",
+        "confidentiality? request_id",
+        "confidentiality? request_kem_random",
+        "confidentiality? request_plaintext",
+        "confidentiality? response_plaintext",
+        "confidentiality? response_random",
+        "authentication? Device -> Client: device_public_key",
+        "authentication? Client -> Device: rotation_enc",
+        "authentication? Client -> Device: request_id",
+        "authentication? Client -> Device: request_enc",
+        "authentication? Client -> Device: request_ciphertext",
+        "authentication? Device -> Client: response_random",
+        "authentication? Device -> Client: response_ciphertext",
+        "freshness? device_public_key",
+        "freshness? rotation_enc",
+        "freshness? request_id",
+        "freshness? request_enc",
+        "freshness? request_ciphertext",
+        "freshness? response_random",
+        "freshness? response_ciphertext"
+      ],
+      "codes": {
+        "1": "c0c0c0c1c0c0c0c1a0a0a0a0a0a1a0f1f0f0f0f0f1f0",
+        "2": "c0c0c0c1c0c0c0c1a0a1a1a1a1a1a0f1f0f0f0f0f1f0"
+      }
+    }
+  }
+}

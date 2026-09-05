@@ -22,16 +22,20 @@
       };
       verifpal = rustPlatform.buildRustPackage rec {
         pname = "verifpal";
-        version = "1.3.2";
+        version = "1.4.3";
 
         src = pkgs.fetchFromGitHub {
           owner = "symbolicsoft";
           repo = "verifpal";
-          rev = "11ea59e2e044e564052e97e7444d375fb3bf4d39";
-          hash = "sha256-0FeV/h/62W3GLP/4Q1qp51NjhWsZw7JD4/gCL41xLzM=";
+          rev = "035f11d0480674a519c4835c20438f7af24f2e92";
+          hash = "sha256-UqmiO9mJiFRNsvVLuMrzvksu4QVY/9yD1hSG3vI1U90=";
         };
 
-        cargoHash = "sha256-r8g0nyyGno4LeWmvj7EXVMw8uFEt7X2k7WIftvpC4LA=";
+        cargoHash = "sha256-48l96oZz5TvZDub+uINttQK2PLQ0MQX4I8bx+dfPYMQ=";
+
+        # Upstream protocol-search tests must not run on every host core.
+        checkFlags = [ "--test-threads=1" ];
+        preCheck = "ulimit -v 8388608";
       };
     in
     {
@@ -48,6 +52,8 @@
           gnugrep
           gnused
           proverif
+          python3
+          util-linux
           rustToolchain
           tamarin-prover
         ] ++ [ verifpal ];

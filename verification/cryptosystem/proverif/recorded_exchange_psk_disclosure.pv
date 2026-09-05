@@ -1,0 +1,8 @@
+(* Run with: proverif -lib recorded_exchange.pvl recorded_exchange_psk_disclosure.pv
+   Expected: observational equivalence proved by diff-equivalence.
+   Only the PSK is disclosed; skD and the live context remain secret. *)
+process
+  new release: channel;
+  (RecordedBindings(release) |
+   !in(release, (binding_psk: psk, skd: device_secret_key, ctx: hpke_context));
+    out(network, binding_psk))

@@ -1,0 +1,117 @@
+/* Retained-slot lifecycle, abstracting successful cryptographic opens.
+ * One linear fact stores cache phase and completion disposition, as one atomic
+ * slot record. Completion may arrive before or after response compaction.
+ * AllocateFreshSlot abstracts the external freshness policy: a forgotten
+ * identifier is never reissued. The discarded phase is an inert ghost state,
+ * not a requirement to retain a real marker after expiry. No uniqueness
+ * restriction is used. Request/response/completion values are attacker inputs.
+ * ResponseFixed includes initial release; ResponseReleased denotes redelivery.
+ */
+theory Agentknock_Slot_Lifecycle
+begin
+
+rule AllocateFreshSlot:
+  [ Fr(~slot) ]
+  --[ SlotAllocated(~slot) ]->
+  [ Slot(~slot, 'empty', 'none', 'none'), Out(~slot) ]
+
+rule AcceptAuthenticatedRequest:
+  [ Slot(slot, 'empty', 'none', 'none'), In(<slot, request, response>) ]
+  --[ SlotRecordUsed(slot, 'empty', 'none'),
+      SlotStateUsed(slot, 'empty', 'none'), SlotEffect(slot),
+      RequestApplied(slot, request), ResponseFixed(slot, response) ]->
+  [ Slot(slot, 'cached', response, 'pending'), Out(response) ]
+
+rule RedeliverCachedResponse:
+  [ Slot(slot, 'cached', response, completion), In(<slot, candidate>) ]
+  --[ SlotRecordUsed(slot, 'cached', response),
+      SlotStateUsed(slot, 'cached', completion), SlotEffect(slot),
+      ResponseReleased(slot, response), RequestReplay(slot) ]->
+  [ Slot(slot, 'cached', response, completion), Out(response) ]
+
+rule CompactResponseToMarker:
+  [ Slot(slot, 'cached', response, completion) ]
+  --[ SlotRecordUsed(slot, 'cached', response),
+      SlotStateUsed(slot, 'cached', completion), ResponseCompacted(slot) ]->
+  [ Slot(slot, 'marker', 'none', completion) ]
+
+rule IgnoreRequestAtMarker:
+  [ Slot(slot, 'marker', 'none', completion), In(<slot, candidate>) ]
+  --[ SlotRecordUsed(slot, 'marker', 'none'),
+      SlotStateUsed(slot, 'marker', completion), RequestIgnored(slot) ]->
+  [ Slot(slot, 'marker', 'none', completion) ]
+
+rule AcceptAuthenticatedCompletion:
+  [ Slot(slot, phase, response, 'pending'), In(<slot, completion>) ]
+  --[ SlotRecordUsed(slot, phase, response),
+      SlotStateUsed(slot, phase, 'pending'), SlotEffect(slot),
+      CompletionApplied(slot, completion) ]->
+  [ Slot(slot, phase, response, 'done') ]
+
+rule IgnoreRepeatedCompletion:
+  [ Slot(slot, phase, response, 'done'), In(<slot, completion>) ]
+  --[ SlotRecordUsed(slot, phase, response),
+      SlotStateUsed(slot, phase, 'done'), CompletionIgnored(slot) ]->
+  [ Slot(slot, phase, response, 'done') ]
+
+rule DiscardSlotAfterExpiry:
+  [ Slot(slot, 'marker', 'none', completion) ]
+  --[ SlotRecordUsed(slot, 'marker', 'none'),
+      SlotStateUsed(slot, 'marker', completion), SlotDiscarded(slot) ]->
+  [ Slot(slot, 'discarded', 'none', 'none') ]
+
+/* This finite schedule selects one witness; universal claims remain unbounded. */
+lemma X06_full_retention_compaction_lifecycle_executable:
+  exists-trace
+  "Ex slot req resp comp #a #b #c #d #e #f #g #h.
+       SlotAllocated(slot)@a & RequestApplied(slot, req)@b & ResponseFixed(slot, resp)@b
+     & RequestReplay(slot)@c & ResponseCompacted(slot)@d
+     & RequestIgnored(slot)@e & CompletionApplied(slot, comp)@f
+     & CompletionIgnored(slot)@g & SlotDiscarded(slot)@h
+     & #a < #b & #b < #c & #c < #d & #d < #e & #e < #f & #f < #g & #g < #h
+     & (All phase status #u. SlotStateUsed(slot, phase, status)@u
+          ==> #u = #b | #u = #c | #u = #d | #u = #e | #u = #f | #u = #g | #u = #h)"
+
+lemma X06_request_effect_at_most_once [reuse, use_induction]:
+  "All slot x y #i #j. RequestApplied(slot, x)@i & RequestApplied(slot, y)@j
+     ==> #i = #j & x = y"
+
+lemma completed_slot_never_pending_again [reuse, use_induction]:
+  "All slot value phase #i #j.
+       CompletionApplied(slot, value)@i & SlotStateUsed(slot, phase, 'pending')@j
+     ==> #j < #i | #j = #i"
+
+lemma compacted_cache_never_used_again [reuse, use_induction]:
+  "All slot completion #i #j.
+       ResponseCompacted(slot)@i & SlotStateUsed(slot, 'cached', completion)@j
+     ==> #j < #i | #j = #i"
+
+lemma discarded_slot_never_used_again [reuse, use_induction]:
+  "All slot phase completion #i #j.
+       SlotDiscarded(slot)@i & SlotStateUsed(slot, phase, completion)@j
+     ==> #j < #i | #j = #i"
+
+lemma X06_completion_effect_at_most_once:
+  "All slot x y #i #j. CompletionApplied(slot, x)@i & CompletionApplied(slot, y)@j
+     ==> #i = #j & x = y"
+
+lemma response_fixed_once [reuse, use_induction]:
+  "All slot x y #i #j. ResponseFixed(slot, x)@i & ResponseFixed(slot, y)@j
+     ==> #i = #j & x = y"
+
+lemma cached_response_was_fixed [reuse, use_induction]:
+  "All slot response #i. SlotRecordUsed(slot, 'cached', response)@i
+     ==> Ex #j. ResponseFixed(slot, response)@j & #j < #i"
+
+lemma X06_response_bytes_never_change:
+  "All slot x y #i #j. ResponseReleased(slot, x)@i & ResponseReleased(slot, y)@j
+     ==> x = y"
+
+lemma X06_compaction_prevents_response_regeneration:
+  "All slot response #i #j. ResponseCompacted(slot)@i & ResponseReleased(slot, response)@j
+     ==> #j < #i"
+
+lemma X06_discarded_slot_has_no_later_effects:
+  "All slot #i #j. SlotDiscarded(slot)@i & SlotEffect(slot)@j
+     ==> #j < #i"
+end

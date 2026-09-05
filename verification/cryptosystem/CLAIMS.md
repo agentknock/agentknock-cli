@@ -49,6 +49,11 @@ bounded evidence, manual argument, assumption, or out of scope.
 | R08 | At most one client rotation is unconfirmed, and the device retains at most the immediately previous generation; a later rotation retires older authority. |
 | R09 | Rotation is limited to active bindings, activation cannot rotate, invalidation blocks both current and previous PSKs for new requests, and one binding cannot mutate another. |
 
+R06 is historical key confirmation: the device held the successor when it
+produced the authenticated response. A delayed response can arrive after a
+later rotation or invalidation; it does not certify the device's current state
+at receipt. The focused Tamarin confirmation model includes that witness.
+
 ## Compromise and advertised non-properties
 
 | ID | Specification claim |

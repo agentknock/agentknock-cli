@@ -6,6 +6,7 @@
 attacker[active]
 
 principal Client[
+	knows public record_sequence_one
 	knows public version_info, hpke_psk_label, hpke_schedule_label
 	knows public psk_export_label, response_label, response_key_label
 	knows public response_nonce_label, rotation_request_id
@@ -14,6 +15,7 @@ principal Client[
 ]
 
 principal Device[
+	knows public record_sequence_one
 	knows public version_info, hpke_psk_label, hpke_schedule_label
 	knows public psk_export_label, response_label, response_key_label
 	knows public response_nonce_label, rotation_request_id
@@ -33,12 +35,12 @@ principal Client[
 	)
 	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
 	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
-	rotation_context = HKDF(
+	_, _, rotation_exporter_root = HKDF(
 		CONCAT(rotation_kem_secret, current_psk),
 		rotation_binding,
 		hpke_schedule_label
 	)
-	successor_psk = HKDF(rotation_context, psk_export_label, nil)
+	successor_psk = HKDF(rotation_exporter_root, psk_export_label, nil)
 
 	// The first ordinary request after the atomic client transition uses the
 	// successor and repeatedly carries the fixed rotation_enc.
@@ -49,13 +51,14 @@ principal Client[
 	)
 	request_info = CONCAT(version_info, device_id, request_id)
 	request_binding = CONCAT(hpke_psk_label, request_info, client_id)
-	request_key, completion_key, response_exporter_root = HKDF(
+	request_key, request_nonce, response_exporter_root = HKDF(
 		CONCAT(request_kem_secret, successor_psk),
 		request_binding,
 		hpke_schedule_label
 	)
+	completion_nonce = CONCAT(request_nonce, record_sequence_one)
 	response_exporter = HKDF(response_exporter_root, response_label, nil)
-	request_ciphertext = AEAD_ENC(request_key, request_plaintext, nil)
+	request_ciphertext = AEAD_ENC(request_key, request_nonce, request_plaintext, nil)
 ]
 
 Client -> Device: request_id, request_enc, request_ciphertext, rotation_enc
@@ -73,12 +76,12 @@ principal Device[
 		rotation_info_device,
 		client_id
 	)
-	rotation_context_device = HKDF(
+	_, _, rotation_exporter_root_device = HKDF(
 		CONCAT(rotation_kem_secret_device, current_psk),
 		rotation_binding_device,
 		hpke_schedule_label
 	)
-	candidate_psk = HKDF(rotation_context_device, psk_export_label, nil)
+	candidate_psk = HKDF(rotation_exporter_root_device, psk_export_label, nil)
 
 	request_kem_secret_device = KEM_DECAP(device_private_key, request_enc)?
 	request_info_device = CONCAT(version_info, device_id, request_id)
@@ -87,11 +90,12 @@ principal Device[
 		request_info_device,
 		client_id
 	)
-	request_key_device, completion_key_device, response_exporter_root_device = HKDF(
+	request_key_device, request_nonce_device, response_exporter_root_device = HKDF(
 		CONCAT(request_kem_secret_device, candidate_psk),
 		request_binding_device,
 		hpke_schedule_label
 	)
+	completion_nonce_device = CONCAT(request_nonce_device, record_sequence_one)
 	response_exporter_device = HKDF(
 		response_exporter_root_device,
 		response_label,
@@ -99,7 +103,7 @@ principal Device[
 	)
 	// This checked open is the cryptographic gate for candidate adoption.
 	request_plaintext_device = AEAD_DEC(
-		request_key_device,
+		request_key_device, request_nonce_device,
 		request_ciphertext,
 		nil
 	)?
@@ -115,8 +119,7 @@ principal Device[
 		response_exporter_device,
 		response_nonce_label
 	)
-	response_material = CONCAT(response_key, response_nonce)
-	response_ciphertext = AEAD_ENC(response_material, response_plaintext, nil)
+	response_ciphertext = AEAD_ENC(response_key, response_nonce, response_plaintext, nil)
 ]
 
 Device -> Client: response_random, response_ciphertext
@@ -133,10 +136,9 @@ principal Client[
 		response_exporter,
 		response_nonce_label
 	)
-	response_material_client = CONCAT(response_key_client, response_nonce_client)
 	// A checked open of this response is the rotation confirmation event.
 	response_plaintext_client = AEAD_DEC(
-		response_material_client,
+		response_key_client, response_nonce_client,
 		response_ciphertext,
 		nil
 	)?

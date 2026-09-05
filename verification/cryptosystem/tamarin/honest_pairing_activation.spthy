@@ -84,11 +84,11 @@ rule DeviceAcceptsPairingCompletion:
 
 rule UserVerifiesEqualSAS:
   [ ClientWaitSAS(client_id, device_id, pkD, device_random,
-                  client_secret, psk, code),
+                  client_secret, client_psk, code),
     DeviceWaitSAS(client_id, device_id, skD, device_random,
                   client_secret, psk, code) ]
   --[ HonestSASVerified(client_id, device_id, psk) ]->
-  [ ClientPendingActivation(client_id, device_id, pkD, psk),
+  [ ClientPendingActivation(client_id, device_id, pkD, client_psk),
     DevicePendingActivation(client_id, device_id, skD, psk) ]
 
 rule ClientSendsActivationRequest:

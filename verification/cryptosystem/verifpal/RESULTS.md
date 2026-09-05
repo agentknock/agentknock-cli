@@ -1,111 +1,90 @@
-# Verifpal 1.3.2 results
+# Verifpal 1.4.3 results
 
-Each principal is replicated at 1, 2, 4, and 8 concurrent sessions. Verifpal
-emits one letter/digit pair per query, in model order: `c`, `a`, `e`, and `f`
-mean confidentiality, authentication, equivalence, and freshness; `0` means
-the bounded search found no attack and `1` means it found an attack.
+The recorded portfolio contains **47 completed analyses**: 35 explicit-query
+analyses and 12 generated-query analyses. Every query has an exhausted,
+untruncated envelope at its stated bound. These are bounded search results;
+see [README.md](README.md) for primitive abstractions and interpretation limits.
+
+Reproduce with `bash verification/cryptosystem/verifpal/run.sh`. The exact
+query text, order, and codes are checked against [cases.json](cases.json).
+In the codes, `c/a/e/f` denotes confidentiality/authentication/term-equality/
+freshness, and `1` denotes a reported violation; `0` denotes no attack found.
+
+## Explicit queries
 
 | Model | 1 session | 2 sessions | 4 sessions | 8 sessions |
 | --- | --- | --- | --- | --- |
-| `pairing_activation.vp` | `c1c1e1c0c0c0a0a0a0e0e0e0` | `c1c1e1c0c0c0a0a0a0e0e0e0` | `c1c1e1c0c0c0a0a0a0e0e0e0` | `c1c1e1c0c0c0a0a0a0e0e0e0` |
-| `paired_exchange.vp` | `c0c0c0a0a0a0e0e0e0f0f0f0` | `c0c0c0a1a1a1e1e1e1f0f0f0` | `c0c0c0a1a1a1e1e1e1f0f0f0` | `c0c0c0a1a1a1e1e1e1f0f0f0` |
-| `rotation.vp` | `c0c0c0a0a0e0e0` | `c0c0c0a1a1e1e1` | `c0c0c0a1a1e1e1` | `c0c0c0a1a1e1e1` |
-| `compromise_psk.vp` | `c0e0` | `c0e1` | `c0e1` | `c0e1` |
-| `compromise_device_key.vp` | `c1c1c1c1c1` | `c1c1c1c1c1` | `c1c1c1c1c1` | `c1c1c1c1c1` |
-| `psk_holder_authority.vp` | `e0e0` | `e1e1` | `e1e1` | `e1e1` |
-| `negative_missing_request_id.vp` | `e0` | `e1` | `e1` | `e1` |
-| `negative_record_key_reuse.vp` | `e1e1` | `e1e1` | `e1e1` | `e1e1` |
-| `negative_rotation_candidate_pre_gate.vp` | `e1` | `e1` | `e1` | `e1` |
+| `compromise_device_key` | `c1c1c1c1c1` | `c1c1c1c1c1` | `c1c1c1c1c1` | `c1c1c1c1c1` |
+| `compromise_psk` | `c0c0c0e0e0e0` | `c0c0c0e1e1e1` | `c0c0c0e1e1e1` | `c0c0c0e1e1e1` |
+| `negative_missing_request_id` | `e1` | `e1` | `e1` | `e1` |
+| `negative_record_nonce_reuse` | `c1e1e1` | `c1e1e1` | `c1e1e1` | `c1e1e1` |
+| `negative_rotation_candidate_pre_gate` | `e1` | `e1` | `e1` | `e1` |
+| `paired_exchange` | `c0c0c0a0a0a0e0e0e0f0f0f0` | `c0c0c0a1a0a1e1e1e1f0f0f0` | `c0c0c0a1a0a1e1e1e1f0f0f0` | `c0c0c0a1a0a1e1e1e1f0f0f0` |
+| `pairing_activation` | `c1c1e1c0c0c0a0a0a0e0e0e0` | `c1c1e1c0c0c0a0a0a0e0e0e0` | `c1c1e1c0c0c0a0a0a0e0e0e0` | not tested |
+| `psk_holder_authority` | `e0e0` | `e1e1` | `e1e1` | `e1e1` |
+| `rotation` | `c0c0c0a0a0e0e0` | `c0c0c0a1a0e1e1` | `c0c0c0a1a0e1e1` | `c0c0c0a1a0e1e1` |
 
-## Interpretation of reported attacks
+The combined pairing model completed at four sessions in approximately ten
+minutes. Its eight-session case is not part of the recorded portfolio.
 
-All reported attacks are expected and have a minimized executable narration in
-Verifpal's full output:
+## Interpretation of reported violations
 
-- In `pairing_activation.vp`, the first two `c1` results confirm P04: before
-  SAS acceptance, an active relay can replace the clear device response with
-  its own KEM public key, recover the base-mode `client_secret`, and open the
-  pairing application record. The `e1` confirms the P05 premise that this
-  unauthenticated exchange alone does not agree on the intended device public
-  key. All post-SAS activation queries remain `0`.
-- In `compromise_device_key.vp`, all five `c1` results are the advertised C03
-  compromise chain: a later device-key disclosure opens recorded pairing
-  traffic, recovers the initial PSK, derives the recorded rotation successor,
-  and opens traffic in both generations.
-- In `paired_exchange.vp`, all confidentiality and freshness queries continue
-  to hold through eight sessions. At two sessions the attacker can replay a
-  complete valid request, response, or completion tuple into a sibling role
-  instance. Verifpal 1.3.2 checks injective authentication, so the three
-  authentication queries fail; the recipient also compares the replayed
-  plaintext with its sibling session's local plaintext, so the three
-  equivalence queries fail. The model deliberately has no retained request
-  slot, cache, or processed marker. These are expected witnesses for the X06
-  state dependency, not cryptographic forgeries or counterexamples to the
-  stateful Tamarin results.
-- `rotation.vp` has the analogous two-session whole-tuple replay: successor,
-  request, and response confidentiality still hold, while injective request
-  and response authentication and same-session agreement fail without R01/R06
-  pending and confirmation state.
-- In `compromise_psk.vp`, recorded-request confidentiality still holds after
-  PSK-only disclosure at every bound. Its equivalence query fails from two
-  sessions onward only because a complete recorded request can be routed into
-  the sibling stateless receiver. `psk_holder_authority.vp` has the same
-  cross-session agreement artifact; its one-session executions remain the
-  intended constructive C01 witnesses.
-- `negative_missing_request_id.vp` needs two sessions, then moves a ciphertext
-  between request slots that share the intentionally broken schedule. The
-  one-session `e0` and multi-session `e1` are both expected.
-- `negative_record_key_reuse.vp` swaps request and completion records that
-  intentionally reuse the same effective symbolic key/nonce material, so both
-  agreement queries fail even with one session. This represents missing
-  record-sequence separation; concrete HPKE may retain the key while changing
-  the nonce.
-- `negative_rotation_candidate_pre_gate.vp` substitutes a well-formed
-  attacker-created encapsulation under the public device key and changes the
-  uncommitted raw candidate. The checked request in `rotation.vp` prevents
-  that candidate from reaching adoption; this is a denial-of-service
-  diagnostic, not a protocol-security counterexample.
+- **Pairing:** the two secrecy failures and early public-key mismatch precede
+  SAS. A relay substitutes its public key in the unauthenticated response and
+  opens the base records. All post-SAS activation queries hold at the tested bounds.
+- **Ordinary traffic and rotation:** confidentiality holds. From two sessions,
+  a full valid request tuple can be replayed into another stateless receiver,
+  breaking injective request/completion authentication and same-instance term
+  equality. The response-equality trace can instead replay a request into
+  another device role, which generates its own valid response. Response
+  authentication holds; the old version's `a1` response result is superseded.
+- **PSK disclosure:** all three recorded plaintexts remain secret. The equality
+  failures from two sessions have the same stateless-role interpretation.
+- **Device-key disclosure:** all five explicit secrets are recovered: base
+  application, initial and successor requests, and both generations' PSKs.
+- **PSK-holder authority:** both constructive one-session equalities hold;
+  multi-session instance-equality failures do not remove the holder's authority.
+- **Missing request identity:** replacing the outer request ID changes the
+  accepted `(ID, plaintext)` tuple while the encrypted open still succeeds.
+  This is a direct one-session binding sensitivity check with KEM setup retained.
+- **Record nonce reuse:** swapping records passes the wrong open. A public
+  request also permits recovery of the completion in the tool's nonce-reuse
+  abstraction. The correct model changes the nonce and keeps the key fixed.
+- **Pre-gate candidate:** altering `rotation_enc` changes the candidate before
+  authentication. The query deliberately precedes the ordinary-request gate;
+  it is not evidence of unauthorized adoption.
 
-## New 1.3 analysis modes
+## Generated-query audit
 
-The generated-query audit asks broader mechanically selected questions. Many
-reported attacks are intentionally non-properties: public identifiers and KEM
-components, declared leaks, static long-term values, or the advertised pre-SAS
-pairing exposure. The increase at two sessions is entirely the whole-tuple
-replay boundary described above; no additional cryptographic confidentiality
-failure was found.
+Generated queries do not replace the explicit queries. Their names and order
+are fully recorded in `cases.json`; the codes are:
 
-| Model | Generated queries | Attacks at 1 session | Attacks at 2 sessions |
-| --- | ---: | ---: | ---: |
-| `pairing_activation.vp` | 45 | 14 | 14 |
-| `paired_exchange.vp` | 22 | 5 | 10 |
-| `rotation.vp` | 22 | 5 | 10 |
-| `compromise_psk.vp` | 13 | 7 | 8 |
-| `compromise_device_key.vp` | 14 | 7 | 7 |
-| `psk_holder_authority.vp` | 25 | 13 | 15 |
+| Model | 1 session | 2 sessions |
+| --- | --- | --- |
+| `compromise_device_key` | `c1c1c1c1c1c1c1c1c1c1c1a0f1f0f0` | `c1c1c1c1c1c1c1c1c1c1c1a0f1f0f0` |
+| `compromise_psk` | `c1c0c1c0c0c0c0c1a0a0a0a0a1a0a0f1f0f0f0f1f0f0` | `c1c0c1c0c0c0c0c1a0a1a1a1a1a0a1f1f0f0f0f1f0f0` |
+| `paired_exchange` | `c0c0c1c0c0c0c0c1a0a0a0a0a1a0a0f1f0f0f0f1f0f0` | `c0c0c1c0c0c0c0c1a0a1a1a1a1a0a1f1f0f0f0f1f0f0` |
+| `pairing_activation` | `c1c1c1c0c1c1c1c1c0c0c0c0c1a0a0a0a0a1a0a0a1a0a0a0a0a0a1a0a0f0f0f1f0f1f0f0f1f0f0f0f0f0f1f0f0` | `c1c1c1c0c1c1c1c1c0c0c0c0c1a0a1a0a0a1a0a0a1a0a0a0a0a0a1a0a0f0f0f1f0f1f0f0f1f0f0f0f0f0f1f0f0` |
+| `psk_holder_authority` | `c0c0c1c0c0c0c1c0c0a0a1a1a0a1a1a1a0f1f1f1f0f1f1f1f0` | `c0c0c1c0c0c0c1c0c0a0a1a1a1a1a1a1a1f1f1f1f0f1f1f1f0` |
+| `rotation` | `c0c0c0c1c0c0c0c1a0a0a0a0a0a1a0f1f0f0f0f0f1f0` | `c0c0c0c1c0c0c0c1a0a1a1a1a1a1a0f1f0f0f0f0f1f0` |
 
-Saturating search compares successive result codes from one session upward and
-stops at the first equality, with a maximum of four sessions. The recorded
-stopping points are:
+The generated violations fall into these reviewed categories:
 
-| Model | Saturation stop count | Result code there |
-| --- | ---: | --- |
-| `pairing_activation.vp` | 2 | `c1c1e1c0c0c0a0a0a0e0e0e0` |
-| `paired_exchange.vp` | 3 | `c0c0c0a1a1a1e1e1e1f0f0f0` |
-| `rotation.vp` | 3 | `c0c0c0a1a1e1e1` |
-| `compromise_psk.vp` | 3 | `c0e1` |
-| `compromise_device_key.vp` | 2 | `c1c1c1c1c1` |
-| `psk_holder_authority.vp` | 3 | `e1e1` |
-| `negative_missing_request_id.vp` | 3 | `e1` |
-| `negative_record_key_reuse.vp` | 2 | `e1e1` |
-| `negative_rotation_candidate_pre_gate.vp` | 2 | `e1` |
+1. Public identifiers/randoms, explicitly disclosed PSKs/device keys, and
+   pre-SAS application/secret values are obtainable by the attacker.
+2. Abstract KEM seeds become obtainable under substituted or disclosed device
+   keys. This follows from Verifpal's generic KEM equations; it is not a claim
+   of X25519 scalar recovery.
+3. Replayed requests, completions, rotation inputs, and pre-SAS commitments
+   can violate injectivity in replicated roles without retained-slot state.
+4. Unauthenticated values can reach intermediate calculations before a later
+   open or SAS assertion rejects them. This includes response randoms, raw KEM
+   encapsulations, device contributions, and pre-SAS application ciphertexts.
+5. Static device keys and substituted public values do not satisfy generated
+   freshness queries. Freshness is not the protocol's timestamp or replay policy.
 
-These stopping points are evidence only. In particular, equality at sessions
-1 and 2 does not preclude a new attack first requiring session 3. The fixed
-eight-session runs remain the recorded bound.
-
-All holding queries in the structured reports carry an exhausted search
-envelope at the reported session count and no truncation reason. They remain
-bounded evidence only: Verifpal has an incomplete active-attacker search,
-including a whole-term basis restriction, and does not model the state-machine
-properties listed in [`README.md`](README.md).
+Some reports explicitly say their substitutions were not minimized into a
+smaller witness. The portfolio records the tool's reports and checks their
+structure, but does not treat every generated narration as an independently
+validated attack against the concrete protocol. The explicit queries and the
+Tamarin/ProVerif proofs carry the stated security claims.
