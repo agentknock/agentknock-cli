@@ -7,6 +7,7 @@
   feature. Use `!` only when a change to existing functionality breaks existing
   clients. If a change does not alter the produced binaries, use neither `feat`
   nor `fix`.
+- Code reviews must not verify whether commits are signed.
 - Rebase feature branches onto `origin/master` and force-push with lease. Never
   merge `master` into a feature branch.
 - Open pull requests and merge them with merge commits. Never commit directly
