@@ -4,6 +4,7 @@
 attacker[active]
 
 principal Client[
+	knows public record_sequence_one
 	knows public version_info, hpke_psk_label, hpke_schedule_label
 	knows public response_label, response_key_label, response_nonce_label
 	knows public device_id, client_id
@@ -11,6 +12,7 @@ principal Client[
 ]
 
 principal Device[
+	knows public record_sequence_one
 	knows public version_info, hpke_psk_label, hpke_schedule_label
 	knows public response_label, response_key_label, response_nonce_label
 	knows public device_id, client_id
@@ -30,13 +32,14 @@ principal Client[
 	)
 	request_info = CONCAT(version_info, device_id, request_id)
 	request_binding = CONCAT(hpke_psk_label, request_info, client_id)
-	request_key, completion_key, response_exporter_root = HKDF(
+	request_key, request_nonce, response_exporter_root = HKDF(
 		CONCAT(request_kem_secret, client_psk),
 		request_binding,
 		hpke_schedule_label
 	)
+	completion_nonce = CONCAT(request_nonce, record_sequence_one)
 	response_exporter = HKDF(response_exporter_root, response_label, nil)
-	request_ciphertext = AEAD_ENC(request_key, request_plaintext, nil)
+	request_ciphertext = AEAD_ENC(request_key, request_nonce, request_plaintext, nil)
 ]
 
 Client -> Device: request_id, request_enc, request_ciphertext
@@ -49,18 +52,19 @@ principal Device[
 		request_info_device,
 		client_id
 	)
-	request_key_device, completion_key_device, response_exporter_root_device = HKDF(
+	request_key_device, request_nonce_device, response_exporter_root_device = HKDF(
 		CONCAT(request_kem_secret_device, client_psk),
 		request_binding_device,
 		hpke_schedule_label
 	)
+	completion_nonce_device = CONCAT(request_nonce_device, record_sequence_one)
 	response_exporter_device = HKDF(
 		response_exporter_root_device,
 		response_label,
 		nil
 	)
 	request_plaintext_device = AEAD_DEC(
-		request_key_device,
+		request_key_device, request_nonce_device,
 		request_ciphertext,
 		nil
 	)?
@@ -76,10 +80,7 @@ principal Device[
 		response_exporter_device,
 		response_nonce_label
 	)
-	// Verifpal's AEAD has no nonce argument.  A key-and-nonce tuple is used as
-	// its symbolic key so acceptance still depends on both derived values.
-	response_material = CONCAT(response_key, response_nonce)
-	response_ciphertext = AEAD_ENC(response_material, response_plaintext, nil)
+	response_ciphertext = AEAD_ENC(response_key, response_nonce, response_plaintext, nil)
 ]
 
 Device -> Client: response_random, response_ciphertext
@@ -96,14 +97,13 @@ principal Client[
 		response_exporter,
 		response_nonce_label
 	)
-	response_material_client = CONCAT(response_key_client, response_nonce_client)
 	response_plaintext_client = AEAD_DEC(
-		response_material_client,
+		response_key_client, response_nonce_client,
 		response_ciphertext,
 		nil
 	)?
 	completion_ciphertext = AEAD_ENC(
-		completion_key,
+		request_key, completion_nonce,
 		completion_plaintext,
 		nil
 	)
@@ -113,7 +113,7 @@ Client -> Device: completion_ciphertext
 
 principal Device[
 	completion_plaintext_device = AEAD_DEC(
-		completion_key_device,
+		request_key_device, completion_nonce_device,
 		completion_ciphertext,
 		nil
 	)?

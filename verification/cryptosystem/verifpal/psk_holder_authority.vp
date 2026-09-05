@@ -32,12 +32,12 @@ principal PSKHolder[
 	)
 	request0_info = CONCAT(version_info, device_id, request0_id)
 	request0_binding = CONCAT(hpke_psk_label, request0_info, client_id)
-	request0_key = HKDF(
+	request0_key, request0_nonce = HKDF(
 		CONCAT(request0_kem_secret, current_psk),
 		request0_binding,
 		hpke_schedule_label
 	)
-	request0_ciphertext = AEAD_ENC(request0_key, chosen_plaintext0, nil)
+	request0_ciphertext = AEAD_ENC(request0_key, request0_nonce, chosen_plaintext0, nil)
 ]
 
 PSKHolder -> Device: request0_id, request0_enc, request0_ciphertext
@@ -50,13 +50,13 @@ principal Device[
 		request0_info_device,
 		client_id
 	)
-	request0_key_device = HKDF(
+	request0_key_device, request0_nonce_device = HKDF(
 		CONCAT(request0_kem_secret_device, current_psk),
 		request0_binding_device,
 		hpke_schedule_label
 	)
 	chosen_plaintext0_device = AEAD_DEC(
-		request0_key_device,
+		request0_key_device, request0_nonce_device,
 		request0_ciphertext,
 		nil
 	)?
@@ -71,13 +71,13 @@ principal PSKHolder[
 	)
 	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
 	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
-	rotation_context = HKDF(
+	_, _, rotation_exporter_root = HKDF(
 		CONCAT(rotation_kem_secret, current_psk),
 		rotation_binding,
 		hpke_schedule_label
 	)
 	compromised_successor_psk = HKDF(
-		rotation_context,
+		rotation_exporter_root,
 		psk_export_label,
 		nil
 	)
@@ -88,12 +88,12 @@ principal PSKHolder[
 	)
 	request1_info = CONCAT(version_info, device_id, request1_id)
 	request1_binding = CONCAT(hpke_psk_label, request1_info, client_id)
-	request1_key = HKDF(
+	request1_key, request1_nonce = HKDF(
 		CONCAT(request1_kem_secret, compromised_successor_psk),
 		request1_binding,
 		hpke_schedule_label
 	)
-	request1_ciphertext = AEAD_ENC(request1_key, chosen_plaintext1, nil)
+	request1_ciphertext = AEAD_ENC(request1_key, request1_nonce, chosen_plaintext1, nil)
 ]
 
 PSKHolder -> Device: request1_id, request1_enc, request1_ciphertext, rotation_enc
@@ -109,13 +109,13 @@ principal Device[
 		rotation_info_device,
 		client_id
 	)
-	rotation_context_device = HKDF(
+	_, _, rotation_exporter_root_device = HKDF(
 		CONCAT(rotation_kem_secret_device, current_psk),
 		rotation_binding_device,
 		hpke_schedule_label
 	)
 	device_candidate_psk = HKDF(
-		rotation_context_device,
+		rotation_exporter_root_device,
 		psk_export_label,
 		nil
 	)
@@ -126,13 +126,13 @@ principal Device[
 		request1_info_device,
 		client_id
 	)
-	request1_key_device = HKDF(
+	request1_key_device, request1_nonce_device = HKDF(
 		CONCAT(request1_kem_secret_device, device_candidate_psk),
 		request1_binding_device,
 		hpke_schedule_label
 	)
 	chosen_plaintext1_device = AEAD_DEC(
-		request1_key_device,
+		request1_key_device, request1_nonce_device,
 		request1_ciphertext,
 		nil
 	)?

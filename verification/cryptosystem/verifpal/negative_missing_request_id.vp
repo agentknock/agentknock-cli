@@ -1,57 +1,52 @@
-// Deliberate negative control for X04/X05.
-// request_id is intentionally absent from the PSK key schedule.  One session
-// is insufficient to expose the error; with two sessions the relay can move
-// a protected record into another routing request slot.  The KEM layer is
-// deliberately elided in this focused control because it is orthogonal to the
-// missing context field and makes Verifpal's bounded search less complete.
+// X04/X05 sensitivity control: only request_id is omitted from HPKE info.
+// Keep the fresh KEM and record nonce. Compare the routed ID as well as the
+// opened plaintext, so a one-session ID substitution is observable.
 
 attacker[active]
 
 principal Client[
 	knows public version_info, hpke_psk_label, hpke_schedule_label
-	knows public device_id, client_id
+	knows public device_id, client_id, replacement_request_id
 	knows private client_psk
 ]
 
 principal Device[
 	knows public version_info, hpke_psk_label, hpke_schedule_label
 	knows public device_id, client_id
-	knows private client_psk
+	knows private client_psk, device_private_key
+	device_public_key = PUBKEY(device_private_key)
 ]
+
+Device -> Client: [device_public_key]
 
 principal Client[
-	generates request_id, request_plaintext
-	// BUG: request_id is absent from this context.
-	broken_binding = CONCAT(hpke_psk_label, version_info, device_id, client_id)
-	request_key = HKDF(
-		client_psk,
-		broken_binding,
-		hpke_schedule_label
+	generates request_id, request_plaintext, request_kem_random
+	request_kem_secret, request_enc = KEM_ENCAP(device_public_key, request_kem_random)
+	// BUG: only the routing request ID is absent.
+	broken_info = CONCAT(version_info, device_id)
+	broken_binding = CONCAT(hpke_psk_label, broken_info, client_id)
+	request_key, request_nonce = HKDF(
+		CONCAT(request_kem_secret, client_psk), broken_binding, hpke_schedule_label
 	)
-	request_ciphertext = AEAD_ENC(request_key, request_plaintext, nil)
+	request_ciphertext = AEAD_ENC(request_key, request_nonce, request_plaintext, nil)
+	sent_record = CONCAT(request_id, request_plaintext)
 ]
 
-Client -> Device: request_id, request_ciphertext
+Client -> Device: request_id, request_enc, request_ciphertext
 
 principal Device[
-	broken_binding_device = CONCAT(
-		hpke_psk_label,
-		version_info,
-		device_id,
-		client_id
-	)
-	request_key_device = HKDF(
-		client_psk,
-		broken_binding_device,
-		hpke_schedule_label
+	request_kem_secret_device = KEM_DECAP(device_private_key, request_enc)?
+	broken_info_device = CONCAT(version_info, device_id)
+	broken_binding_device = CONCAT(hpke_psk_label, broken_info_device, client_id)
+	request_key_device, request_nonce_device = HKDF(
+		CONCAT(request_kem_secret_device, client_psk), broken_binding_device, hpke_schedule_label
 	)
 	request_plaintext_device = AEAD_DEC(
-		request_key_device,
-		request_ciphertext,
-		nil
+		request_key_device, request_nonce_device, request_ciphertext, nil
 	)?
+	accepted_record = CONCAT(request_id, request_plaintext_device)
 ]
 
 queries[
-	equivalence? request_plaintext, request_plaintext_device
+	equivalence? sent_record, accepted_record
 ]

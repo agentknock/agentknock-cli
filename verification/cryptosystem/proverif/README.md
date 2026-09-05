@@ -35,8 +35,9 @@ PROVERIF=/absolute/path/to/proverif2.05/proverif \
 ```
 
 Pass `--full` to retain ProVerif's derivations and reconstructed attack traces
-on stdout. The runner checks the complete ordered true/false verdict vector
-for every file and exits nonzero on any mismatch; the default prints the exact
+on stdout. The runner checks every model is registered, enforces a three-minute timeout
+and 2 GiB address-space limit, and rejects incomplete or unknown verdicts. It
+compares complete ordered verdict vectors and equivalence summaries; the default prints the exact
 verification summaries recorded in [`RESULTS.md`](RESULTS.md).
 
 ## Model inventory
@@ -47,7 +48,8 @@ verification summaries recorded in [`RESULTS.md`](RESULTS.md).
 | `pairing_activation.pv` | Commitment, ordered base records, ideal full-SAS comparison, and PSK-mode activation | P01-P03, P05-P07 |
 | `rotation_step.pv` | Ordered current-first/candidate-fallback processing for one active PSK generation and authenticated confirmation | cryptographic part of R02-R04 and R06 |
 | `version_binding.pv` | Two symbolic versions sharing one key, client identity, and PSK; the receiver accepts either outer version and relies on `version_info` inside HPKE `info` | X04, X05 |
-| `psk_compromise.pv` | Historical secrecy after PSK-only disclosure and future impersonation | C01, C02 |
+| `psk_compromise.pv` | Recorded request, accepted response, and completion secrecy after PSK-only disclosure; future impersonation | C01, C02 |
+| `recorded_exchange_*_disclosure.pv` and `recorded_exchange.pvl` | Chosen-plaintext recorded-transcript equivalence after PSK disclosure, with device-key and live-context disclosure controls | C02, C03 boundary |
 | `device_key_compromise.pv` | Delayed `skD` compromise over a recorded base transcript, initial request, one rotation, and its successor request | C03 one-step instance |
 | `address_offline_guess.pv` | Qualitative weak-secret/offline-test analysis of deterministic `address_id` | C05 |
 | `negative_pairing_mitm.pv` | Deliberately omits SAS to expose the specified pre-SAS MITM | P04, P05 |
@@ -95,8 +97,36 @@ ULID policy, persistence implementation, timing, erasure, and quantitative
 security remain outside symbolic trace verification.
 
 In the output, a `true` secrecy/correspondence result is a successful proof in
-this abstraction. The four reachability queries intentionally ask ProVerif
+this abstraction. The reachability queries intentionally ask ProVerif
 to prove that an honest terminal event is unreachable, so their `false`
 results are expected executable witnesses. Every `false` result in a file
 named `negative_*`, both advertised compromise attacks, and the weak-address
 result is likewise expected and accompanied by a concrete reconstructed trace.
+
+## Recorded-transcript equivalence
+
+`recorded_exchange_psk_disclosure.pv` proves observational equivalence between
+attacker-chosen request/response/completion tuples with identical public
+metadata. The shared library generates an honest recorded base pairing and
+arbitrarily many ordinary recordings per binding, with arbitrarily many
+bindings sharing a device key. Each recording has fresh KEM randomness and
+request identity; disclosure follows its three records. Other concurrent
+recordings may already have disclosed the same PSK.
+
+This experiment strengthens the direct secrecy queries. Its scope is the
+recorded ciphertext transcript. Equal byte lengths and identical public
+application behavior are external premises; symbolic bitstrings do not model
+length, timing, errors, or traffic patterns. It supplies no interactive
+application or decryption oracle and is not a full computational IND-CCA proof.
+
+The device-key and live-context variants return **“Observational equivalence
+cannot be proved.”** In both cases ProVerif also reconstructs a concrete
+equality-test distinguisher: disclosure lets the attacker reconstruct/open the
+chosen record and compare the plaintext with its candidate. The runner requires
+both the exact unknown summary and the concrete distinguishing-trace markers.
+An unknown result without that trace is rejected; it is not relabeled a `false`
+verdict. Inspect the complete traces with `--full`.
+
+The equivalence drivers are run with `-lib recorded_exchange` (the `.pvl`
+extension is implicit). See the [official ProVerif manual](https://bblanche.gitlabpages.inria.fr/proverif/manual.pdf)
+for biprocess and observational-equivalence semantics.

@@ -2,8 +2,9 @@
 
 This directory is a reproducible, specification-level symbolic analysis of
 [`docs/cryptosystem.md`](../../docs/cryptosystem.md). It analyzes the protocol
-as written. It does **not** inspect, model, test, or make claims about the
-Agentknock implementation.
+as written. The CLI informed the conformance review, but these models do not
+prove or test implementation conformance. The findings and corrections are
+recorded in [AUDIT.md](AUDIT.md).
 
 The portfolio uses three complementary tools:
 
@@ -11,11 +12,12 @@ The portfolio uses three complementary tools:
   invalidation, and rollback/clone state machines. Its universal lemmas range
   over all traces admitted by each model.
 - **ProVerif** independently checks the replicated-session cryptographic core,
-  correspondences, secrecy claims, compromise experiments, and context-binding
-  sensitivity controls.
+  correspondences, secrecy claims, compromise experiments, recorded-transcript
+  observational equivalence, and context-binding sensitivity controls.
 - **Verifpal** performs a separate bounded active-attacker search at 1, 2, 4,
-  and 8 sessions per principal. A reported attack is a concrete bounded trace;
-  a no-attack result is supporting evidence, not a completeness result.
+  and 8 sessions per principal for the smaller models, and 1, 2, and 4 for
+  combined pairing/activation. Its reports are interpreted within the primitive
+  abstraction; a no-attack result is supporting evidence, not a completeness result.
 
 The claim-by-claim outcome is in [`RESULTS.md`](RESULTS.md). Stable claim IDs
 and their specification wording are in [`CLAIMS.md`](CLAIMS.md). Quantitative
@@ -67,10 +69,12 @@ bash verification/cryptosystem/proverif/run.sh
 bash verification/cryptosystem/verifpal/run.sh
 ```
 
-The Tamarin runner uses a global lock, one prover process at a time, a 384 MiB
-GHC heap ceiling, and a three-minute deadline per lemma. The Verifpal runner
-uses one Nix build job, an 8 GiB per-process ceiling, and a 15-minute deadline
-per analysis; its 8-session pairing case can take several minutes. See the
+Every prover runner checks the specification hash and tool version, uses a
+global per-tool lock, and rejects incomplete inventories/results. Tamarin uses
+a 384 MiB GHC heap ceiling, an 8 GiB address-space ceiling, and three minutes per
+lemma. ProVerif uses 2 GiB and three minutes per model. Verifpal uses 8 GiB and
+fifteen minutes per analysis; its four-session pairing case took about ten
+minutes. Nix builds use one job and two cores. See the
 prover-specific reports for exact commands, expected-attack conventions, and
 full-output options. The Tamarin report also documents optional host-level
 cgroup isolation:
@@ -87,6 +91,7 @@ needed to reproduce the verdicts.
 | Artifact | Role |
 | --- | --- |
 | [`run.sh`](run.sh) | Sequential specification-hash, Tamarin, ProVerif, and Verifpal reproduction entrypoint. |
+| [`AUDIT.md`](AUDIT.md) | Audit findings, corrected modeling errors, and remaining boundaries. |
 | [`CLAIMS.md`](CLAIMS.md) | Stable ledger P01--P08, X01--X08, R01--R09, C01--C05, and O01--O08. |
 | [`RESULTS.md`](RESULTS.md) | Portfolio-level disposition and exact evidence map for every claim ID. |
 | [`QUANTITATIVE.md`](QUANTITATIVE.md) | Exact 12-digit SAS modulo-bias calculation, attempt union bound, and ULID birthday bound. |
@@ -123,18 +128,20 @@ The endpoint assumptions match the specification:
 - SAS equality is collision-free in symbolic models, while the real collision
   probability is handled separately in [`QUANTITATIVE.md`](QUANTITATIVE.md).
 
-The Tamarin slot-uniqueness restrictions express the specification's retained
-identifier, freshness, serialization, and one-acceptance rules. Therefore the
-result is conditional: Tamarin proves the consequences of those normative
-state rules, not that an implementation provides crash-safe storage or enforces
-them. The models do not garbage-collect or compact an accepted slot: P08, X06,
-and the fixed-cache portion of X07 apply while the corresponding slot and
-response data are retained. Section 5.6 also permits compaction to a terminal
-marker, which suppresses repeated effects and response regeneration without
-preserving the bytes needed for redelivery. Once even that marker may be
-discarded, subsequent handling belongs to the O03 freshness policy and is not
-a Tamarin idempotency theorem. Likewise, the finite pending-pairing limit used
-in the SAS attempt bound is a deployment assumption, not a prover result.
+The core Tamarin models assume per-device slot uniqueness through explicit
+restrictions. A separate `slot_lifecycle.spthy` uses linear state to check
+one-effect behavior, cache-to-marker compaction, and eventual discard without
+those restrictions. Its fresh slot allocation represents the external policy
+that a forgotten identifier cannot be resurrected; it does not prove a real
+ULID clock or freshness implementation. The binding lifecycle retains a nested,
+current-bound successor term across arbitrary rotations, while the core models
+check the full cryptographic schedule and authentication. State observations
+establish arbitrary-sequence per-binding isolation in a separate map model.
+
+Focused state and phase-witness models have explicit assume/guarantee boundaries;
+this portfolio is not one machine-checked composition theorem for the whole
+implementation. Atomic storage, retained state, finite pending-attempt limits,
+and real deadline enforcement remain external obligations.
 
 ## How to read the verdicts
 
@@ -146,8 +153,8 @@ The reports distinguish five kinds of evidence:
    specification explicitly says is not provided, or for a deliberately
    weakened negative-control model.
 3. **Bounded evidence**: Verifpal found no attack up to the recorded session
-   bounds. Its active-attacker search is sound when it reports an attack but is
-   intentionally incomplete when it reports none.
+   bounds. Reports must be interpreted in the tool and primitive abstractions;
+   no-attack results do not establish completeness.
 4. **Manual/quantitative argument**: the result follows from arithmetic,
    specification structure, or an induction outside the prover's direct
    query.
@@ -169,8 +176,8 @@ first-request replacement or completion forgery.
   [Tamarin manual](https://tamarin-prover.com/manual/master/book/001_introduction.html).
 - ProVerif 2.05 is supplied by the same pin; the upstream release and manual
   are linked from the [official ProVerif site](https://bblanche.gitlabpages.inria.fr/proverif/).
-- Verifpal 1.3.2 is built from source commit
-  `11ea59e2e044e564052e97e7444d375fb3bf4d39`, corresponding to the verified
-  [v1.3.2 release](https://github.com/symbolicsoft/verifpal/releases/tag/v1.3.2).
+- Verifpal 1.4.3 is built from source commit
+  `035f11d0480674a519c4835c20438f7af24f2e92`, corresponding to the verified
+  [v1.4.3 release](https://github.com/symbolicsoft/verifpal/releases/tag/v1.4.3).
   Its bounded-search limitations are described in the
-  [pinned upstream README](https://github.com/symbolicsoft/verifpal/blob/11ea59e2e044e564052e97e7444d375fb3bf4d39/README.md).
+  [pinned upstream README](https://github.com/symbolicsoft/verifpal/blob/035f11d0480674a519c4835c20438f7af24f2e92/README.md).

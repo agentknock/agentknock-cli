@@ -139,6 +139,12 @@ rule ClientAcceptsResponseAndConfirmsRotation:
   [ ClientBinding(client_id, device_id, pkD,
                   new_psk, 'none', 'none') ]
 
+/* A held response can arrive after authority for new requests was revoked. */
+rule InvalidateDeviceBinding:
+  [ DeviceBinding(client_id, device_id, skD, psk) ]
+  --[ BindingInvalidated(client_id, device_id, psk) ]->
+  [ ]
+
 restriction UniqueDeviceRequestSlot:
   "All client_id device_id request_id psk1 class1 rotation1 enc1 c01 ctx1 x1
        psk2 class2 rotation2 enc2 c02 ctx2 x2 #i #j.
@@ -171,5 +177,11 @@ lemma R06_only_matching_pending_encapsulation_is_cleared:
             ClientPendingRequestSent(client_id, device_id, rid,
                                      new, renc, enc, c0, ctx, request)@j
           & #j < #i)"
+
+lemma R06_delayed_confirmation_after_invalidation_executable:
+  exists-trace
+  "Ex cid did rid psk enc #i #j.
+       BindingInvalidated(cid, did, psk)@i
+     & ClientRotationConfirmed(cid, did, rid, psk, enc)@j & #i < #j"
 
 end

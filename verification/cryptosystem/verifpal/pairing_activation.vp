@@ -1,7 +1,7 @@
 // Agentknock v1 initial pairing, SAS gate, and activation.
 //
 // HPKE is abstracted as KEM_ENCAP/KEM_DECAP followed by an HKDF key schedule
-// and distinct AEAD keys for records 0 and 1.  The guarded SAS messages model
+// and one AEAD key with distinct nonces for records 0 and 1.  The guarded SAS messages model
 // the integrity of the out-of-band comparison, not secrecy of the displayed
 // digits.  Verifpal treats the SAS as collision-free and cannot quantify the
 // 12-digit guessing event.
@@ -9,6 +9,7 @@
 attacker[active]
 
 principal Client[
+	knows public record_sequence_one
 	knows public version_info, base_salt, commitment_label, hpke_base_label
 	knows public hpke_psk_label, hpke_schedule_label, psk_export_label
 	knows public sas_label, response_label, response_key_label
@@ -20,6 +21,7 @@ principal Client[
 Client -> Device: client_id, commitment
 
 principal Device[
+	knows public record_sequence_one
 	knows public version_info, base_salt, commitment_label, hpke_base_label
 	knows public hpke_psk_label, hpke_schedule_label, psk_export_label
 	knows public sas_label, response_label, response_key_label
@@ -39,15 +41,16 @@ principal Client[
 	base_kem_secret, pairing_enc = KEM_ENCAP(device_public_key, pairing_kem_random)
 	base_info = CONCAT(version_info, device_id, client_id)
 	base_context = HKDF(base_kem_secret, base_info, hpke_base_label)
-	base_record0_key, base_record1_key, base_exporter_root = HKDF(
+	base_record_key, base_record_nonce, base_exporter_root = HKDF(
 		base_context,
 		hpke_schedule_label,
 		nil
 	)
+	base_application_nonce = CONCAT(base_record_nonce, record_sequence_one)
 	client_psk = HKDF(base_exporter_root, psk_export_label, nil)
-	secret_ciphertext = AEAD_ENC(base_record0_key, client_secret, nil)
+	secret_ciphertext = AEAD_ENC(base_record_key, base_record_nonce, client_secret, nil)
 	pairing_application_ciphertext = AEAD_ENC(
-		base_record1_key,
+		base_record_key, base_application_nonce,
 		pairing_application,
 		nil
 	)
@@ -70,23 +73,19 @@ principal Device[
 		base_info_device,
 		hpke_base_label
 	)
-	base_record0_key_device, base_record1_key_device, base_exporter_root_device = HKDF(
+	base_record_key_device, base_record_nonce_device, base_exporter_root_device = HKDF(
 		base_context_device,
 		hpke_schedule_label,
 		nil
 	)
-	device_client_psk = HKDF(
-		base_exporter_root_device,
-		psk_export_label,
-		nil
-	)
+	base_application_nonce_device = CONCAT(base_record_nonce_device, record_sequence_one)
 	client_secret_device = AEAD_DEC(
-		base_record0_key_device,
+		base_record_key_device, base_record_nonce_device,
 		secret_ciphertext,
 		nil
 	)?
 	pairing_application_device = AEAD_DEC(
-		base_record1_key_device,
+		base_record_key_device, base_application_nonce_device,
 		pairing_application_ciphertext,
 		nil
 	)?
@@ -96,6 +95,11 @@ principal Device[
 		commitment_label
 	)
 	_ = ASSERT(commitment, recovered_commitment)?
+	device_client_psk = HKDF(
+		base_exporter_root_device,
+		psk_export_label,
+		nil
+	)
 	sas_info_device = CONCAT(sas_label, device_id, client_id, device_public_key)
 	sas_device = HKDF(device_random, client_secret_device, sas_info_device)
 ]
@@ -123,14 +127,15 @@ principal Client[
 		activation_info,
 		client_id
 	)
-	activation_request_key, activation_completion_key, activation_exporter_root = HKDF(
+	activation_request_key, activation_request_nonce, activation_exporter_root = HKDF(
 		CONCAT(activation_kem_secret, client_psk),
 		activation_binding,
 		hpke_schedule_label
 	)
+	activation_completion_nonce = CONCAT(activation_request_nonce, record_sequence_one)
 	activation_exporter = HKDF(activation_exporter_root, response_label, nil)
 	activation_request_ciphertext = AEAD_ENC(
-		activation_request_key,
+		activation_request_key, activation_request_nonce,
 		activation_request_plaintext,
 		nil
 	)
@@ -153,18 +158,19 @@ principal Device[
 		activation_info_device,
 		client_id
 	)
-	activation_request_key_device, activation_completion_key_device, activation_exporter_root_device = HKDF(
+	activation_request_key_device, activation_request_nonce_device, activation_exporter_root_device = HKDF(
 		CONCAT(activation_kem_secret_device, device_client_psk),
 		activation_binding_device,
 		hpke_schedule_label
 	)
+	activation_completion_nonce_device = CONCAT(activation_request_nonce_device, record_sequence_one)
 	activation_exporter_device = HKDF(
 		activation_exporter_root_device,
 		response_label,
 		nil
 	)
 	activation_request_plaintext_device = AEAD_DEC(
-		activation_request_key_device,
+		activation_request_key_device, activation_request_nonce_device,
 		activation_request_ciphertext,
 		nil
 	)?
@@ -180,12 +186,8 @@ principal Device[
 		activation_exporter_device,
 		response_nonce_label
 	)
-	activation_response_material = CONCAT(
-		activation_response_key,
-		activation_response_nonce
-	)
 	activation_response_ciphertext = AEAD_ENC(
-		activation_response_material,
+		activation_response_key, activation_response_nonce,
 		activation_response_plaintext,
 		nil
 	)
@@ -208,17 +210,13 @@ principal Client[
 		activation_exporter,
 		response_nonce_label
 	)
-	activation_response_material_client = CONCAT(
-		activation_response_key_client,
-		activation_response_nonce_client
-	)
 	activation_response_plaintext_client = AEAD_DEC(
-		activation_response_material_client,
+		activation_response_key_client, activation_response_nonce_client,
 		activation_response_ciphertext,
 		nil
 	)?
 	activation_completion_ciphertext = AEAD_ENC(
-		activation_completion_key,
+		activation_request_key, activation_completion_nonce,
 		activation_completion_plaintext,
 		nil
 	)
@@ -228,7 +226,7 @@ Client -> Device: activation_completion_ciphertext
 
 principal Device[
 	activation_completion_plaintext_device = AEAD_DEC(
-		activation_completion_key_device,
+		activation_request_key_device, activation_completion_nonce_device,
 		activation_completion_ciphertext,
 		nil
 	)?

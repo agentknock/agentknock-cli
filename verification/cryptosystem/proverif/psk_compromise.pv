@@ -1,8 +1,9 @@
 (**
   Agentknock v1 compromise experiment for C01/C02.
 
-  An honest paired ciphertext is recorded, then the current client PSK is
-  disclosed.  Historical plaintext secrecy must still hold without skD or the
+  An honest request, its authenticated response, and its completion are
+  recorded, then the current client PSK is disclosed.  Historical plaintext
+  secrecy must still hold without skD or the
   sender ephemeral (C02), while authentication of future client requests must
   fail because the attacker can create a new PSK-mode context (C01).
 *)
@@ -20,9 +21,16 @@ type record_sequence.
 
 free network: channel.
 free request_tag: bitstring.
+free response_tag: bitstring.
+free completion_tag: bitstring.
 free version_v1: bitstring.
 free sequence_zero: record_sequence.
+free sequence_one: record_sequence.
+free response_exporter_label: bitstring.
+free response_key_label: bitstring.
+free response_nonce_label: bitstring.
 free historical_plaintext: bitstring [private].
+free historical_completion: bitstring [private].
 
 fun device_public(device_secret_key): device_public_key.
 fun encapsulate(ephemeral_secret_key): encapsulated_key.
@@ -34,12 +42,24 @@ fun hpke_psk_context(kem_secret, psk, bitstring, bitstring): hpke_context.
 fun hpke_seal(bitstring, hpke_context, record_sequence): bitstring.
 reduc forall message: bitstring, context: hpke_context, sequence: record_sequence;
   hpke_open(hpke_seal(message, context, sequence), context, sequence) = message.
+fun hpke_export(hpke_context, bitstring): bitstring.
+fun derive_response_value(bitstring, encapsulated_key, bitstring, bitstring): bitstring.
+fun response_seal(bitstring, bitstring, bitstring): bitstring.
+reduc forall message: bitstring, key: bitstring, nonce: bitstring;
+  response_open(response_seal(message, key, nonce), key, nonce) = message.
 
 event HonestClientSend(bitstring, bitstring, bitstring).
 event DeviceAccept(bitstring, bitstring, bitstring).
+event RecordedResponse(bitstring).
 
 (** C02: a PSK alone cannot reconstruct the recorded DH/KEM context. *)
 query attacker(historical_plaintext) ==> false.
+query response: bitstring;
+  event(RecordedResponse(response)) && attacker(response) ==> false.
+query attacker(historical_completion) ==> false.
+
+(** Non-vacuity: the client authenticates a historical response. *)
+query response: bitstring; event(RecordedResponse(response)) ==> false.
 
 (** C01 expected attack: after disclosure, the attacker impersonates client. *)
 query cid: bitstring, rid: bitstring, message: bitstring;
@@ -63,7 +83,17 @@ let HonestClient(
   event HonestClientSend(client_id, request_id, historical_plaintext);
   out(network,
     (request_tag, client_id, request_id, version_v1, enc, ciphertext));
-  (* Durable-state disclosure after the historical ciphertext is recorded. *)
+  in(network,
+    (=response_tag, =client_id, =request_id,
+     response_random: bitstring, response_ciphertext: bitstring));
+  let exported = hpke_export(context, response_exporter_label) in
+  let key = derive_response_value(exported, enc, response_random, response_key_label) in
+  let nonce = derive_response_value(exported, enc, response_random, response_nonce_label) in
+  let response = response_open(response_ciphertext, key, nonce) in
+  event RecordedResponse(response);
+  let completion = hpke_seal(historical_completion, context, sequence_one) in
+  out(network, (completion_tag, client_id, request_id, completion));
+  (* Disclosure follows all three transcript outputs. *)
   out(network, binding_psk).
 
 let Device(
@@ -77,7 +107,16 @@ let Device(
     kem_receiver(enc, secret_key), binding_psk, client_id, info
   ) in
   let message = hpke_open(ciphertext, context, sequence_zero) in
-  event DeviceAccept(client_id, request_id, message).
+  event DeviceAccept(client_id, request_id, message);
+  (* Each accepted context receives its own plaintext: a later compromised
+     holder can obtain a response to its own request, not this old response. *)
+  new response: bitstring;
+  new response_random: bitstring;
+  let exported = hpke_export(context, response_exporter_label) in
+  let key = derive_response_value(exported, enc, response_random, response_key_label) in
+  let nonce = derive_response_value(exported, enc, response_random, response_nonce_label) in
+  let response_ciphertext = response_seal(response, key, nonce) in
+  out(network, (response_tag, client_id, request_id, response_random, response_ciphertext)).
 
 process
   new secret_key: device_secret_key;

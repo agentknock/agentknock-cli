@@ -32,12 +32,12 @@ principal Client[
 	)
 	rotation_info = CONCAT(version_info, device_id, rotation_request_id)
 	rotation_binding = CONCAT(hpke_psk_label, rotation_info, client_id)
-	rotation_context = HKDF(
+	_, _, rotation_exporter_root = HKDF(
 		CONCAT(rotation_kem_secret, current_psk),
 		rotation_binding,
 		hpke_schedule_label
 	)
-	successor_psk = HKDF(rotation_context, psk_export_label, nil)
+	successor_psk = HKDF(rotation_exporter_root, psk_export_label, nil)
 ]
 
 Client -> Device: rotation_enc
@@ -53,12 +53,12 @@ principal Device[
 		rotation_info_device,
 		client_id
 	)
-	rotation_context_device = HKDF(
+	_, _, rotation_exporter_root_device = HKDF(
 		CONCAT(rotation_kem_secret_device, current_psk),
 		rotation_binding_device,
 		hpke_schedule_label
 	)
-	candidate_psk = HKDF(rotation_context_device, psk_export_label, nil)
+	candidate_psk = HKDF(rotation_exporter_root_device, psk_export_label, nil)
 ]
 
 queries[

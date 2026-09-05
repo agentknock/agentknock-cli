@@ -62,11 +62,22 @@ The symbolic models use fresh names for accepted `client_id` and ordinary
 `request_id` values. Concretely, two generated ULIDs can collide only when
 their 48-bit millisecond timestamps are equal and their independent 80-bit
 random fields collide. For `m` identifiers generated in one millisecond, the
-usual birthday upper bound is approximately
+exact collision probability under that independence assumption is
 
 ```text
-m * (m - 1) / 2^81.
+1 - product(1 - i / 2^80, i = 0, ..., m - 1).
 ```
+
+The union bound gives the rigorous upper bound
+
+```text
+min(1, m * (m - 1) / 2^81).
+```
+
+For several timestamp buckets, sum `m_t * (m_t - 1) / 2^81` over
+buckets and cap the sum at one. Different timestamps cannot collide. The
+small-probability birthday approximation is close to that bound; the bound
+itself is not an approximation.
 
 The specification additionally requires actual uniqueness checks and an
 implementation-defined freshness policy. Those requirements, claimed clock

@@ -1,53 +1,121 @@
-// Compromise experiment for C01 and C02.
-// A recorded request is created before phase 1.  Only the binding PSK is then
-// disclosed: the old plaintext should remain confidential because the KEM
-// secret still needs the device private key.  psk_holder_authority.vp is the
-// separate constructive witness for the compromised holder's future power.
+// C02: full recorded exchange followed by durable client-PSK disclosure.
+// The device key and live request context are not disclosed.
+// Future PSK-holder authority is checked separately in psk_holder_authority.vp.
 
 attacker[active]
 
 principal Client[
+	knows public record_sequence_one
 	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public response_label, response_key_label, response_nonce_label
 	knows public device_id, client_id
 	knows private client_psk
 ]
 
 principal Device[
+	knows public record_sequence_one
 	knows public version_info, hpke_psk_label, hpke_schedule_label
+	knows public response_label, response_key_label, response_nonce_label
 	knows public device_id, client_id
 	knows private client_psk, device_private_key
 	device_public_key = PUBKEY(device_private_key)
 ]
 
+// An active binding has already authenticated this long-term device key.
 Device -> Client: [device_public_key]
 
 principal Client[
-	generates old_request_id, old_kem_random, old_plaintext
-	old_kem_secret, old_enc = KEM_ENCAP(device_public_key, old_kem_random)
-	old_info = CONCAT(version_info, device_id, old_request_id)
-	old_binding = CONCAT(hpke_psk_label, old_info, client_id)
-	old_request_key = HKDF(
-		CONCAT(old_kem_secret, client_psk),
-		old_binding,
+	generates request_id, request_kem_random
+	generates request_plaintext, completion_plaintext
+	request_kem_secret, request_enc = KEM_ENCAP(
+		device_public_key,
+		request_kem_random
+	)
+	request_info = CONCAT(version_info, device_id, request_id)
+	request_binding = CONCAT(hpke_psk_label, request_info, client_id)
+	request_key, request_nonce, response_exporter_root = HKDF(
+		CONCAT(request_kem_secret, client_psk),
+		request_binding,
 		hpke_schedule_label
 	)
-	old_ciphertext = AEAD_ENC(old_request_key, old_plaintext, nil)
+	completion_nonce = CONCAT(request_nonce, record_sequence_one)
+	response_exporter = HKDF(response_exporter_root, response_label, nil)
+	request_ciphertext = AEAD_ENC(request_key, request_nonce, request_plaintext, nil)
 ]
 
-Client -> Device: old_request_id, old_enc, old_ciphertext
+Client -> Device: request_id, request_enc, request_ciphertext
 
 principal Device[
-	old_kem_secret_device = KEM_DECAP(device_private_key, old_enc)?
-	old_info_device = CONCAT(version_info, device_id, old_request_id)
-	old_binding_device = CONCAT(hpke_psk_label, old_info_device, client_id)
-	old_request_key_device = HKDF(
-		CONCAT(old_kem_secret_device, client_psk),
-		old_binding_device,
+	request_kem_secret_device = KEM_DECAP(device_private_key, request_enc)?
+	request_info_device = CONCAT(version_info, device_id, request_id)
+	request_binding_device = CONCAT(
+		hpke_psk_label,
+		request_info_device,
+		client_id
+	)
+	request_key_device, request_nonce_device, response_exporter_root_device = HKDF(
+		CONCAT(request_kem_secret_device, client_psk),
+		request_binding_device,
 		hpke_schedule_label
 	)
-	old_plaintext_device = AEAD_DEC(
-		old_request_key_device,
-		old_ciphertext,
+	completion_nonce_device = CONCAT(request_nonce_device, record_sequence_one)
+	response_exporter_device = HKDF(
+		response_exporter_root_device,
+		response_label,
+		nil
+	)
+	request_plaintext_device = AEAD_DEC(
+		request_key_device, request_nonce_device,
+		request_ciphertext,
+		nil
+	)?
+	generates response_plaintext, response_random
+	response_salt = CONCAT(request_enc, response_random)
+	response_key = HKDF(
+		response_salt,
+		response_exporter_device,
+		response_key_label
+	)
+	response_nonce = HKDF(
+		response_salt,
+		response_exporter_device,
+		response_nonce_label
+	)
+	response_ciphertext = AEAD_ENC(response_key, response_nonce, response_plaintext, nil)
+]
+
+Device -> Client: response_random, response_ciphertext
+
+principal Client[
+	response_salt_client = CONCAT(request_enc, response_random)
+	response_key_client = HKDF(
+		response_salt_client,
+		response_exporter,
+		response_key_label
+	)
+	response_nonce_client = HKDF(
+		response_salt_client,
+		response_exporter,
+		response_nonce_label
+	)
+	response_plaintext_client = AEAD_DEC(
+		response_key_client, response_nonce_client,
+		response_ciphertext,
+		nil
+	)?
+	completion_ciphertext = AEAD_ENC(
+		request_key, completion_nonce,
+		completion_plaintext,
+		nil
+	)
+]
+
+Client -> Device: completion_ciphertext
+
+principal Device[
+	completion_plaintext_device = AEAD_DEC(
+		request_key_device, completion_nonce_device,
+		completion_ciphertext,
 		nil
 	)?
 ]
@@ -57,7 +125,11 @@ phase[1]
 principal Client[leaks client_psk]
 
 queries[
-	// C02 should hold under PSK-only post-recording disclosure.
-	confidentiality? old_plaintext
-	equivalence? old_plaintext, old_plaintext_device
+	// C02: all three recorded plaintexts survive PSK-only disclosure.
+	confidentiality? request_plaintext
+	confidentiality? response_plaintext
+	confidentiality? completion_plaintext
+	equivalence? request_plaintext, request_plaintext_device
+	equivalence? response_plaintext, response_plaintext_client
+	equivalence? completion_plaintext, completion_plaintext_device
 ]

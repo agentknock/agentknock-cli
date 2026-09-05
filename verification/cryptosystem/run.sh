@@ -6,6 +6,7 @@ repo_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 
 cd "$repo_dir"
 sha256sum -c "$script_dir/SPECIFICATION.sha256"
+python3 -B -m unittest discover -s "$script_dir" -p 'test_*.py'
 
 printf '\n== Tamarin ==\n'
 bash "$script_dir/tamarin/run.sh"

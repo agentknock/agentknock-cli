@@ -156,26 +156,42 @@ rule IgnoreLaterPairingCompletion:
 
 /*
  * This internal rule is the authenticated out-of-band comparison.  Requiring
- * one syntactically equal full SAS models the no-collision branch.  Both
- * endpoints move atomically to pending activation state.
+ * one syntactically equal full SAS models the no-collision branch.  No PSK,
+ * encapsulation, or transcript field is compared out of band.  In particular,
+ * PSK agreement must follow from the protocol, not from this rule's premises.
  */
 rule UserVerifiesEqualSAS:
-  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
-                  client_secret, pairing_application, psk, code),
+  [ ClientWaitSAS(client_cid, client_did, client_pk, client_random,
+                  client_contribution, pairing_application, client_psk, code),
     DeviceWaitSAS(client_id, device_id, skD, device_random,
                   client_secret, device_application, psk, code) ]
-  --[ SASVerified(client_id, device_id, pkD, device_random,
+  --[ SASVerified(client_id, device_id, pk(skD), device_random,
                   client_secret, psk, code),
+      ClientSASVerified(client_cid, client_did, client_pk, client_random,
+                        client_contribution, client_psk, code),
+      SASKeyComparison(client_id, device_id, client_psk, psk),
       PendingBindingEstablished(client_id, device_id, psk) ]->
-  [ ClientPendingActivation(client_id, device_id, pkD, psk),
+  [ ClientPendingActivation(client_cid, client_did, client_pk, client_psk),
     DevicePendingActivation(client_id, device_id, skD, psk),
-    !PendingPSKCompromiseCopy(client_id, device_id, psk) ]
+    !PendingPSKCompromiseCopy(client_cid, client_did, client_psk) ]
+
+/* Device-local rejection needs no cooperating client and is possible at
+ * each pre-activation phase. Retained response bytes can still be redelivered.
+ */
+rule RejectBeforePairingCompletion:
+  [ DeviceWaitCompletion(client_id, device_id, skD, commit, device_random) ]
+  --[ SASRejected(client_id, device_id) ]->
+  [ !PairingRejected(client_id),
+    !PairingCompletionDisposition(client_id, device_id, 'rejected') ]
 
 rule UserRejectsPairing:
-  [ ClientWaitSAS(client_id, device_id, pkD, device_random,
-                  client_secret, pairing_application, psk, code),
-    DeviceWaitSAS(client_id, device_id, skD, other_random,
-                  other_secret, device_application, other_psk, other_code) ]
+  [ DeviceWaitSAS(client_id, device_id, skD, device_random,
+                  client_secret, application, psk, code) ]
+  --[ SASRejected(client_id, device_id) ]->
+  [ !PairingRejected(client_id) ]
+
+rule RejectBeforeActivation:
+  [ DevicePendingActivation(client_id, device_id, skD, psk) ]
   --[ SASRejected(client_id, device_id) ]->
   [ !PairingRejected(client_id) ]
 
@@ -351,12 +367,50 @@ lemma P03_sas_full_transcript_agreement:
   "All client_id device_id pkD device_random secret psk code #i.
        SASVerified(client_id, device_id, pkD, device_random,
                    secret, psk, code)@i
-     ==> (Ex #j #k.
+     ==> (Ex client_psk #j #k.
             ClientSASReady(client_id, device_id, pkD, device_random,
-                           secret, psk, code)@j
+                           secret, client_psk, code)@j
           & DeviceSASReady(client_id, device_id, pkD, device_random,
                            secret, psk, code)@k
           & #j < #i & #k < #i)"
+
+lemma P03_sas_implies_psk_agreement:
+  "All client_id device_id client_psk device_psk #i.
+       SASKeyComparison(client_id, device_id, client_psk, device_psk)@i
+     ==> client_psk = device_psk
+       | (Ex #r. DeviceKeyRevealed(device_id)@r & #r < #i)"
+
+lemma P03_verified_pairing_completion_agreement:
+  "All client_id device_id pkD random secret psk code app enc c0 c1 #s #d.
+       SASVerified(client_id, device_id, pkD, random, secret, psk, code)@s
+     & DevicePairingCompletionAccepted(client_id, device_id, pkD,
+                                       secret, app, enc, c0, c1, psk)@d
+     ==> (Ex #c. ClientPairingCompletionSent(client_id, device_id, pkD,
+                                            secret, app, enc, c0, c1, psk)@c
+                  & #c < #d)
+       | (Ex #r. DeviceKeyRevealed(device_id)@r & #r < #s)"
+
+/* With skD disclosed, the attacker can re-encrypt the same client secret
+ * under a different base context.  The displays still match, but the PSKs
+ * differ.  This checks that the OOB rule does not silently compare PSKs. */
+lemma device_key_compromise_allows_equal_sas_with_different_psks:
+  exists-trace
+  "Ex client_id device_id client_psk device_psk #r #s.
+       DeviceKeyRevealed(device_id)@r
+     & SASKeyComparison(client_id, device_id, client_psk, device_psk)@s
+     & #r < #s & not (client_psk = device_psk)"
+
+lemma P01_active_network_pairing_activation_executable:
+  exists-trace
+  "Ex client_id device_id psk request_id completion #s #d #c #f.
+       PendingBindingEstablished(client_id, device_id, psk)@s
+     & DeviceActivated(client_id, device_id, psk)@d
+     & ClientActivated(client_id, device_id, psk)@c
+     & DeviceActivationCompletionAccepted(client_id, device_id,
+                                          request_id, completion)@f
+     & #s < #d & #d < #c & #c < #f
+     & not (Ex did #r. DeviceKeyRevealed(did)@r)
+     & not (Ex cid key #r. ClientPSKRevealed(cid, key)@r)"
 
 lemma P03_sas_injective:
   "All client_id device_id psk #i #j.
@@ -380,9 +434,11 @@ lemma P05_rejected_attempt_cannot_activate:
 /* ------------------------- Activation (P06/P07) ------------------------ */
 
 lemma P06_device_activation_agreement:
-  "All client_id device_id psk #i.
+  "All client_id device_id psk request_id enc request #i.
        DeviceActivated(client_id, device_id, psk)@i
-     ==> (Ex request_id enc request #j.
+     & DeviceActivationRequestAccepted(client_id, device_id, request_id,
+                                        enc, request)@i
+     ==> (Ex #j.
             ClientActivationRequestSent(client_id, device_id, request_id,
                                         enc, request)@j
           & #j < #i)
@@ -390,9 +446,11 @@ lemma P06_device_activation_agreement:
        | (Ex #r. DeviceKeyRevealed(device_id)@r & #r < #i)"
 
 lemma P07_client_activation_authenticates_response:
-  "All client_id device_id psk #i.
+  "All client_id device_id psk request_id response_plain #i.
        ClientActivated(client_id, device_id, psk)@i
-     ==> (Ex request_id request_msg response_plain #j #k.
+     & ClientActivationResponseAccepted(client_id, device_id, request_id,
+                                         response_plain)@i
+     ==> (Ex request_msg #j #k.
             DeviceActivated(client_id, device_id, psk)@j
           & DeviceActivationResponseFixed(client_id, request_id,
                                           request_msg, response_plain)@k

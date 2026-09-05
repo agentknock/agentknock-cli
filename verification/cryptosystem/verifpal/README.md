@@ -1,152 +1,116 @@
-# Verifpal model of the Agentknock v1 cryptosystem
+# Verifpal analysis of Agentknock v1
 
-This directory contains a bounded symbolic analysis of
-[`docs/cryptosystem.md`](../../../docs/cryptosystem.md) under an active
-Dolev--Yao network attacker. It covers the cryptographic core of pairing and
-SAS-gated activation, ordinary paired traffic, response and completion
-binding, rotation fallback and confirmation, session mixups, and the stated
-PSK and device-key compromise consequences.
+These models provide independent bounded symbolic evidence for
+[`docs/cryptosystem.md`](../../../docs/cryptosystem.md). A `0` result means that
+this search found no attack within its recorded envelope. It is not an
+unbounded theorem or a computational security proof. Reported attacks must be
+interpreted in the modeled primitive and endpoint semantics.
 
-The result is supporting evidence, not a complete proof of the specification.
-Verifpal deliberately performs a terminating, sound-but-incomplete search over
-a bounded number of replicated sessions. In particular, when its attack
-construction needs a whole term, it chooses only among terms computed by the
-protocol and can miss an attack requiring a different term. Verifpal 1.3.2
-stamps every holding query with its search envelope, such as
-`[search exhausted at 8 sessions]`; that makes the applied bound explicit but
-does not make the search complete or identify a missed attack. A `0` result
-therefore means only that this search found no attack. The unbounded and
-stateful claims are handled by the companion Tamarin and ProVerif models.
+`equivalence?` checks equality of named terms in the explored executions. It
+is not observational equivalence or plaintext indistinguishability. The latter
+has a separate experiment in [ProVerif](../proverif/README.md).
 
-Verifpal's `equivalence?` query checks symbolic term agreement between the
-named principals in these traces. It is not the observational-equivalence
-notion supported by tools such as ProVerif or Tamarin.
-
-## Reproduce the analysis
-
-The repository flake pins Verifpal 1.3.2 and its complete build inputs. Run:
+## Reproduction and provenance
 
 ```sh
-./verification/cryptosystem/verifpal/run.sh
+bash verification/cryptosystem/verifpal/run.sh
 ```
 
-The runner builds the pinned binary with one build job, applies an 8 GiB
-per-process memory ceiling, and verifies its version. It then checks every
-hand-written query at 1, 2, 4, and 8 sessions per principal, the generated
-query audit at 1 and 2 sessions, and the saturation point of each model against
-[`RESULTS.md`](RESULTS.md). The 8-session pairing run can take several minutes.
-To inspect a full minimized attack narration for one model, use the same pinned
-binary directly, for example:
+The runner pins Verifpal 1.4.3, verifies the specification hash and model
+inventory, and checks full JSON reports against [cases.json](cases.json).
+Every query must have the expected name, kind, verdict, session bound, and
+exhausted, untruncated search envelope. Unexpected assumptions, preconditions,
+errors, omitted queries, or attacks without reported steps fail the run.
+Regression tests for result acceptance live in [../test_check_results.py](../test_check_results.py).
 
-```sh
-nix run path:$PWD/verification/cryptosystem#verifpal -- \
-  verify verification/cryptosystem/verifpal/negative_missing_request_id.vp \
-  --sessions 2 --result-code
-```
+The explicit-query matrix uses 1, 2, 4, and 8 sessions per principal, except
+for the combined pairing/activation model, which uses 1, 2, and 4. Its
+four-session analysis took approximately ten minutes in the recorded run;
+eight sessions were not tested. Automatic queries over the six non-diagnostic
+models are checked at 1 and 2 sessions. A global runner lock, 8 GiB address-space
+limit, and fifteen-minute per-analysis timeout bound resource use. Nix builds
+use one job and two cores; upstream tests run sequentially.
 
-The pin resolves as follows:
+The exact source pin is:
 
-- official release: `v1.3.2`;
-- annotated tag object: `7538231411fc73d119510250ef501c338905709c`;
-- source commit: `11ea59e2e044e564052e97e7444d375fb3bf4d39`;
-- source and Cargo dependency hashes: recorded in
-  [`../flake.nix`](../flake.nix).
+- release [v1.4.3](https://github.com/symbolicsoft/verifpal/releases/tag/v1.4.3);
+- annotated tag object `19bf1213b71738b75df2c5b052788ddd95714f31`;
+- source commit `035f11d0480674a519c4835c20438f7af24f2e92`;
+- source and Cargo hashes in [../flake.nix](../flake.nix).
 
-## Models and claim coverage
+Version 1.4 fixed several attack-search errors and introduced explicit AEAD
+nonces. The old 1.3.2 results are superseded, including its response-authentication
+failure classification. See the [upstream release explanation](https://symbolic.software/blog/2026-09-04-verifpal-1-4/).
 
-Claim IDs refer to the shared [`../CLAIMS.md`](../CLAIMS.md) ledger.
+## Models
 
-| Model | Purpose and covered claims |
+| Model | Purpose |
 | --- | --- |
-| `pairing_activation.vp` | Pairing base exchange, commitment check, collision-free SAS equality gate, and activation; expected pre-SAS attacks P04/P05 and bounded evidence for P06/P07 plus the activation instance of X01--X05. |
-| `paired_exchange.vp` | Request, exporter-derived response, and completion; bounded secrecy, injective authentication, agreement, mixup, and freshness evidence for X01--X05 and the cryptographic part of X07. Its multi-session replay results expose the absent X06 slot state. |
-| `rotation.vp` | Candidate derivation, the checked ordinary-request adoption gate, and response confirmation; bounded secrecy and one-session agreement evidence for the cryptographic parts of R02/R03/R06, plus the expected multi-session replay boundary. |
-| `compromise_psk.vp` | Post-transcript PSK-only disclosure; bounded confidentiality evidence for C02. Its multi-session equivalence result has the same absent-slot qualification. |
-| `compromise_device_key.vp` | Later device-private-key disclosure; expected attacks demonstrating C03. |
-| `psk_holder_authority.vp` | Constructive compromised-holder traces for future request impersonation and competing rotation, C01. |
-| `negative_missing_request_id.vp` | Deliberately omits `request_id`; a two-session cross-feed demonstrates why X04/X05 require it. |
-| `negative_record_key_reuse.vp` | Deliberately reuses the same effective symbolic key/nonce material for records 0 and 1; a one-session swap demonstrates why X03/X05 require record-sequence separation. In concrete HPKE the sequence changes the nonce while the AEAD key may stay fixed. |
-| `negative_rotation_candidate_pre_gate.vp` | Deliberate pre-gate diagnostic: a relay may alter an uncommitted candidate, but that does not establish adoption or violate R02/R06. |
+| `pairing_activation.vp` | Commitment, ordered base records, bilateral full-SAS comparison, activation, and expected pre-SAS disclosure/substitution. |
+| `paired_exchange.vp` | Request, response, and completion secrecy, agreement, injective authentication, and freshness diagnostics. |
+| `rotation.vp` | Candidate derivation and agreement after the checked request/response gates. |
+| `compromise_psk.vp` | All three recorded plaintexts remain secret after PSK-only disclosure. |
+| `compromise_device_key.vp` | Recorded base pairing, initial request, and one successor request after device-key disclosure. |
+| `psk_holder_authority.vp` | Constructive request and rotation authority of a PSK holder. |
+| `negative_missing_request_id.vp` | Retains fresh KEM setup but omits request identity from the schedule; an outer-ID mutation passes the open in one session. |
+| `negative_record_nonce_reuse.vp` | Reuses one AEAD key/nonce for records 0 and 1; demonstrates record swaps and completion disclosure with a known request. |
+| `negative_rotation_candidate_pre_gate.vp` | Queries the uncommitted candidate before authentication; substitution here is an expected denial-of-service capability. |
 
 ## Cryptographic abstraction
 
-Verifpal has no native HPKE construction. Each HPKE setup is represented by
-`KEM_ENCAP`/checked `KEM_DECAP?`, an opaque HKDF schedule, and AEAD. Checked
-decapsulation makes a receiver abort on an invalid encapsulation, matching the
-specification's HPKE setup and input-validation failure. In PSK mode the KEM
-secret and PSK are both inputs to the symbolic schedule. Distinct schedule
-outputs stand for HPKE record sequence 0, sequence 1, and the exporter secret;
-this captures their separation but not concrete HPKE counters, nonces, or byte
-encoding.
+Checked `KEM_DECAP?`, HKDF, and AEAD represent HPKE. PSK mode includes the KEM
+secret, PSK, client identity, version, device identity, and request identity.
+The three HKDF schedule outputs consistently denote the AEAD key, base nonce,
+and exporter root. Base, ordinary, and rotation setups use the same output
+positions; rotation discards the first two outputs. Exporter and response
+key/nonce labels remain distinct public constants.
 
-`CONCAT` is used for the specification's fixed-length `info`, PSK identity
-binding, and `response_salt` values. It is an injective symbolic tuple for the
-unambiguous fixed-width concatenation, not an extra cryptographic hash. Public
-labels remain public constants.
+AEAD has four explicit arguments: key, nonce, plaintext/ciphertext, and
+associated data. Records 0 and 1 share the AEAD key. The nonce for record 1 is
+represented by `CONCAT(base_nonce, record_sequence_one)`, a distinct, reversible
+symbolic term standing for the concrete fixed-width XOR with sequence one.
+It does **not** implement XOR algebra, nonce lengths, or HPKE counters. Responses
+use separately derived key and nonce arguments directly. `CONCAT` otherwise
+represents the specification's unambiguous fixed-width tuples.
 
-The response follows Section 8.2 as separate derivations: the HPKE exporter is
-derived under `response_label`, then `response_key` and `response_nonce` are
-derived by two HKDF calls under `response_key_label` and
-`response_nonce_label`. Verifpal's AEAD primitive has no nonce parameter, so
-`CONCAT(response_key, response_nonce)` is used as its symbolic key. This makes
-acceptance depend on both values but cannot analyze concrete nonce formatting
-or misuse.
+The generic KEM is an ideal encapsulation abstraction, not an implementation of
+DHKEM(X25519). Its [pinned primitive rules](https://github.com/symbolicsoft/verifpal/blob/035f11d0480674a519c4835c20438f7af24f2e92/src/primitive/spec.rs)
+allow a matching private key to recover both the modeled shared secret and the
+encapsulation seed. Consequently some automatic queries report seed disclosure
+under key substitution or device-key compromise. This does not mean a real
+X25519 sender private scalar is recoverable. No such claim is made here.
+The nonce-reuse rule is also pessimistic: it allows plaintext recovery and
+forgery after conflicting uses. It is a misuse detector, not an exact account
+of ChaCha20Poly1305 leakage.
 
-The pairing response is intentionally attacker-mutable. The two guarded SAS
-messages and checked assertions represent an honest bilateral out-of-band
-comparison. This is only the collision-free branch: the model does not prove
-the quantitative `10^-12` wrong-SAS bound in O02 and does not give secrecy to
-the displayed digits.
+Guarded SAS messages and checked assertions model the honest bilateral
+out-of-band comparison of the entire code. Hash collisions, decimal reduction,
+human behavior, and bounded attempt enforcement remain separate assumptions.
 
-## Limits on the interpretation
+## Interpretation limits
 
-- Positive `authentication?` results assume honest endpoints execute the
-  modeled roles and mean that the relay did not synthesize the accepted value
-  in the bounded experiment. They are context-possession results, not
-  endpoint-origin or non-repudiation proofs: either endpoint retaining a
-  request context can construct context-consistent records in either
-  direction.
-- Verifpal 1.3.2 authentication is injective agreement. At two or more
-  sessions, replaying one honestly sent tuple into a second role instance
-  breaks authentication even though the attacker forged no cryptographic
-  value. This is useful evidence that the stateless cryptographic core alone
-  does not provide the one-slot, one-effect, or idempotency rules in P08, X06,
-  and R01.
-- A `freshness?` result says the symbolic term depends on a generated fresh
-  atom. It can hold even while an entire fresh tuple is replayed, and does not
-  prove state uniqueness, response caching, or nonce-reuse discipline by
-  itself.
-- Verifpal has no mutable protocol state or conditional equivalence query.
-  Current/previous/candidate ordering, conditional adoption, overlap expiry,
-  fixed terminal responses, retained per-request contexts, rotation
-  idempotency, invalidation, and crash-safe atomic transitions therefore remain
-  outside these models. This includes P08, X06, the stateful parts of X07/X08,
-  and most of R01/R04/R05/R07--R09.
-- `negative_rotation_candidate_pre_gate.vp` is intentionally not counted as a
-  rotation failure. A relay can substitute a well-formed `rotation_enc` and
-  change the raw candidate, but the subsequent checked ordinary request then
-  fails. Verifpal cannot ask for candidate equivalence only on traces where
-  adoption succeeded; the positive rotation model queries agreement after the
-  gate, while Tamarin/ProVerif carry the conditional state claim.
-- `--auto-queries` was run over the six non-diagnostic models at one and two
-  sessions. It generated confidentiality queries for secret inputs,
-  authentication queries for received values used cryptographically, and
-  freshness queries for used wire values. It found the same two-session replay
-  boundary and the already advertised public, leaked, or pre-SAS values, but no
-  additional cryptographic confidentiality failure. Hand-written queries
-  remain authoritative because automatic queries do not generate equivalence,
-  unlinkability, or preconditioned properties.
-- `--saturate` stopped at two or three sessions for these models. It stops at
-  the first adjacent equal result code, at no more than four sessions, so this
-  is an inexpensive diagnostic rather than a proof of saturation. The fixed
-  1/2/4/8 matrix remains the stronger recorded bounded experiment.
-- The new `scenarios[]` peer-configuration axis was reviewed but is not added
-  to these models. The pairing model already exposes peer-key substitution and
-  checks the SAS gate directly; after activation, each model has a fixed peer
-  binding rather than a runtime peer parameter. Adding one would conflate the
-  cryptographic trace with binding lookup. Multiple-binding selection and
-  isolation are represented explicitly in the Tamarin state models instead.
-- Algorithms, exact lengths and parsing, X25519 validation details, concrete
-  probabilities, storage behavior, side channels, and implementation
-  conformance are the separate O01--O07 obligations, not conclusions of this
-  symbolic model.
+The stateless replicated roles can accept a complete request tuple in multiple
+instances. Request/completion injective authentication therefore fails from
+two sessions, while response authentication holds in the tested matrix.
+Plaintext equality queries can also fail when a different honest role instance
+produces a response for a replayed request. These are not forged AEAD records;
+Tamarin checks the retained-slot and binding state that these models omit.
+
+Automatic queries are diagnostics at the **first cryptographic use** of a
+value. An authentication/freshness failure for `response_random` can occur
+while computing the response salt, before the later checked response open.
+It is not an accepted response or confirmation failure. Likewise, pre-SAS
+application authentication and commitment replays precede SAS authorization.
+The exact generated query lists and verdicts are pinned alongside the explicit
+queries; their classification is in [RESULTS.md](RESULTS.md).
+
+A freshness query asks whether a term depends on fresh generation. It does not
+prove single acceptance, nonce uniqueness, persistence, or response caching.
+An equality of result codes at adjacent session counts is not a saturation
+proof; the runner uses explicit bounds instead of `--saturate` diagnostics.
+
+Current/previous/candidate ordering, fixed overlap deadlines, invalidation,
+cache compaction, rollback, and crash-safe storage are outside these models.
+Response and completion authentication means context possession, not signatures
+or non-repudiation. Primitive security, exact bytes, parsing, clocks, erasure,
+and implementation conformance remain O01--O08 in the shared ledger.
