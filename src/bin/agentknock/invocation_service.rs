@@ -271,7 +271,7 @@ pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if !quiet {
-                eprintln!("AGENTKNOCK: Git signing failed: {error}.");
+                eprintln!("AGENTKNOCK: Git signing failed: {error}");
             }
             ExitCode::FAILURE
         }
@@ -721,7 +721,7 @@ async fn handle_agent_connection(
                     Ok(signature) => crate::ssh_agent::signature_response(&signature),
                     Err(error) => {
                         if !context.quiet {
-                            print_message(format!("SSH authentication failed: {error}."));
+                            print_message(format!("SSH authentication failed: {error}"));
                         }
                         crate::ssh_agent::failure_response().to_vec()
                     }
