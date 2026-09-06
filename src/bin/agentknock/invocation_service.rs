@@ -271,7 +271,7 @@ pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if !quiet {
-                eprintln!("AGENTKNOCK: Git signing failed: {error}");
+                print_message(format_args!("Git signing failed: {error}"));
             }
             ExitCode::FAILURE
         }
