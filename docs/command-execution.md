@@ -117,7 +117,7 @@ The invocation request reports:
 - The SHA-256 executable hash, when the file is readable.
 - The connection type of standard input, output, and error.
 - A bounded chain of launcher executable paths.
-- The requested secret names and optional reason.
+- The requested secret names and optional explanation of why they are needed.
 - Environment-variable selection, omission, renaming, and standard-input
   routing requested for each secret.
 

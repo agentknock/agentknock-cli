@@ -37,19 +37,19 @@ const MAX_LAUNCHER_DEPTH: usize = 4;
 const RUN_EXAMPLES: &str = concat!(
     "Examples:\n",
     "  Use one secret:\n",
-    "    agentknock -s github -- gh issue list\n\n",
+    "    agentknock -s github \\\n      --reason \"GitHub token provides access to private repository issues\" \\\n      -- gh issue list\n\n",
     "  Use the explicit command form:\n",
-    "    agentknock run -s github -- gh issue list\n\n",
-    "  Use multiple secrets and explain why:\n",
-    "    agentknock -s github -s cloudflare --reason \"Deploy the release\" -- wrangler deploy\n\n",
+    "    agentknock run -s github \\\n      --reason \"GitHub token provides access to private repository issues\" \\\n      -- gh issue list\n\n",
+    "  Use multiple secrets:\n",
+    "    agentknock -s github -s cloudflare \\\n      --reason \"GitHub token for repository access; Cloudflare token for deployment access\" \\\n      -- ./release.sh\n\n",
     "  Select and rename an environment variable:\n",
-    "    agentknock -s github --only-env github GH_TOKEN --rename-env github GH_TOKEN GITHUB_TOKEN -- env\n\n",
+    "    agentknock -s github \\\n      --reason \"GitHub token authenticates the command's API requests\" \\\n      --only-env github GH_TOKEN --rename-env github GH_TOKEN GITHUB_TOKEN \\\n      -- ./command-expecting-github-token\n\n",
     "  Send one environment variable to standard input:\n",
-    "    agentknock -s password --only-env password PASSWORD --stdin password PASSWORD -- command-reading-a-password\n\n",
+    "    agentknock -s service-password \\\n      --reason \"Service password is required to authenticate the service account\" \\\n      --only-env service-password PASSWORD --stdin service-password PASSWORD \\\n      -- ./command-reading-a-password\n\n",
     "  Connect with an SSH secret:\n",
-    "    agentknock -s production-ssh -- ssh example.com\n\n",
-    "  Sign a Git commit with an SSH secret:\n",
-    "    agentknock -s git-signing -- git -c gpg.format=ssh commit -S -m \"Describe the change\"",
+    "    agentknock -s production-ssh \\\n      --reason \"SSH key is required to authenticate to example.com\" -- ssh example.com\n\n",
+    "  Sign a Git commit with Git configured for SSH signing:\n",
+    "    agentknock -s git-signing \\\n      --reason \"SSH key is required to sign the commit\" -- git commit",
 );
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -218,6 +218,9 @@ struct RunCommand {
     stdin: Option<Vec<String>>,
 
     /// Explain why the command needs the selected secrets.
+    ///
+    /// Describe the access or signing capability needed from each secret. The command and
+    /// arguments already describe the action.
     ///
     /// Agentknock sends this text unchanged to the device with the request.
     #[arg(
@@ -2367,14 +2370,12 @@ mod tests {
             "--secret",
             "cf-wrangler",
             "--reason",
-            "needed by the deployment agent",
+            "GitHub token for repository access; Cloudflare token for deployment access",
             "--no-ssh-passthrough",
             "--no-ssh-agent",
             "--no-git-sign",
             "--",
-            "sh",
-            "-c",
-            "printf '%s' \"$TOKEN\"",
+            "./release.sh",
         ])
         .unwrap();
 
@@ -2384,12 +2385,10 @@ mod tests {
                 Operation::Run {
                     secrets: secret_options(["cf-wrangler", "gh-token"]),
                     git_signing: false,
-                    reason: Some("needed by the deployment agent".into()),
+                    reason: Some("GitHub token for repository access; Cloudflare token for deployment access".into()),
                     ssh_agent: false,
                     ssh_passthrough: false,
-                    command: ["sh", "-c", "printf '%s' \"$TOKEN\""]
-                        .map(String::from)
-                        .to_vec(),
+                    command: vec!["./release.sh".into()],
                 },
                 OutputMode::Normal,
             )

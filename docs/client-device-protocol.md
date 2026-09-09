@@ -392,15 +392,15 @@ An `exec` request has this plaintext shape:
       }
     }
   },
-  "reason": "Publish the release",
+  "reason": "GitHub token for repository access; Cloudflare token for deployment access",
   "operation": {
     "type": "exec",
-    "command": "wrangler",
-    "arguments": ["deploy"],
+    "command": "./release.sh",
+    "arguments": [],
     "working_directory": "/work/project",
-    "executable_path": "/usr/bin/wrangler",
+    "executable_path": "/work/project/release.sh",
     "executable_hash": "base64 SHA-256 digest",
-    "executable_mode": "BINARY",
+    "executable_mode": "SCRIPT",
     "stdin": "TERMINAL",
     "stdout": "TERMINAL",
     "stderr": "TERMINAL"
@@ -434,10 +434,10 @@ Every present array is nonempty and contains unique names. A source named by
 must not be in `omit`. A source cannot be both renamed and sent to standard
 input. Environment options are invalid for other secret types.
 
-The optional `reason` is untrusted text supplied by the client. The
-`invocation_token` is a fresh 32-byte random value. The device associates it
-with the request identifier and selected secrets for later operations
-belonging to this invocation.
+The optional `reason` explains why the operation needs the selected secrets.
+It is untrusted text supplied by the client. The `invocation_token` is a fresh
+32-byte random value. The device associates it with the request identifier
+and selected secrets for later operations belonging to this invocation.
 
 For an `exec` operation:
 
