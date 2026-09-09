@@ -42,13 +42,13 @@ into a sandbox or privilege boundary.
 
 Agentknock selects its persistent directory from `--agentknock-home`, then
 `AGENTKNOCK_HOME`, then `$HOME/.agentknock`. It resolves the selected path at
-startup and sets `AGENTKNOCK_HOME` to that absolute path in the invocation
-service's environment, so deferred SSH and Git operations use the same pairing
-as the initial request. The option does not set or change `HOME` or
-`AGENTKNOCK_HOME` in the command's
-environment. Existing values are inherited and can be replaced by explicitly
-requested environment-secret delivery in the usual way. Temporary service
-directories are separate from this persistent directory.
+startup, requires valid UTF-8, and passes the absolute path as a string in the
+invocation service's startup JSON, so deferred SSH and Git operations use the
+same pairing as the initial request. The option does not set or change `HOME`
+or `AGENTKNOCK_HOME` in the command's environment. Existing values are inherited
+and can be replaced by explicitly requested environment-secret delivery in the
+usual way. Temporary service directories are separate from this persistent
+directory.
 
 `agentknock run` follows this sequence:
 

@@ -4,7 +4,7 @@ mod support;
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt as _,
+    os::unix::{ffi::OsStringExt as _, fs::PermissionsExt as _},
     process::{Command, Stdio},
     sync::mpsc,
     time::Duration,
@@ -153,6 +153,36 @@ fn invalid_or_unavailable_agentknock_home_never_uses_the_default_pairing() {
                 .unwrap()
                 .contains(&selected.display().to_string())
         );
+    }
+}
+
+#[test]
+fn rejects_non_utf8_home_paths_unless_overridden() {
+    let default = TestHome::active();
+    let invalid = std::ffi::OsString::from_vec(b"/invalid-home-\xff".to_vec());
+    for variable in ["AGENTKNOCK_HOME", "HOME"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+        command
+            .env_remove("AGENTKNOCK_HOME")
+            .env("HOME", default.path())
+            .env(variable, &invalid)
+            .args(["pairing", "status"]);
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("Agentknock home isn't valid UTF-8")
+        );
+
+        let output = command
+            .arg("--agentknock-home")
+            .arg(default.path().join(".agentknock"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"Pairing status: active.\n");
     }
 }
 

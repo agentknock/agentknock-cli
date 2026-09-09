@@ -68,7 +68,7 @@ const RUN_EXAMPLES: &str = concat!(
 struct Cli {
     /// Directory for Agentknock configuration and pairing state.
     ///
-    /// Overrides AGENTKNOCK_HOME, which must be a nonempty absolute path. Defaults to
+    /// Overrides AGENTKNOCK_HOME, which must be a nonempty absolute UTF-8 path. Defaults to
     /// $HOME/.agentknock when neither is set. Relative option paths are resolved against
     /// the current working directory. Does not change HOME or AGENTKNOCK_HOME for the
     /// wrapped command. Use the same directory for pairing and subsequent commands.

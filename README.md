@@ -171,7 +171,7 @@ detailed instructions.
 
 Agentknock stores pairing state in `$HOME/.agentknock/pairing.json`. If your
 execution environment needs another location, set `AGENTKNOCK_HOME` to a
-nonempty absolute directory path before pairing:
+nonempty absolute UTF-8 directory path before pairing:
 
 ```sh
 export AGENTKNOCK_HOME=/persist/agentknock

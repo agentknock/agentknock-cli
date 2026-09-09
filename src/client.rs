@@ -99,7 +99,7 @@ impl Client {
     /// Creates a client that uses the user's shared Agentknock state.
     ///
     /// Uses `AGENTKNOCK_HOME` when set, or `$HOME/.agentknock` otherwise.
-    /// `AGENTKNOCK_HOME` must be a nonempty absolute path. The directory is
+    /// `AGENTKNOCK_HOME` must be a nonempty absolute UTF-8 path. The directory is
     /// selected at construction and doesn't need to exist yet.
     ///
     /// # Errors
@@ -115,14 +115,14 @@ impl Client {
     /// Creates a client that uses `home` for configuration and pairing state.
     ///
     /// This overrides `AGENTKNOCK_HOME` and `HOME`. Relative paths are resolved
-    /// against the current working directory at construction. The directory
-    /// doesn't need to exist yet. Agentknock stores the pairing in
-    /// `pairing.json` inside it.
+    /// against the current working directory at construction. The resolved path
+    /// must be valid UTF-8. The directory doesn't need to exist yet. Agentknock
+    /// stores the pairing in `pairing.json` inside it.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigurationError::InvalidHome`] if the path is empty or
-    /// can't be resolved.
+    /// Returns [`ConfigurationError::InvalidHome`] if the path is empty,
+    /// can't be resolved, or the resolved path isn't valid UTF-8.
     pub fn new_in(
         application_info: ApplicationInfo,
         home: impl Into<PathBuf>,
@@ -130,6 +130,15 @@ impl Client {
         let home = home.into();
         let home = std::path::absolute(&home)
             .map_err(|source| ConfigurationError::InvalidHome { path: home, source })?;
+        if home.to_str().is_none() {
+            return Err(ConfigurationError::InvalidHome {
+                path: home,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Agentknock home isn't valid UTF-8",
+                ),
+            });
+        }
         Ok(Self {
             application_info,
             home,
@@ -263,12 +272,12 @@ mod tests {
     #[test]
     fn explicit_home_resolves_relative_paths_and_rejects_empty_paths() {
         let application = ApplicationInfo::new("test-application", "1.0.0");
-        let client = Client::new_in(application.clone(), "relative-agentknock-home").unwrap();
+        let client = Client::new_in(application.clone(), "relative-agentknock-homé").unwrap();
         assert_eq!(
             client.home(),
             std::env::current_dir()
                 .unwrap()
-                .join("relative-agentknock-home")
+                .join("relative-agentknock-homé")
         );
         assert!(matches!(
             Client::new_in(application, ""),
