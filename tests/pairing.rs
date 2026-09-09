@@ -4,7 +4,7 @@ mod support;
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt as _,
+    os::unix::{ffi::OsStringExt as _, fs::PermissionsExt as _},
     process::{Command, Stdio},
     sync::mpsc,
     time::Duration,
@@ -63,6 +63,7 @@ fn reports_local_pairing_status() {
     for (home, status, suggested_command) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
             .env("HOME", home.path())
+            .env_remove("AGENTKNOCK_HOME")
             .args(["pairing", "status"])
             .output()
             .unwrap();
@@ -86,6 +87,103 @@ fn reports_local_pairing_status() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_while_starting_pairing_discards_local_state() {
     cancel_start_pairing(false).await;
+}
+
+#[test]
+fn selects_agentknock_home_before_the_default_pairing() {
+    let default = TestHome::pending();
+    let selected = TestHome::active();
+    let selected_directory = selected.path().join(".agentknock");
+    let empty = TestHome::empty();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
+        .env("HOME", default.path())
+        .env("AGENTKNOCK_HOME", &selected_directory)
+        .args(["pairing", "status"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"Pairing status: active.\n");
+
+    command.env_remove("HOME");
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"Pairing status: active.\n");
+
+    command.arg("--agentknock-home").arg(empty.path());
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .starts_with("Pairing status: not paired.")
+    );
+
+    command.env("AGENTKNOCK_HOME", "invalid-relative-environment-path");
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .starts_with("Pairing status: not paired.")
+    );
+}
+
+#[test]
+fn invalid_or_unavailable_agentknock_home_never_uses_the_default_pairing() {
+    let default = TestHome::active();
+    let unavailable = default.path().join("not-a-directory");
+    fs::write(&unavailable, b"not a directory").unwrap();
+    for selected in [
+        std::path::Path::new(""),
+        std::path::Path::new("relative"),
+        &unavailable,
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+            .env("HOME", default.path())
+            .env("AGENTKNOCK_HOME", selected)
+            .args(["pairing", "remove", "--force"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(default.pairing_path().exists());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains(&selected.display().to_string())
+        );
+    }
+}
+
+#[test]
+fn rejects_non_utf8_home_paths_unless_overridden() {
+    let default = TestHome::active();
+    let invalid = std::ffi::OsString::from_vec(b"/invalid-home-\xff".to_vec());
+    for variable in ["AGENTKNOCK_HOME", "HOME"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+        command
+            .env_remove("AGENTKNOCK_HOME")
+            .env("HOME", default.path())
+            .env(variable, &invalid)
+            .args(["pairing", "status"]);
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("Agentknock home isn't valid UTF-8")
+        );
+
+        let output = command
+            .arg("--agentknock-home")
+            .arg(default.path().join(".agentknock"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"Pairing status: active.\n");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -147,6 +245,7 @@ async fn cancel_start_pairing(replace_pairing: bool) {
 
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["pairing", "start", "yup-its-free"])
         .stdout(Stdio::piped())
@@ -211,6 +310,7 @@ async fn pairing_finish_does_not_activate_a_replacement_pairing() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["pairing", "finish"])
         .output()
@@ -226,6 +326,15 @@ async fn pairing_finish_does_not_activate_a_replacement_pairing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starts_and_finishes_pairing_over_websockets() {
+    start_and_finish_pairing(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starts_and_finishes_pairing_in_a_custom_home_without_home_environment() {
+    start_and_finish_pairing(true).await;
+}
+
+async fn start_and_finish_pairing(custom_home: bool) {
     let home = TestHome::empty();
     let pairing_path = home.pairing_path();
     let device_private_key = home.device_private_key.clone();
@@ -455,12 +564,18 @@ async fn starts_and_finishes_pairing_over_websockets() {
     })
     .await;
 
-    let start = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+    let mut start = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    start
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
-        .args(["pairing", "start", "yup-its-free"])
-        .output()
-        .unwrap();
+        .args(["pairing", "start", "yup-its-free"]);
+    if custom_home {
+        start
+            .env_remove("HOME")
+            .env("AGENTKNOCK_HOME", home.path().join(".agentknock"));
+    }
+    let start = start.output().unwrap();
     assert!(
         start.status.success(),
         "{}",
@@ -483,12 +598,20 @@ async fn starts_and_finishes_pairing_over_websockets() {
         0o600
     );
 
-    let finish = Command::new(env!("CARGO_BIN_EXE_agentknock"))
+    let mut finish = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    finish
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
-        .args(["pairing", "finish"])
-        .output()
-        .unwrap();
+        .args(["pairing", "finish"]);
+    if custom_home {
+        finish
+            .env_remove("HOME")
+            .env("AGENTKNOCK_HOME", "invalid-relative-environment-path")
+            .current_dir(home.path())
+            .args(["--agentknock-home", ".agentknock"]);
+    }
+    let finish = finish.output().unwrap();
     assert!(
         finish.status.success(),
         "{}",
@@ -527,6 +650,7 @@ fn abort_pairing_removes_only_a_pending_pairing() {
     let home = TestHome::pending();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .args(["pairing", "abort"])
         .output()
         .unwrap();
@@ -600,6 +724,7 @@ async fn removes_pairing_after_an_authenticated_device_response() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["pairing", "remove"])
         .output()

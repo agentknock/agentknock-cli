@@ -160,7 +160,7 @@ impl Client {
         tokio::pin!(cancellation);
         progress(RequestProgress::Preparing);
         self.maybe_rotate_psk()?;
-        let pairing_path = self.pairing_path()?;
+        let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
         let plaintext = self
@@ -263,7 +263,7 @@ impl Client {
         tokio::pin!(cancellation);
         progress(RequestProgress::Preparing);
         self.maybe_rotate_psk()?;
-        let pairing_path = self.pairing_path()?;
+        let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
         let request_payload = UploadRequest {

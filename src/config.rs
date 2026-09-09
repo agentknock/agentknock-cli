@@ -210,9 +210,19 @@ impl Serialize for CanonicalUlid {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigurationError {
-    /// `HOME` wasn't set when the client selected its default state directory.
-    #[error("HOME isn't set")]
+    /// Neither `AGENTKNOCK_HOME` nor `HOME` was set when the client was created.
+    #[error("neither AGENTKNOCK_HOME nor HOME is set")]
     HomeNotSet,
+
+    /// The selected Agentknock home is invalid or couldn't be resolved.
+    #[error("couldn't use Agentknock home {path:?}: {source}")]
+    InvalidHome {
+        /// The selected directory.
+        path: PathBuf,
+        /// The reason the directory couldn't be selected.
+        #[source]
+        source: io::Error,
+    },
 
     /// Agentknock couldn't access a pairing file or its parent directory.
     #[error("couldn't access pairing file {path}: {source}")]

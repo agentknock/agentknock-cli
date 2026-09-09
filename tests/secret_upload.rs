@@ -110,6 +110,7 @@ async fn uploads_an_environment_secret_from_multiple_sources() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("FROM_PROCESS", "process value")
         .args([
@@ -241,6 +242,7 @@ async fn uploads_an_ssh_private_key(passphrase: Option<&str>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
     command
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "secret",
@@ -283,6 +285,7 @@ fn rejects_an_encrypted_ssh_private_key_without_a_passphrase_source() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .args([
             "secret",
             "upload",
@@ -324,6 +327,7 @@ fn explains_how_to_convert_a_legacy_pem_ssh_private_key() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .args([
             "secret",
             "upload",
@@ -401,6 +405,7 @@ async fn updates_an_environment_variable_from_standard_input() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "secret",
@@ -490,6 +495,7 @@ async fn reports_a_rejected_secret_upload() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("TOKEN", "must not appear")
         .args(["secret", "upload", "rejected", "--from-env", "TOKEN"])
@@ -508,6 +514,7 @@ fn rejects_multiple_standard_input_sources_before_connecting() {
     let home = TestHome::active();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .args([
             "secret",
             "upload",
@@ -535,6 +542,7 @@ fn does_not_print_a_secret_from_an_invalid_environment_file() {
     fs::write(&environment_path, "TOKEN='do-not-print-this\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .args([
             "secret",
             "upload",

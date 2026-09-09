@@ -51,6 +51,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize, Serialize)]
 struct StartupRequest {
+    agentknock_home: PathBuf,
     owner_pid: libc::pid_t,
     invocation_id: String,
     invocation_token: String,
@@ -280,6 +281,7 @@ pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
 
 impl InvocationService {
     pub fn start(
+        agentknock_home: &Path,
         invocation: &SecretUseInvocation,
         ssh: Option<&SshSecretUse>,
         stdin: Option<&str>,
@@ -300,6 +302,7 @@ impl InvocationService {
 
         match initialize(
             &mut process,
+            agentknock_home,
             invocation,
             ssh,
             stdin,
@@ -401,6 +404,7 @@ impl InvocationService {
 
 fn initialize(
     process: &mut Child,
+    agentknock_home: &Path,
     invocation: &SecretUseInvocation,
     ssh: Option<&SshSecretUse>,
     stdin: Option<&str>,
@@ -409,6 +413,7 @@ fn initialize(
 ) -> io::Result<(Option<PathBuf>, Option<ChildStdout>)> {
     let has_stdin = stdin.is_some();
     let request = StartupRequest {
+        agentknock_home: agentknock_home.to_owned(),
         // SAFETY: getpid has no preconditions.
         owner_pid: unsafe { libc::getpid() },
         invocation_id: invocation.id().to_owned(),
@@ -451,6 +456,11 @@ fn initialize(
 
 fn prepare() -> io::Result<PreparedService> {
     let request = read_request()?;
+    let client = Client::new_in(
+        ApplicationInfo::new("agentknock", env!("CARGO_PKG_VERSION")),
+        request.agentknock_home,
+    )
+    .map_err(io::Error::other)?;
     let token = BASE64_STANDARD
         .decode(&request.invocation_token)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -553,10 +563,7 @@ fn prepare() -> io::Result<PreparedService> {
         runtime_directory: path,
         stdin: request.stdin,
         context: ServiceContext {
-            client: Client::new(ApplicationInfo::new(
-                "agentknock",
-                env!("CARGO_PKG_VERSION"),
-            )),
+            client,
             owner_pid: request.owner_pid,
             invocation_id: request.invocation_id,
             invocation_token,

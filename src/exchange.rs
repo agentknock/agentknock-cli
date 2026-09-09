@@ -24,7 +24,7 @@ impl Client {
     ) -> Result<T, RequestError> {
         tokio::pin!(cancellation);
         self.maybe_rotate_psk()?;
-        let pairing_path = self.pairing_path()?;
+        let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
         let plaintext = self.encode(payload).map_err(RequestError::other)?;
         let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
