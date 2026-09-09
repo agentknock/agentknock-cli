@@ -84,7 +84,7 @@ impl Client {
             ));
         }
         progress(RequestProgress::Preparing);
-        let pairing_path = self.pairing_path()?;
+        let pairing_path = self.pairing_path();
         ensure_pairing_absent(&pairing_path)?;
         let client_secret = generate_client_secret().map_err(RequestError::other)?;
         let commitment = derive_pairing_commitment(&client_secret).map_err(RequestError::other)?;
@@ -182,7 +182,7 @@ impl Client {
     {
         tokio::pin!(cancellation);
         progress(RequestProgress::Preparing);
-        let pairing_path = self.pairing_path()?;
+        let pairing_path = self.pairing_path();
         let pairing = read_pending_pairing(&pairing_path)?;
         let request_id = Ulid::generate();
         let plaintext = self
@@ -260,7 +260,7 @@ impl Client {
     /// [`ConfigurationError::PairingNotPending`] if the pairing is active, or
     /// another configuration error if the pending state can't be removed.
     pub fn abort_pairing(&self) -> Result<(), ConfigurationError> {
-        abort_pending_pairing(&self.pairing_path()?, None)
+        abort_pending_pairing(&self.pairing_path(), None)
     }
 
     /// Deletes the local pairing without contacting the device.
@@ -274,7 +274,7 @@ impl Client {
     /// Returns a configuration error if no local pairing exists or the pairing
     /// file can't be removed.
     pub fn force_remove_pairing(&self) -> Result<(), ConfigurationError> {
-        remove_pairing_file(&self.pairing_path()?)
+        remove_pairing_file(&self.pairing_path())
     }
 
     /// Removes an active pairing from both the device and this client.
@@ -303,9 +303,7 @@ impl Client {
     {
         tokio::pin!(cancellation);
         progress(RequestProgress::Preparing);
-        let pairing_path = self
-            .pairing_path()
-            .map_err(PairingRemoveError::Configuration)?;
+        let pairing_path = self.pairing_path();
         let pairing =
             read_pairing_from(&pairing_path).map_err(PairingRemoveError::Configuration)?;
         let device_id = pairing.device_id_bytes();
@@ -383,7 +381,7 @@ where
 
 impl Client {
     pub(crate) fn maybe_rotate_psk(&self) -> Result<bool, RequestError> {
-        maybe_rotate_psk_at(&self.pairing_path()?, current_timestamp()?)
+        maybe_rotate_psk_at(&self.pairing_path(), current_timestamp()?)
     }
 }
 

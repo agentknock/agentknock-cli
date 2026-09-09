@@ -47,6 +47,7 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": owner.0.id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -184,6 +185,7 @@ fn exposes_the_selected_key_through_ssh_auth_sock() {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -224,6 +226,7 @@ fn does_not_create_an_ssh_agent_when_unused() {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -251,6 +254,7 @@ fn does_not_create_git_signing_endpoints_when_disabled() {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -278,6 +282,7 @@ fn serves_agent_and_helper_connections_concurrently() {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -347,6 +352,7 @@ fn streams_standard_input_without_an_ssh_runtime_directory() {
     serde_json::to_writer(
         service.0.stdin.take().unwrap(),
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -375,6 +381,7 @@ fn serves_ssh_while_streaming_large_standard_input() {
     serde_json::to_writer(
         service.0.stdin.take().unwrap(),
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -452,6 +459,7 @@ fn checks_git_signing_key_passthrough(ssh_agent: bool, ssh_passthrough: bool) {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -551,6 +559,7 @@ fn start_ready_service(mut command: Command) -> (ChildGuard, PathBuf) {
     let response = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(b"/unused-agentknock-home"),
             "owner_pid": std::process::id(),
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,
@@ -644,11 +653,13 @@ fn signature_service(
     let mut command = service_command();
     command
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay);
     let mut service = ChildGuard(command.spawn().unwrap());
     let ready = send_startup(
         &mut service.0,
         &json!({
+            "agentknock_home": BASE64_STANDARD.encode(home.path().join(".agentknock").as_os_str().as_bytes()),
             "owner_pid": owner_pid,
             "invocation_id": "01K00000000000000000000000",
             "invocation_token": STARTUP,

@@ -355,6 +355,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
     command
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", &relay_url)
         .env("SSH_AUTH_SOCK", &upstream_socket)
         .args(["run", "-s", "ssh-login"]);
@@ -451,6 +452,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         .join(" ");
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("SSH_AUTH_SOCK", upstream_socket)
         .args(["run", "-s", "ssh-login", "--", "git", "-C"])
@@ -477,28 +479,34 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ed25519_secret() {
-    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], true).await;
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_rsa_secret() {
-    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"], true).await;
+    signs_a_git_commit_with_an_ssh_secret("rsa", &["-b", "3072"], true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_with_an_ecdsa_secret() {
-    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"], true).await;
+    signs_a_git_commit_with_an_ssh_secret("ecdsa", &["-b", "256"], true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signs_a_git_commit_without_providing_an_ssh_agent() {
-    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], false).await;
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_signing_uses_the_explicit_home_despite_conflicting_environment() {
+    signs_a_git_commit_with_an_ssh_secret("ed25519", &[], true, true).await;
 }
 
 async fn signs_a_git_commit_with_an_ssh_secret(
     key_type: &str,
     key_options: &[&str],
     ssh_agent: bool,
+    custom_home: bool,
 ) {
     let home = TestHome::active();
     let repository = home.path().join("repository");
@@ -721,11 +729,20 @@ async fn signs_a_git_commit_with_an_ssh_secret(
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
     command
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("TMPDIR", temporary_directory)
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "git-signing"]);
     if !ssh_agent {
         command.arg("--no-ssh-agent");
+    }
+    if custom_home {
+        let selected_home = home.path().join("custom home");
+        fs::rename(home.path().join(".agentknock"), &selected_home).unwrap();
+        command
+            .env("AGENTKNOCK_HOME", home.path().join("wrong pairing"))
+            .current_dir(home.path())
+            .args(["--agentknock-home", "custom home"]);
     }
     let output = command
         .args(["--", "git", "-C"])
@@ -1056,6 +1073,7 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "-s",
@@ -1083,6 +1101,84 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
     );
     assert_eq!(output.stderr, b"");
     server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_home_preserves_the_child_environment_with_a_read_only_home() {
+    for (use_option, inherit_override) in [(false, true), (true, false), (true, true)] {
+        let pairing = TestHome::active();
+        let selected_home = pairing.path().join(".agentknock");
+        let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let device_private_key = pairing.device_private_key.clone();
+        let (relay_url, server) = websocket_server(move |listener| async move {
+            let (_, mut socket) = accept(&listener).await;
+            let request = receive_json(&mut socket).await;
+            let (mut context, key, _) = open_request(
+                &device_private_key,
+                request["request_id"].as_str().unwrap(),
+                &request["payload"],
+            );
+            send_json(&mut socket, json!({
+                "type": "message", "client_id": request["client_id"],
+                "request_id": request["request_id"], "kind": "response",
+                "payload": encrypt_response(&context, &key, &approved_environment("test", serde_json::Map::new())),
+            })).await;
+            assert_eq!(receive_json(&mut socket).await["kind"], "response");
+            let completion = receive_json(&mut socket).await;
+            assert_eq!(open_completion(&mut context, &completion["payload"])["result"], "APPROVED");
+            send_json(&mut socket, json!({
+                "type": "ack", "client_id": request["client_id"],
+                "request_id": request["request_id"], "kind": "completion",
+            })).await;
+        }).await;
+
+        let inherited_home = if use_option {
+            pairing.path().join("another pairing")
+        } else {
+            selected_home.clone()
+        };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+        command
+            .env("HOME", home.path())
+            .env_remove("AGENTKNOCK_HOME")
+            .env("AGENTKNOCK_TEST_RELAY_URL", relay_url);
+        if inherit_override {
+            command.env("AGENTKNOCK_HOME", &inherited_home);
+        }
+        if use_option {
+            command.arg("--agentknock-home").arg(&selected_home);
+        }
+        let output = command
+            .args([
+                "-s",
+                "test",
+                "--reason",
+                "Check inherited home directories",
+                "--",
+                "sh",
+                "-c",
+                "printf '%s\\n%s\\n' \"$HOME\" \"${AGENTKNOCK_HOME-unset}\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected_override = if inherit_override {
+            inherited_home.display().to_string()
+        } else {
+            "unset".into()
+        };
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n{expected_override}\n", home.path().display())
+        );
+        assert!(!home.path().join(".agentknock").exists());
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1184,6 +1280,7 @@ async fn selects_renames_omits_and_pipes_environment_values() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
     command
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "-s",
@@ -1309,6 +1406,7 @@ async fn reports_and_executes_a_shebang_script() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "test", "--", script.to_str().unwrap()])
         .output()
@@ -1396,6 +1494,7 @@ async fn replace_selected_native_file_after_approval() -> std::process::Output {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .env("PATH", home.path())
         .arg("run")
@@ -1490,6 +1589,7 @@ async fn restores_sigpipe_before_executing_the_command() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args([
             "run",
@@ -1578,6 +1678,7 @@ fn rejects_a_missing_command_before_sending_an_invocation() {
     let home = TestHome::active();
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", "ws://127.0.0.1:1")
         .args([
             "run",
@@ -1685,6 +1786,7 @@ async fn resends_the_exact_request_when_the_connection_closes_before_ack() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "github", "--", "env"])
         .output()
@@ -1792,6 +1894,7 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "github", "--", "env"])
         .output()
@@ -1851,6 +1954,7 @@ async fn signal_before_response_sends_an_aborted_completion() {
 
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "github", "--", "env"])
         .stdout(Stdio::piped())
@@ -1937,6 +2041,7 @@ async fn relay_errors_retry_the_exact_request_and_completion() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["-s", "test", "--quiet", "--", "true"])
         .output()
@@ -1993,6 +2098,7 @@ async fn relay_rejection_still_attempts_an_aborted_completion() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["-s", "test", "--", "echo", "must not run"])
         .output()
@@ -2081,6 +2187,7 @@ async fn check_aborted_response(
 
     let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "github", "--", "env"])
         .output()
@@ -2161,6 +2268,7 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
 
     let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
         .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
         .args(["run", "-s", "github", "--", "env"])
         .stdout(Stdio::piped())
@@ -2233,6 +2341,7 @@ async fn cancellation_bounds_the_entire_completion_handoff() {
         let mut child = ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_agentknock"))
                 .env("HOME", home.path())
+                .env_remove("AGENTKNOCK_HOME")
                 .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
                 .args(["-s", "test", "--", "env"])
                 .stdout(Stdio::piped())

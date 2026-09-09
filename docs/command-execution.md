@@ -40,6 +40,15 @@ into a sandbox or privilege boundary.
 
 ## Common execution semantics
 
+Agentknock selects its persistent directory from `--agentknock-home`, then
+`AGENTKNOCK_HOME`, then `$HOME/.agentknock`. It resolves the selected path at
+startup and passes that absolute path to the invocation service, so deferred
+SSH and Git operations use the same pairing as the initial request. The
+option does not set or change `HOME` or `AGENTKNOCK_HOME` in the command's
+environment. Existing values are inherited and can be replaced by explicitly
+requested environment-secret delivery in the usual way. Temporary service
+directories are separate from this persistent directory.
+
 `agentknock run` follows this sequence:
 
 1. Capture the working directory and executable search path.

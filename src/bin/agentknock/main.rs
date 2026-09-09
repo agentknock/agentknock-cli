@@ -60,12 +60,21 @@ const RUN_EXAMPLES: &str = concat!(
     long_about = "Pair this client with a device, run commands with selected secrets, list available secrets, and upload secrets for review on the device.\n\nTo run a command, put the run options directly after `agentknock`, followed by `--` and the command. You can also use the explicit `agentknock run` form.\n\nBefore you use or manage secrets, run `agentknock pairing start` and `agentknock pairing finish` to pair this client. Commands that wait for the device report their progress every 30 seconds. All command-line arguments must be valid UTF-8.",
     max_term_width = 120,
     arg_required_else_help = true,
-    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
     disable_help_subcommand = true,
     propagate_version = true,
     after_long_help = RUN_EXAMPLES
 )]
 struct Cli {
+    /// Directory for Agentknock configuration and pairing state.
+    ///
+    /// Overrides AGENTKNOCK_HOME, which must be a nonempty absolute path. Defaults to
+    /// $HOME/.agentknock when neither is set. Relative option paths are resolved against
+    /// the current working directory. Does not change HOME or AGENTKNOCK_HOME for the
+    /// wrapped command. Use the same directory for pairing and subsequent commands.
+    #[arg(long, global = true, value_name = "PATH", value_parser = parse_path)]
+    agentknock_home: Option<PathBuf>,
+
     #[command(flatten)]
     run: RunCommand,
 
@@ -145,7 +154,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Args, PartialEq, Eq)]
+#[derive(Debug, Default, Args, PartialEq, Eq)]
 struct RunCommand {
     /// Name of a secret to use for the command.
     ///
@@ -671,6 +680,7 @@ impl Cli {
     fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
         match self.command {
             None => self.run.into_operation(),
+            Some(_) if self.run != RunCommand::default() => Err(RunOptionsError::Subcommand),
             Some(command) => command.into_operation(),
         }
     }
@@ -788,6 +798,8 @@ impl RunCommand {
 
 #[derive(Debug, Error)]
 enum RunOptionsError {
+    #[error("run options cannot precede a subcommand")]
+    Subcommand,
     #[error("secret {0:?} was specified more than once")]
     DuplicateSecret(String),
     #[error("{0}")]
@@ -876,6 +888,7 @@ fn main() -> ExitCode {
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
     let cli = Cli::parse_from(arguments);
+    let agentknock_home = cli.agentknock_home.clone();
     let (operation, output) = match cli.into_operation() {
         Ok(operation) => operation,
         Err(error) => {
@@ -883,7 +896,28 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(operation, output).await {
+    let application = ApplicationInfo::new("agentknock", env!("CARGO_PKG_VERSION"));
+    let client = match agentknock_home {
+        Some(home) => Client::new_in(application, home),
+        None => Client::new(application),
+    };
+    let client = match client {
+        Ok(client) => client,
+        Err(error) => {
+            if output != OutputMode::Quiet {
+                if matches!(operation, Operation::Run { .. }) {
+                    print_run_configuration_error(&error);
+                } else {
+                    print_plain_error(format_args!(
+                        "Agentknock couldn't select its home directory: {error}"
+                    ));
+                    print_plain_configuration_action(&error);
+                }
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    match run(&client, operation, output).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             print_command_error(&error, output);
@@ -892,11 +926,11 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
     }
 }
 
-async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandError> {
-    let client = Client::new(ApplicationInfo::new(
-        "agentknock",
-        env!("CARGO_PKG_VERSION"),
-    ));
+async fn run(
+    client: &Client,
+    operation: Operation,
+    output: OutputMode,
+) -> Result<(), CommandError> {
     match operation {
         Operation::Run {
             secrets,
@@ -944,7 +978,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             };
             let mut signals = CommandSignals::new().map_err(CommandError::RunSignal)?;
             let secret_use_output =
-                request_run_secrets(&client, request, output, &mut signals).await?;
+                request_run_secrets(client, request, output, &mut signals).await?;
             let upstream_agent_socket = if ssh_passthrough && (ssh_agent || git_signing) {
                 secret_use_output
                     .environment_variable("SSH_AUTH_SOCK")
@@ -962,6 +996,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 if service_ssh.is_some() || secret_use_output.stdin_value().is_some() {
                     Some(
                         invocation_service::InvocationService::start(
+                            client.home(),
                             secret_use_output.invocation(),
                             service_ssh,
                             secret_use_output.stdin_value(),
@@ -1033,7 +1068,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                 })?;
         }
         Operation::StartPairing(address) => {
-            let sas = start_pairing_for_cli(&client, &address)
+            let sas = start_pairing_for_cli(client, &address)
                 .await
                 .map_err(CommandError::StartPairing)?;
             print_start_pairing_success(&sas);
@@ -1045,7 +1080,7 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
             print_pairing_status(status);
         }
         Operation::FinishPairing => {
-            finish_pairing_for_cli(&client)
+            finish_pairing_for_cli(client)
                 .await
                 .map_err(CommandError::FinishPairing)?;
             println!("Pairing complete. Agentknock is ready to run commands with secrets.");
@@ -1061,21 +1096,21 @@ async fn run(operation: Operation, output: OutputMode) -> Result<(), CommandErro
                     .map_err(CommandError::ForceRemovePairing)?;
                 println!("Local pairing removed. The pairing on the device is unchanged.");
             } else {
-                remove_pairing_for_cli(&client)
+                remove_pairing_for_cli(client)
                     .await
                     .map_err(CommandError::RemovePairing)?;
                 println!("Pairing removed from this client and the device.");
             }
         }
         Operation::ListSecrets => {
-            let secrets = list_secrets_for_cli(&client)
+            let secrets = list_secrets_for_cli(client)
                 .await
                 .map_err(CommandError::ListSecrets)?;
             print_secrets(&secrets);
         }
         Operation::UploadSecret(command) => {
             let (secret, mode) = read_secret(command).map_err(CommandError::SecretInput)?;
-            upload_secret_for_cli(&client, &secret, mode)
+            upload_secret_for_cli(client, &secret, mode)
                 .await
                 .map_err(CommandError::UploadSecret)?;
             println!("Secret upload {:?} delivered to the device.", secret.name());
@@ -1823,12 +1858,14 @@ fn print_run_configuration_error(error: &ConfigurationError) {
             print_message("Suggested action: Run:");
             print_message(format_args!("chmod 600 {path:?}"));
         }
-        ConfigurationError::HomeNotSet => {
-            print_message(
-                "The HOME environment variable isn't set, so Agentknock can't find the pairing file.",
-            );
+        ConfigurationError::HomeNotSet | ConfigurationError::InvalidHome { .. } => {
+            print_message(format_args!(
+                "Agentknock couldn't select its home directory: {error}"
+            ));
             print_message("The command didn't run.");
-            print_message("Suggested action: Set HOME to your home directory.");
+            print_message(
+                "Suggested action: Use --agentknock-home or set AGENTKNOCK_HOME to an absolute directory path.",
+            );
         }
         ConfigurationError::Invalid { path, source } => {
             print_message(format_args!("Pairing file {path:?} isn't valid: {source}"));
@@ -2072,8 +2109,10 @@ fn print_plain_configuration_action(error: &ConfigurationError) {
             print_plain_error("Suggested action: Run:");
             print_plain_error(format_args!("chmod 600 {path:?}"));
         }
-        ConfigurationError::HomeNotSet => {
-            print_plain_error("Suggested action: Set HOME to your home directory.");
+        ConfigurationError::HomeNotSet | ConfigurationError::InvalidHome { .. } => {
+            print_plain_error(
+                "Suggested action: Use --agentknock-home or set AGENTKNOCK_HOME to an absolute directory path.",
+            );
         }
         ConfigurationError::InvalidSystemTime(_) => {
             print_plain_error("Suggested action: Correct the system clock.");
@@ -2249,6 +2288,72 @@ mod tests {
             .into_iter()
             .map(|name| (name.into(), SecretUseOptions::default()))
             .collect()
+    }
+
+    #[test]
+    fn agentknock_home_is_global_and_stops_at_the_command_separator() {
+        for command in [
+            vec!["pairing", "status"],
+            vec!["secret", "list"],
+            vec!["run", "-s", "github", "--", "true"],
+            vec!["-s", "github", "--", "true"],
+        ] {
+            let arguments = [
+                vec!["agentknock", "--agentknock-home", "selected-home"],
+                command,
+            ]
+            .concat();
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert_eq!(cli.agentknock_home, Some("selected-home".into()));
+            assert!(cli.into_operation().is_ok());
+        }
+        let cli = Cli::try_parse_from([
+            "agentknock",
+            "pairing",
+            "status",
+            "--agentknock-home",
+            "selected-home",
+        ])
+        .unwrap();
+        assert_eq!(cli.agentknock_home, Some("selected-home".into()));
+
+        let cli = Cli::try_parse_from([
+            "agentknock",
+            "-s",
+            "github",
+            "--",
+            "tool",
+            "--agentknock-home",
+            "child-home",
+        ])
+        .unwrap();
+        assert!(cli.agentknock_home.is_none());
+        let (Operation::Run { command, .. }, _) = cli.into_operation().unwrap() else {
+            panic!("expected run operation");
+        };
+        assert_eq!(command, ["tool", "--agentknock-home", "child-home"]);
+        assert!(
+            Cli::try_parse_from(["agentknock", "--agentknock-home", "", "pairing", "status"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_run_options_before_a_subcommand() {
+        for command in [
+            vec!["pairing", "status"],
+            vec!["secret", "list"],
+            vec!["run", "-s", "github", "--", "true"],
+        ] {
+            for option in [vec!["--quiet"], vec!["-s", "github"]] {
+                let arguments = [vec!["agentknock"], option, command.clone()].concat();
+                let cli = Cli::try_parse_from(arguments).unwrap();
+                assert!(matches!(
+                    cli.into_operation(),
+                    Err(super::RunOptionsError::Subcommand)
+                ));
+            }
+        }
     }
 
     #[test]

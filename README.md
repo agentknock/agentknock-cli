@@ -167,6 +167,35 @@ Agentknock includes its complete command-line reference in `--help`. Run
 `agentknock --help` for an overview, or use `--help` with any command for
 detailed instructions.
 
+### Choose the Agentknock directory
+
+Agentknock stores pairing state in `$HOME/.agentknock/pairing.json`. If your
+execution environment needs another location, set `AGENTKNOCK_HOME` to a
+nonempty absolute directory path before pairing:
+
+```sh
+export AGENTKNOCK_HOME=/persist/agentknock
+```
+
+Use the same directory for pairing and subsequent commands. It must remain
+writable because Agentknock updates the pairing keys during use. Selecting
+another directory does not copy or move an existing pairing.
+
+The global `--agentknock-home` option overrides the environment variable for
+one command. Relative option paths are resolved against the current working
+directory:
+
+```sh
+agentknock --agentknock-home /persist/agentknock \
+  -s gh-token --reason "Review open issues" -- gh issue list
+```
+
+Neither setting changes the wrapped command's `HOME`. An existing
+`AGENTKNOCK_HOME` is inherited normally; the option does not set or change it
+for the wrapped command. With either override, Agentknock does not require
+`HOME` and does not fall back to another directory if the selected location
+is unusable.
+
 ### Pair the client
 
 Use the pairing address that you selected when you set up the mobile app. For
