@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/agentknock/agentknock-cli/compare/v0.4.1...v0.5.0) - 2026-09-09
+
+### Added
+
+- support a configurable Agentknock home
+
+### Fixed
+
+- require UTF-8 Agentknock home paths
+- prefix every line of Git signing errors
+- preserve punctuation in error messages
+- complete canceled and invalid exchanges consistently
+- preserve replacement pairings during delayed operations
+- explain legacy PEM key conversion
+
+### Other
+
+- pass Agentknock home through the service environment
+- show reasons and configured signing in README examples
+- cover relay errors across approval exchanges
+- borrow invocation service state for connection handlers
+- share approval exchanges for commands and signing
+- unify request progress and CLI reporting
+- simplify run validation and descriptor ownership
+- centralize relay frame errors and remove unused state
+- share pairing file reads and atomic writes
+- use request errors for PSK rotation
+- *(deps)* update dependencies and pinned build tools
+
 ## [0.4.1](https://github.com/agentknock/agentknock-cli/compare/v0.4.0...v0.4.1) - 2026-09-02
 
 ### Added
