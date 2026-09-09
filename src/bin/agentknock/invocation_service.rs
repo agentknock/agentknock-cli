@@ -51,7 +51,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize, Serialize)]
 struct StartupRequest {
-    agentknock_home: String,
     owner_pid: libc::pid_t,
     invocation_id: String,
     invocation_token: String,
@@ -294,6 +293,7 @@ impl InvocationService {
         let executable = std::env::current_exe()?;
         let mut process = Command::new(executable)
             .arg(INTERNAL_ARGUMENT)
+            .env("AGENTKNOCK_HOME", agentknock_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -302,7 +302,6 @@ impl InvocationService {
 
         match initialize(
             &mut process,
-            agentknock_home,
             invocation,
             ssh,
             stdin,
@@ -404,7 +403,6 @@ impl InvocationService {
 
 fn initialize(
     process: &mut Child,
-    agentknock_home: &Path,
     invocation: &SecretUseInvocation,
     ssh: Option<&SshSecretUse>,
     stdin: Option<&str>,
@@ -413,7 +411,6 @@ fn initialize(
 ) -> io::Result<(Option<PathBuf>, Option<ChildStdout>)> {
     let has_stdin = stdin.is_some();
     let request = StartupRequest {
-        agentknock_home: BASE64_STANDARD.encode(agentknock_home.as_os_str().as_bytes()),
         // SAFETY: getpid has no preconditions.
         owner_pid: unsafe { libc::getpid() },
         invocation_id: invocation.id().to_owned(),
@@ -456,18 +453,10 @@ fn initialize(
 
 fn prepare() -> io::Result<PreparedService> {
     let request = read_request()?;
-    let home = BASE64_STANDARD
-        .decode(&request.agentknock_home)
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid Agentknock home: {error}"),
-            )
-        })?;
-    let client = Client::new_in(
-        ApplicationInfo::new("agentknock", env!("CARGO_PKG_VERSION")),
-        PathBuf::from(OsString::from_vec(home)),
-    )
+    let client = Client::new(ApplicationInfo::new(
+        "agentknock",
+        env!("CARGO_PKG_VERSION"),
+    ))
     .map_err(io::Error::other)?;
     let token = BASE64_STANDARD
         .decode(&request.invocation_token)
