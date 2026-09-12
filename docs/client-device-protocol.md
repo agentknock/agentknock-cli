@@ -448,6 +448,11 @@ For an `exec` operation:
 - `executable_hash` is optional. When present, it is the Base64 encoding of a
   32-byte SHA-256 digest of the selected top-level executable.
 - `executable_mode` is `BINARY` or `SCRIPT`.
+- `script_contents` is an optional string, valid only for `SCRIPT` executables.
+  It contains the entire selected script, including the shebang line, decoded
+  as UTF-8 with invalid sequences replaced by U+FFFD (`�`). `executable_hash`
+  identifies the original file bytes, which may differ from the UTF-8 encoding
+  of this string.
 - `stdin`, `stdout`, and `stderr` are `TERMINAL`, `NULL_DEVICE`, `PIPE`,
   `SOCKET`, `REGULAR_FILE`, or `UNKNOWN`.
 - `launcher_chain` contains up to four client-reported executable paths, from

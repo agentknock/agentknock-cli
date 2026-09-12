@@ -260,6 +260,28 @@ The request identifies a detected shebang file as a script and another file as
 a binary. It includes the standard Base64 encoding of the 32-byte digest when
 hashing succeeds.
 
+For a detected shebang script, that same read also captures its entire source
+when the file is no larger than 16 KiB. The invocation includes it as the
+optional string `script_contents`, decoded as UTF-8 with invalid sequences
+replaced by U+FFFD (`�`). Larger scripts omit the field instead of sending
+partial contents. The hash and execution always use the original file bytes,
+not the potentially lossy review text. The capture limit applies before text
+conversion, bounds retained source memory, and leaves room for conversion,
+JSON escaping, and encryption encoding within the 256 KiB frame limit. The
+existing total-frame size check still applies.
+
+Capture applies to the selected executable only. Running `./script.py` with a
+shebang includes that file; running `python script.py` selects the interpreter
+and does not discover scripts from its arguments. Agentknock does not collect
+imports or other runtime dependencies.
+
+The source is sent to the device before approval and may contain embedded
+credentials or other sensitive information. A device that includes this field
+in AI review also sends it to the review service. Source is untrusted review
+evidence; comments and strings do not authorize secret use. Supporting devices
+can reuse the stored invocation source in existing parent review context for
+later signatures without adding it to those client requests.
+
 An execute-only file might not be readable. In that case, Agentknock omits the
 hash and treats the target as a binary. If the kernel cannot execute it through
 the retained descriptor, execution fails without a pathname or shell fallback.
