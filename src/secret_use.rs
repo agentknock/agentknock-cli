@@ -32,7 +32,7 @@ pub struct SecretUseRequest<'a> {
     /// The operation that will receive or use the selected secrets.
     pub operation: SecretUseOperation<'a>,
 
-    /// An optional explanation shown with the request.
+    /// An optional explanation of why the operation needs each selected secret.
     ///
     /// Agentknock transmits this value unchanged.
     pub reason: Option<&'a str>,
@@ -406,7 +406,7 @@ impl Client {
     ///         stdout: StreamKind::Terminal,
     ///         stderr: StreamKind::Terminal,
     ///     },
-    ///     reason: Some("Review open issues"),
+    ///     reason: Some("GitHub token provides access to private repository issues"),
     ///     launcher_chain: &launcher_chain,
     /// };
     ///

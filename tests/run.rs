@@ -970,7 +970,10 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
             plaintext["secrets"],
             json!({"cloudflare": {}, "github": {}})
         );
-        assert_eq!(plaintext["reason"], "integration test");
+        assert_eq!(
+            plaintext["reason"],
+            "GitHub and Cloudflare secrets provide the environment variables under test"
+        );
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
         assert!(plaintext["operation"].get("script_contents").is_none());
@@ -1082,7 +1085,7 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
             "-s",
             "cloudflare",
             "--reason",
-            "integration test",
+            "GitHub and Cloudflare secrets provide the environment variables under test",
             "--",
             "env",
         ])
@@ -1155,7 +1158,7 @@ async fn custom_home_preserves_the_child_environment_with_a_read_only_home() {
                 "-s",
                 "test",
                 "--reason",
-                "Check inherited home directories",
+                "Test secret provides an empty environment to isolate directory selection",
                 "--",
                 "sh",
                 "-c",

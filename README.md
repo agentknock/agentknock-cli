@@ -21,7 +21,9 @@ them. For example:
 1. Run a command with the `gh-token` secret:
 
    ```sh
-   agentknock -s gh-token --reason "Merge the reviewed pull request" -- gh pr merge 123
+   agentknock -s gh-token \
+     --reason "GitHub token provides write access to the repository" \
+     -- gh pr merge 123
    ```
 
 2. The paired mobile device displays the request. Approve the use of
@@ -187,7 +189,8 @@ directory:
 
 ```sh
 agentknock --agentknock-home /persist/agentknock \
-  -s gh-token --reason "Review open issues" -- gh issue list
+  -s gh-token --reason "GitHub token provides access to private repository issues" \
+  -- gh issue list
 ```
 
 Neither setting changes the wrapped command's `HOME`. An existing
@@ -222,17 +225,25 @@ The client can now request secrets from the paired mobile device.
 ### Run a command with secrets
 
 The `run` command requires at least one secret. Repeat `-s` when a command
-needs more than one, and use `--reason` to add context to the request. You can
-omit `run` and put its options directly after `agentknock`:
+needs more than one. Use `--reason` to explain why each selected secret is
+needed, such as API access, SSH authentication, or a signing operation. The
+command and arguments already describe the action.
+
+You can omit `run` and put its options directly after `agentknock`. For a
+release script that needs both GitHub and Cloudflare access:
 
 ```sh
-agentknock -s gh-token -s cloudflare --reason "Publish release" -- ./release.sh
+agentknock -s gh-token -s cloudflare \
+  --reason "GitHub token for repository access; Cloudflare token for deployment access" \
+  -- ./release.sh
 ```
 
 The explicit form is equivalent:
 
 ```sh
-agentknock run -s gh-token -s cloudflare --reason "Publish release" -- ./release.sh
+agentknock run -s gh-token -s cloudflare \
+  --reason "GitHub token for repository access; Cloudflare token for deployment access" \
+  -- ./release.sh
 ```
 
 The `--` separator is required. Agentknock passes the command and every
@@ -253,12 +264,12 @@ Use `--only-env` to select a subset, or `--omit-env` to exclude variables:
 
 ```sh
 agentknock -s github \
-  --reason "Review open issues" \
+  --reason "GitHub token provides access to private repository issues" \
   --only-env github GH_TOKEN \
   -- gh issue list
 
 agentknock -s development \
-  --reason "Test the changes locally" \
+  --reason "Development credentials authenticate the server to its database" \
   --omit-env development DEBUG_TOKEN \
   -- ./run-development-server
 ```
@@ -271,7 +282,7 @@ environment:
 
 ```sh
 agentknock -s github \
-  --reason "Fetch GitHub data for the task" \
+  --reason "GitHub token authenticates the command's API requests" \
   --only-env github GH_TOKEN \
   --rename-env github GH_TOKEN GITHUB_TOKEN \
   -- ./command-expecting-github-token
@@ -281,7 +292,7 @@ Use `--stdin` to send one stored variable to the command's standard input:
 
 ```sh
 agentknock -s service-password \
-  --reason "Authenticate to the service for the task" \
+  --reason "Service password is required to authenticate the service account" \
   --only-env service-password PASSWORD \
   --stdin service-password PASSWORD \
   -- ./command-reading-a-password
@@ -309,13 +320,15 @@ keys.
 Use the SSH secret with a direct connection:
 
 ```sh
-agentknock -s production-ssh --reason "Investigate the production service" -- ssh example.com
+agentknock -s production-ssh \
+  --reason "SSH key is required to authenticate to example.com" -- ssh example.com
 ```
 
 The same setup works when Git uses an SSH remote:
 
 ```sh
-agentknock -s github-ssh --reason "Push the changes for review" -- git push
+agentknock -s github-ssh \
+  --reason "SSH key authenticates Git access to the GitHub repository" -- git push
 ```
 
 The command can select at most one SSH secret. Agentknock puts that key first
@@ -327,7 +340,7 @@ the existing agent:
 
 ```sh
 agentknock --no-ssh-passthrough -s production-ssh \
-  --reason "Investigate the production service" -- ssh example.com
+  --reason "SSH key is required to authenticate to example.com" -- ssh example.com
 ```
 
 This option also makes Git SSH signing fail if Git requests a different key.
@@ -352,7 +365,7 @@ requested signature.
 With Git configured to sign commits using SSH, wrap your usual command:
 
 ```sh
-agentknock -s git-signing --reason "Record the completed changes" -- git commit
+agentknock -s git-signing --reason "SSH key is required to sign the commit" -- git commit
 ```
 
 Use `--no-git-sign` when Agentknock should not provide Git signing. Agentknock
