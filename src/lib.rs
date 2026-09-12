@@ -28,9 +28,9 @@ pub use git_sign::{
 };
 pub use pairing::{PairingRemoveError, PairingSas};
 pub use secret_use::{
-    DenialReason, EnvironmentVariableOptions, ExecutableMode, ExecutableScript, RequestError,
-    SecretUseInvocation, SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseRequest,
-    SshSecretUse, StreamKind,
+    DenialReason, EnvironmentVariableOptions, ExecutableMode, RequestError, SecretUseInvocation,
+    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseRequest, SshSecretUse,
+    StreamKind,
 };
 pub use secrets::{Secret, SecretUpload, SecretUploadError, SecretUploadMode, Secrets};
 pub use ssh_authentication::{SshAuthenticationRequest, SshSignatureAlgorithm};

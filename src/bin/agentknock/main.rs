@@ -965,7 +965,7 @@ async fn run(
                     executable_path: selected.path(),
                     executable_hash: selected.hash(),
                     executable_mode: selected.mode(),
-                    executable_script: selected.script(),
+                    script_contents: selected.script_contents(),
                     stdin: if stdin_source.is_some() {
                         StreamKind::Pipe
                     } else {

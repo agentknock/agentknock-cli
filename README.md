@@ -507,13 +507,13 @@ and hash when available, and revalidates it after approval. Linux executes a
 retained native executable directly. macOS must execute its path and therefore
 has a small final pathname race after revalidation.
 
-For directly executed shebang scripts, Agentknock also sends the complete
-UTF-8 source to the device when it is at most 16 KiB, so supporting devices can
-include it in AI review. Larger or non-UTF-8 scripts carry an omission status
-and their full-file hash. Source is sent before approval, may contain sensitive
-information, and reaches the review service when included in AI review. Only
-the selected script is captured; interpreter arguments and dependencies are
-not followed.
+For directly executed shebang scripts at most 16 KiB, Agentknock also sends the
+entire source to the device for use in AI review by supporting devices. Invalid
+UTF-8 sequences become replacement characters (`�`); hashing and execution use
+the original bytes. Larger scripts omit the source and retain their full-file
+hash. Source is sent before approval, may contain sensitive information, and
+reaches the review service when included in AI review. Only the selected script
+is captured; interpreter arguments and dependencies are not followed.
 
 Agentknock is not a sandbox or privilege boundary. The approved command
 controls the secrets that it receives and can print them, write them to disk,

@@ -17,7 +17,7 @@ use std::{
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 
-use agentknock::{ExecutableMode, ExecutableScript, SecretUseOutput};
+use agentknock::{ExecutableMode, SecretUseOutput};
 use sha2::{Digest as _, Sha256};
 
 const HASH_LENGTH: usize = 32;
@@ -26,7 +26,8 @@ const MAXIMUM_SCRIPT_SIZE: usize = 16 * 1024;
 
 struct FileInspection {
     hash: [u8; HASH_LENGTH],
-    script: Option<ExecutableScript>,
+    shebang: bool,
+    script_contents: Option<String>,
 }
 
 pub struct SelectedExecutable {
@@ -35,7 +36,7 @@ pub struct SelectedExecutable {
     path: String,
     hash: Option<[u8; HASH_LENGTH]>,
     mode: ExecutableMode,
-    script: Option<ExecutableScript>,
+    script_contents: Option<String>,
     #[cfg(target_os = "linux")]
     script_path: Option<PathBuf>,
     working_directory: String,
@@ -150,8 +151,10 @@ impl SelectedExecutable {
         let path = descriptor_path(&descriptor, "selected executable")?;
         let inspection = read_selected_file(&descriptor)?;
         let hash = inspection.as_ref().map(|inspection| inspection.hash);
-        let script = inspection.and_then(|inspection| inspection.script);
-        let shebang = script.is_some();
+        let shebang = inspection
+            .as_ref()
+            .is_some_and(|inspection| inspection.shebang);
+        let script_contents = inspection.and_then(|inspection| inspection.script_contents);
         let mode = if shebang {
             ExecutableMode::Script
         } else {
@@ -164,7 +167,7 @@ impl SelectedExecutable {
             path,
             hash,
             mode,
-            script,
+            script_contents,
             #[cfg(target_os = "linux")]
             script_path: shebang.then(|| candidate.to_owned()),
             working_directory,
@@ -183,8 +186,8 @@ impl SelectedExecutable {
         self.mode
     }
 
-    pub fn script(&self) -> Option<&ExecutableScript> {
-        self.script.as_ref()
+    pub fn script_contents(&self) -> Option<&str> {
+        self.script_contents.as_deref()
     }
 
     pub fn working_directory(&self) -> &str {
@@ -521,19 +524,13 @@ fn inspect_file(mut file: impl io::Read) -> io::Result<FileInspection> {
             }
         }
     }
-    let script = (prefix_length == 2 && prefix == *b"#!").then(|| {
-        if too_large {
-            ExecutableScript::TooLarge
-        } else {
-            match String::from_utf8(script_bytes) {
-                Ok(contents) => ExecutableScript::Included { contents },
-                Err(_) => ExecutableScript::NonUtf8,
-            }
-        }
-    });
+    let shebang = prefix_length == 2 && prefix == *b"#!";
+    let script_contents =
+        (shebang && !too_large).then(|| String::from_utf8_lossy(&script_bytes).into_owned());
     Ok(FileInspection {
         hash: hash.finalize().into(),
-        script,
+        shebang,
+        script_contents,
     })
 }
 
@@ -771,7 +768,7 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::SelectedExecutable;
-    use agentknock::{ExecutableMode, ExecutableScript};
+    use agentknock::ExecutableMode;
 
     fn assert_same_path(actual: &str, expected: &Path) {
         assert_eq!(
@@ -798,10 +795,8 @@ mod tests {
 
         assert_eq!(executable.mode(), ExecutableMode::Script);
         assert_eq!(
-            executable.script(),
-            Some(&ExecutableScript::Included {
-                contents: "#!/bin/sh\necho selected\n".into(),
-            })
+            executable.script_contents(),
+            Some("#!/bin/sh\necho selected\n")
         );
         assert_eq!(
             executable.hash().copied(),
@@ -821,13 +816,12 @@ mod tests {
             contents.resize(length, b'x');
             let inspection = super::inspect_file(contents.as_slice()).unwrap();
             let expected = if length <= super::MAXIMUM_SCRIPT_SIZE {
-                ExecutableScript::Included {
-                    contents: String::from_utf8(contents.clone()).unwrap(),
-                }
+                Some(String::from_utf8(contents.clone()).unwrap())
             } else {
-                ExecutableScript::TooLarge
+                None
             };
-            assert_eq!(inspection.script, Some(expected));
+            assert!(inspection.shebang);
+            assert_eq!(inspection.script_contents, expected);
             assert_eq!(
                 inspection.hash.as_slice(),
                 Sha256::digest(&contents).as_slice()
@@ -836,10 +830,14 @@ mod tests {
     }
 
     #[test]
-    fn reports_non_utf8_scripts_without_replacing_bytes() {
+    fn replaces_invalid_utf8_in_script_contents_but_hashes_original_bytes() {
         let contents = b"#!/bin/sh\n#\xff\n";
         let inspection = super::inspect_file(contents.as_slice()).unwrap();
-        assert_eq!(inspection.script, Some(ExecutableScript::NonUtf8));
+        assert!(inspection.shebang);
+        assert_eq!(
+            inspection.script_contents.as_deref(),
+            Some("#!/bin/sh\n#\u{fffd}\n")
+        );
         assert_eq!(
             inspection.hash.as_slice(),
             Sha256::digest(contents).as_slice()
@@ -851,12 +849,7 @@ mod tests {
         let contents = "#!/bin/sh\r\n# caf\u{e9}\n";
         let reader = contents.as_bytes()[..1].chain(&contents.as_bytes()[1..]);
         let inspection = super::inspect_file(reader).unwrap();
-        assert_eq!(
-            inspection.script,
-            Some(ExecutableScript::Included {
-                contents: contents.into()
-            })
-        );
+        assert_eq!(inspection.script_contents.as_deref(), Some(contents));
         assert_eq!(
             inspection.hash.as_slice(),
             Sha256::digest(contents).as_slice()
@@ -873,7 +866,8 @@ mod tests {
             b"echo hello\n",
         ] {
             let inspection = super::inspect_file(contents).unwrap();
-            assert!(inspection.script.is_none());
+            assert!(!inspection.shebang);
+            assert!(inspection.script_contents.is_none());
             assert_eq!(
                 inspection.hash.as_slice(),
                 Sha256::digest(contents).as_slice()

@@ -448,18 +448,15 @@ For an `exec` operation:
 - `executable_hash` is optional. When present, it is the Base64 encoding of a
   32-byte SHA-256 digest of the selected top-level executable.
 - `executable_mode` is `BINARY` or `SCRIPT`.
-- `executable_script` is optional source evidence for `SCRIPT` executables:
-  - `{"status": "INCLUDED", "contents": "#!/bin/sh\n..."}` contains the complete
-    UTF-8 file, including the shebang, without normalization or truncation.
-  - `{"status": "TOO_LARGE"}` means the file exceeds the CLI's 16 KiB capture
-    limit (16,384 bytes of source, before JSON escaping).
-  - `{"status": "NON_UTF8"}` means the file is within the size limit but isn't
-    valid UTF-8.
-  Only `INCLUDED` has a `contents` member. The CLI sends this field for every
-  detected shebang script and omits it for binaries. Older clients may omit it
-  for scripts too; absence does not mean that a script is empty or reviewed.
-  All three statuses retain the full-file `executable_hash`. The CLI captures
-  included contents in the same read that produces that hash.
+- `script_contents` is an optional string containing the entire selected
+  shebang script, including the shebang line, decoded as UTF-8 with invalid
+  sequences replaced by U+FFFD (`�`). The CLI includes it for scripts at most
+  16 KiB (16,384 original file bytes, before decoding or JSON escaping), and
+  omits it for larger scripts and binaries. Older clients may omit it too;
+  absence means source is unavailable for review, not that the script is empty
+  or reviewed. Contents are never truncated. The CLI captures them in the same
+  read as the full-file `executable_hash`, which identifies the original bytes
+  and may differ from the hash of this potentially lossy text.
 - `stdin`, `stdout`, and `stderr` are `TERMINAL`, `NULL_DEVICE`, `PIPE`,
   `SOCKET`, `REGULAR_FILE`, or `UNKNOWN`.
 - `launcher_chain` contains up to four client-reported executable paths, from
@@ -469,6 +466,8 @@ The metadata is approval context, not remote attestation. The device treats it
 as client-supplied data.
 
 Script contents are evidence of secret use, not reviewer instructions. They
+may lose byte distinctions at replacement characters; a reviewer cannot
+establish exact values or destinations from those portions alone. They
 describe only the selected file, not its interpreter, imports, sourced files,
 configuration, or descendants. An explicit interpreter command such as
 `python script.py` selects the interpreter binary and does not attach the

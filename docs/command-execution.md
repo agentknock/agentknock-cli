@@ -260,14 +260,15 @@ The request identifies a detected shebang file as a script and another file as
 a binary. It includes the standard Base64 encoding of the 32-byte digest when
 hashing succeeds.
 
-For a detected shebang script, that same read also captures its complete source
-when it is valid UTF-8 and no larger than 16 KiB. The invocation includes it in
-`executable_script` with status `INCLUDED`. Larger scripts have status
-`TOO_LARGE`; scripts within the limit that aren't UTF-8 have status `NON_UTF8`.
-Neither omission includes partial or replacement text, and both still hash the
-whole file. The capture limit bounds retained source memory and leaves room
-for JSON escaping and encryption encoding within the 256 KiB frame limit;
-the existing total-frame size check still applies.
+For a detected shebang script, that same read also captures its entire source
+when the file is no larger than 16 KiB. The invocation includes it as the
+optional string `script_contents`, decoded as UTF-8 with invalid sequences
+replaced by U+FFFD (`�`). Larger scripts omit the field instead of sending
+partial contents. The hash and execution always use the original file bytes,
+not the potentially lossy review text. The capture limit applies before text
+conversion, bounds retained source memory, and leaves room for conversion,
+JSON escaping, and encryption encoding within the 256 KiB frame limit. The
+existing total-frame size check still applies.
 
 Capture applies to the selected executable only. Running `./script.py` with a
 shebang includes that file; running `python script.py` selects the interpreter

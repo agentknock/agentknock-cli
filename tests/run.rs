@@ -973,7 +973,7 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
-        assert!(plaintext["operation"].get("executable_script").is_none());
+        assert!(plaintext["operation"].get("script_contents").is_none());
         assert_eq!(plaintext["operation"]["stdout"], "PIPE");
         assert_eq!(plaintext["operation"]["stderr"], "PIPE");
         assert!(
@@ -1336,7 +1336,7 @@ async fn reports_and_executes_a_shebang_script() {
     let contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n";
     assert_shebang_request(
         contents,
-        json!({"status": "INCLUDED", "contents": std::str::from_utf8(contents).unwrap()}),
+        Some(std::str::from_utf8(contents).unwrap().to_owned()),
     )
     .await;
 }
@@ -1345,27 +1345,28 @@ async fn reports_and_executes_a_shebang_script() {
 async fn sends_maximum_size_scripts_even_with_json_escaping() {
     let mut contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#".to_vec();
     contents.resize(16 * 1024, b'\x01');
-    let expected = json!({
-        "status": "INCLUDED",
-        "contents": std::str::from_utf8(&contents).unwrap(),
-    });
+    let expected = Some(std::str::from_utf8(&contents).unwrap().to_owned());
     assert_shebang_request(&contents, expected).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reports_large_scripts_without_sending_partial_contents() {
+async fn omits_large_script_contents_without_changing_execution() {
     let mut contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#".to_vec();
     contents.resize(16 * 1024 + 1, b'x');
-    assert_shebang_request(&contents, json!({"status": "TOO_LARGE"})).await;
+    assert_shebang_request(&contents, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reports_non_utf8_scripts_without_changing_execution() {
+async fn replaces_invalid_utf8_in_script_evidence_without_changing_execution() {
     let contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#\xff\n";
-    assert_shebang_request(contents, json!({"status": "NON_UTF8"})).await;
+    assert_shebang_request(
+        contents,
+        Some("#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#\u{fffd}\n".into()),
+    )
+    .await;
 }
 
-async fn assert_shebang_request(script_contents: &[u8], expected_script: Value) {
+async fn assert_shebang_request(script_contents: &[u8], expected_contents: Option<String>) {
     let home = TestHome::active();
     let script = home.path().join("script");
     fs::write(&script, script_contents).unwrap();
@@ -1387,7 +1388,10 @@ async fn assert_shebang_request(script_contents: &[u8], expected_script: Value) 
         assert_eq!(plaintext["operation"]["executable_mode"], "SCRIPT");
         assert_eq!(plaintext["operation"]["executable_path"], expected_path);
         assert_eq!(plaintext["operation"]["executable_hash"], expected_hash);
-        assert_eq!(plaintext["operation"]["executable_script"], expected_script);
+        assert_eq!(
+            plaintext["operation"].get("script_contents"),
+            expected_contents.map(Value::String).as_ref(),
+        );
         send_json(
             &mut socket,
             json!({
