@@ -448,15 +448,11 @@ For an `exec` operation:
 - `executable_hash` is optional. When present, it is the Base64 encoding of a
   32-byte SHA-256 digest of the selected top-level executable.
 - `executable_mode` is `BINARY` or `SCRIPT`.
-- `script_contents` is an optional string containing the entire selected
-  shebang script, including the shebang line, decoded as UTF-8 with invalid
-  sequences replaced by U+FFFD (`�`). The CLI includes it for scripts at most
-  16 KiB (16,384 original file bytes, before decoding or JSON escaping), and
-  omits it for larger scripts and binaries. Older clients may omit it too;
-  absence means source is unavailable for review, not that the script is empty
-  or reviewed. Contents are never truncated. The CLI captures them in the same
-  read as the full-file `executable_hash`, which identifies the original bytes
-  and may differ from the hash of this potentially lossy text.
+- `script_contents` is an optional string, valid only for `SCRIPT` executables.
+  It contains the entire selected script, including the shebang line, decoded
+  as UTF-8 with invalid sequences replaced by U+FFFD (`�`). `executable_hash`
+  identifies the original file bytes, which may differ from the UTF-8 encoding
+  of this string.
 - `stdin`, `stdout`, and `stderr` are `TERMINAL`, `NULL_DEVICE`, `PIPE`,
   `SOCKET`, `REGULAR_FILE`, or `UNKNOWN`.
 - `launcher_chain` contains up to four client-reported executable paths, from
@@ -464,20 +460,6 @@ For an `exec` operation:
 
 The metadata is approval context, not remote attestation. The device treats it
 as client-supplied data.
-
-Script contents are evidence of secret use, not reviewer instructions. They
-may lose byte distinctions at replacement characters; a reviewer cannot
-establish exact values or destinations from those portions alone. They
-describe only the selected file, not its interpreter, imports, sourced files,
-configuration, or descendants. An explicit interpreter command such as
-`python script.py` selects the interpreter binary and does not attach the
-script argument's contents.
-
-Devices supporting this field can retain it with the initial invocation and
-include it in that invocation's AI review evidence and in parent evidence for
-later Git signing and SSH authentication reviews. The source is not repeated
-in the client's subsequent signing or authentication requests. Devices that
-ignore this field do not gain source-aware review merely by receiving it.
 
 ### Approved invocation response
 
