@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::{CString, OsStr, OsString},
     fs::File,
-    io::{self, Read as _},
+    io,
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
@@ -17,11 +17,17 @@ use std::{
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 
-use agentknock::{ExecutableMode, SecretUseOutput};
+use agentknock::{ExecutableMode, ExecutableScript, SecretUseOutput};
 use sha2::{Digest as _, Sha256};
 
 const HASH_LENGTH: usize = 32;
 const READ_BUFFER_LENGTH: usize = 64 * 1024;
+const MAXIMUM_SCRIPT_SIZE: usize = 16 * 1024;
+
+struct FileInspection {
+    hash: [u8; HASH_LENGTH],
+    script: Option<ExecutableScript>,
+}
 
 pub struct SelectedExecutable {
     descriptor: OwnedFd,
@@ -29,6 +35,7 @@ pub struct SelectedExecutable {
     path: String,
     hash: Option<[u8; HASH_LENGTH]>,
     mode: ExecutableMode,
+    script: Option<ExecutableScript>,
     #[cfg(target_os = "linux")]
     script_path: Option<PathBuf>,
     working_directory: String,
@@ -141,7 +148,10 @@ impl SelectedExecutable {
         require_regular_file(&descriptor)?;
         require_effective_execute_access(&descriptor)?;
         let path = descriptor_path(&descriptor, "selected executable")?;
-        let (hash, shebang) = inspect_selected_file(&descriptor)?;
+        let inspection = read_selected_file(&descriptor)?;
+        let hash = inspection.as_ref().map(|inspection| inspection.hash);
+        let script = inspection.and_then(|inspection| inspection.script);
+        let shebang = script.is_some();
         let mode = if shebang {
             ExecutableMode::Script
         } else {
@@ -154,6 +164,7 @@ impl SelectedExecutable {
             path,
             hash,
             mode,
+            script,
             #[cfg(target_os = "linux")]
             script_path: shebang.then(|| candidate.to_owned()),
             working_directory,
@@ -170,6 +181,10 @@ impl SelectedExecutable {
 
     pub fn mode(&self) -> ExecutableMode {
         self.mode
+    }
+
+    pub fn script(&self) -> Option<&ExecutableScript> {
+        self.script.as_ref()
     }
 
     pub fn working_directory(&self) -> &str {
@@ -262,7 +277,7 @@ impl SelectedExecutable {
         };
         #[cfg(target_os = "linux")]
         let actual = match self.mode {
-            ExecutableMode::Binary => read_selected_file(&self.descriptor)?.map(|(hash, _)| hash),
+            ExecutableMode::Binary => read_selected_file(&self.descriptor)?.map(|file| file.hash),
             ExecutableMode::Script => Some(hash_path(
                 self.script_path
                     .as_deref()
@@ -270,7 +285,7 @@ impl SelectedExecutable {
             )?),
         };
         #[cfg(target_os = "macos")]
-        let actual = read_selected_file(&self.descriptor)?.map(|(hash, _)| hash);
+        let actual = read_selected_file(&self.descriptor)?.map(|file| file.hash);
         let Some(actual) = actual else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -457,14 +472,7 @@ fn require_effective_execute_access(descriptor: &OwnedFd) -> io::Result<()> {
     Err(error)
 }
 
-fn inspect_selected_file(descriptor: &OwnedFd) -> io::Result<(Option<[u8; HASH_LENGTH]>, bool)> {
-    match read_selected_file(descriptor)? {
-        Some((hash, shebang)) => Ok((Some(hash), shebang)),
-        None => Ok((None, false)),
-    }
-}
-
-fn read_selected_file(descriptor: &OwnedFd) -> io::Result<Option<([u8; HASH_LENGTH], bool)>> {
+fn read_selected_file(descriptor: &OwnedFd) -> io::Result<Option<FileInspection>> {
     #[cfg(target_os = "linux")]
     let path = descriptor_proc_path(descriptor);
     #[cfg(target_os = "macos")]
@@ -476,18 +484,20 @@ fn read_selected_file(descriptor: &OwnedFd) -> io::Result<Option<([u8; HASH_LENG
     };
     #[cfg(target_os = "macos")]
     require_same_file(descriptor.as_raw_fd(), file.as_raw_fd())?;
-    Ok(Some(hash_file(file)?))
+    Ok(Some(inspect_file(file)?))
 }
 
 #[cfg(target_os = "linux")]
 fn hash_path(path: &Path) -> io::Result<[u8; HASH_LENGTH]> {
-    File::open(path).and_then(|file| hash_file(file).map(|(hash, _)| hash))
+    File::open(path).and_then(|file| inspect_file(file).map(|file| file.hash))
 }
 
-fn hash_file(mut file: File) -> io::Result<([u8; HASH_LENGTH], bool)> {
+fn inspect_file(mut file: impl io::Read) -> io::Result<FileInspection> {
     let mut hash = Sha256::new();
     let mut prefix = [0_u8; 2];
     let mut prefix_length = 0;
+    let mut script_bytes = Vec::new();
+    let mut too_large = false;
     let mut buffer = [0_u8; READ_BUFFER_LENGTH];
     loop {
         let length = file.read(&mut buffer)?;
@@ -500,11 +510,31 @@ fn hash_file(mut file: File) -> io::Result<([u8; HASH_LENGTH], bool)> {
             prefix_length += copied;
         }
         hash.update(&buffer[..length]);
+        // Keep a possible one-byte shebang prefix across short reads. Once the
+        // prefix rules out a script, don't retain any more executable bytes.
+        if prefix[..prefix_length] == b"#!"[..prefix_length] && !too_large {
+            if script_bytes.len() + length > MAXIMUM_SCRIPT_SIZE {
+                too_large = true;
+                script_bytes.clear();
+            } else {
+                script_bytes.extend_from_slice(&buffer[..length]);
+            }
+        }
     }
-    Ok((
-        hash.finalize().into(),
-        prefix_length == 2 && prefix == *b"#!",
-    ))
+    let script = (prefix_length == 2 && prefix == *b"#!").then(|| {
+        if too_large {
+            ExecutableScript::TooLarge
+        } else {
+            match String::from_utf8(script_bytes) {
+                Ok(contents) => ExecutableScript::Included { contents },
+                Err(_) => ExecutableScript::NonUtf8,
+            }
+        }
+    });
+    Ok(FileInspection {
+        hash: hash.finalize().into(),
+        script,
+    })
 }
 
 fn descriptor_path(descriptor: &OwnedFd, description: &str) -> io::Result<String> {
@@ -736,12 +766,12 @@ fn signal_is_member(set: &libc::sigset_t, signal: libc::c_int) -> io::Result<boo
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt as _, path::Path};
+    use std::{ffi::OsStr, fs, io::Read as _, os::unix::fs::PermissionsExt as _, path::Path};
 
     use sha2::{Digest as _, Sha256};
 
     use super::SelectedExecutable;
-    use agentknock::ExecutableMode;
+    use agentknock::{ExecutableMode, ExecutableScript};
 
     fn assert_same_path(actual: &str, expected: &Path) {
         assert_eq!(
@@ -768,10 +798,87 @@ mod tests {
 
         assert_eq!(executable.mode(), ExecutableMode::Script);
         assert_eq!(
+            executable.script(),
+            Some(&ExecutableScript::Included {
+                contents: "#!/bin/sh\necho selected\n".into(),
+            })
+        );
+        assert_eq!(
             executable.hash().copied(),
             Some(Sha256::digest(b"#!/bin/sh\necho selected\n").into())
         );
         assert_same_path(executable.path(), &script);
+    }
+
+    #[test]
+    fn captures_complete_scripts_up_to_the_size_limit_and_hashes_omitted_contents() {
+        for length in [
+            super::MAXIMUM_SCRIPT_SIZE,
+            super::MAXIMUM_SCRIPT_SIZE + 1,
+            super::READ_BUFFER_LENGTH + 1,
+        ] {
+            let mut contents = b"#!/bin/sh\n#".to_vec();
+            contents.resize(length, b'x');
+            let inspection = super::inspect_file(contents.as_slice()).unwrap();
+            let expected = if length <= super::MAXIMUM_SCRIPT_SIZE {
+                ExecutableScript::Included {
+                    contents: String::from_utf8(contents.clone()).unwrap(),
+                }
+            } else {
+                ExecutableScript::TooLarge
+            };
+            assert_eq!(inspection.script, Some(expected));
+            assert_eq!(
+                inspection.hash.as_slice(),
+                Sha256::digest(&contents).as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn reports_non_utf8_scripts_without_replacing_bytes() {
+        let contents = b"#!/bin/sh\n#\xff\n";
+        let inspection = super::inspect_file(contents.as_slice()).unwrap();
+        assert_eq!(inspection.script, Some(ExecutableScript::NonUtf8));
+        assert_eq!(
+            inspection.hash.as_slice(),
+            Sha256::digest(contents).as_slice()
+        );
+    }
+
+    #[test]
+    fn preserves_script_contents_across_short_reads() {
+        let contents = "#!/bin/sh\r\n# caf\u{e9}\n";
+        let reader = contents.as_bytes()[..1].chain(&contents.as_bytes()[1..]);
+        let inspection = super::inspect_file(reader).unwrap();
+        assert_eq!(
+            inspection.script,
+            Some(ExecutableScript::Included {
+                contents: contents.into()
+            })
+        );
+        assert_eq!(
+            inspection.hash.as_slice(),
+            Sha256::digest(contents).as_slice()
+        );
+    }
+
+    #[test]
+    fn does_not_capture_files_without_a_complete_shebang_prefix() {
+        for contents in [
+            b"".as_slice(),
+            b"#",
+            b"# comment\n",
+            b"\x7fELF\xff",
+            b"echo hello\n",
+        ] {
+            let inspection = super::inspect_file(contents).unwrap();
+            assert!(inspection.script.is_none());
+            assert_eq!(
+                inspection.hash.as_slice(),
+                Sha256::digest(contents).as_slice()
+            );
+        }
     }
 
     #[test]

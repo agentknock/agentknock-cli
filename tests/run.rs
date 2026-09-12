@@ -973,6 +973,7 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         assert_eq!(plaintext["reason"], "integration test");
         assert_eq!(plaintext["operation"]["command"], "env");
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
+        assert!(plaintext["operation"].get("executable_script").is_none());
         assert_eq!(plaintext["operation"]["stdout"], "PIPE");
         assert_eq!(plaintext["operation"]["stderr"], "PIPE");
         assert!(
@@ -1332,9 +1333,41 @@ async fn selects_renames_omits_and_pipes_environment_values() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reports_and_executes_a_shebang_script() {
+    let contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n";
+    assert_shebang_request(
+        contents,
+        json!({"status": "INCLUDED", "contents": std::str::from_utf8(contents).unwrap()}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_maximum_size_scripts_even_with_json_escaping() {
+    let mut contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#".to_vec();
+    contents.resize(16 * 1024, b'\x01');
+    let expected = json!({
+        "status": "INCLUDED",
+        "contents": std::str::from_utf8(&contents).unwrap(),
+    });
+    assert_shebang_request(&contents, expected).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reports_large_scripts_without_sending_partial_contents() {
+    let mut contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#".to_vec();
+    contents.resize(16 * 1024 + 1, b'x');
+    assert_shebang_request(&contents, json!({"status": "TOO_LARGE"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reports_non_utf8_scripts_without_changing_execution() {
+    let contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n#\xff\n";
+    assert_shebang_request(contents, json!({"status": "NON_UTF8"})).await;
+}
+
+async fn assert_shebang_request(script_contents: &[u8], expected_script: Value) {
     let home = TestHome::active();
     let script = home.path().join("script");
-    let script_contents = b"#!/bin/sh\nprintf 'script:%s' \"$AGENTKNOCK_SCRIPT_TEST\"\n";
     fs::write(&script, script_contents).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let expected_path = fs::canonicalize(&script)
@@ -1354,6 +1387,7 @@ async fn reports_and_executes_a_shebang_script() {
         assert_eq!(plaintext["operation"]["executable_mode"], "SCRIPT");
         assert_eq!(plaintext["operation"]["executable_path"], expected_path);
         assert_eq!(plaintext["operation"]["executable_hash"], expected_hash);
+        assert_eq!(plaintext["operation"]["executable_script"], expected_script);
         send_json(
             &mut socket,
             json!({

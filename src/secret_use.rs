@@ -124,6 +124,9 @@ pub enum SecretUseOperation<'a> {
         /// Whether the selected executable is a native binary or a script.
         executable_mode: ExecutableMode,
 
+        /// The selected shebang script's source or the reason it wasn't included.
+        executable_script: Option<&'a ExecutableScript>,
+
         /// How the executable's standard input is connected.
         stdin: StreamKind,
 
@@ -144,6 +147,21 @@ pub enum ExecutableMode {
 
     /// A script that selects an interpreter with a shebang line.
     Script,
+}
+
+/// Source evidence for a selected shebang script.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutableScript {
+    /// The complete UTF-8 source, including the shebang line.
+    Included {
+        /// The script contents, without normalization or truncation.
+        contents: String,
+    },
+    /// The script exceeds the client's source capture limit.
+    TooLarge,
+    /// The script is not valid UTF-8.
+    NonUtf8,
 }
 
 /// Secret material and related authorization returned for an invocation.
@@ -395,6 +413,7 @@ impl Client {
     ///         executable_path: "/usr/bin/gh",
     ///         executable_hash: None,
     ///         executable_mode: ExecutableMode::Binary,
+    ///         executable_script: None,
     ///         stdin: StreamKind::Terminal,
     ///         stdout: StreamKind::Terminal,
     ///         stderr: StreamKind::Terminal,
@@ -437,6 +456,7 @@ impl Client {
                 executable_path,
                 executable_hash,
                 executable_mode,
+                executable_script,
                 stdin,
                 stdout,
                 stderr,
@@ -447,6 +467,7 @@ impl Client {
                 executable_path,
                 executable_hash: executable_hash.map(|hash| BASE64_STANDARD.encode(hash)),
                 executable_mode,
+                executable_script,
                 stdin: stdin.into(),
                 stdout: stdout.into(),
                 stderr: stderr.into(),
@@ -753,6 +774,8 @@ enum InvocationOperationMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         executable_hash: Option<String>,
         executable_mode: ExecutableMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        executable_script: Option<&'a ExecutableScript>,
         stdin: StreamKindMessage,
         stdout: StreamKindMessage,
         stderr: StreamKindMessage,

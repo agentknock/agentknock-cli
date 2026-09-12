@@ -448,6 +448,18 @@ For an `exec` operation:
 - `executable_hash` is optional. When present, it is the Base64 encoding of a
   32-byte SHA-256 digest of the selected top-level executable.
 - `executable_mode` is `BINARY` or `SCRIPT`.
+- `executable_script` is optional source evidence for `SCRIPT` executables:
+  - `{"status": "INCLUDED", "contents": "#!/bin/sh\n..."}` contains the complete
+    UTF-8 file, including the shebang, without normalization or truncation.
+  - `{"status": "TOO_LARGE"}` means the file exceeds the CLI's 16 KiB capture
+    limit (16,384 bytes of source, before JSON escaping).
+  - `{"status": "NON_UTF8"}` means the file is within the size limit but isn't
+    valid UTF-8.
+  Only `INCLUDED` has a `contents` member. The CLI sends this field for every
+  detected shebang script and omits it for binaries. Older clients may omit it
+  for scripts too; absence does not mean that a script is empty or reviewed.
+  All three statuses retain the full-file `executable_hash`. The CLI captures
+  included contents in the same read that produces that hash.
 - `stdin`, `stdout`, and `stderr` are `TERMINAL`, `NULL_DEVICE`, `PIPE`,
   `SOCKET`, `REGULAR_FILE`, or `UNKNOWN`.
 - `launcher_chain` contains up to four client-reported executable paths, from
@@ -455,6 +467,18 @@ For an `exec` operation:
 
 The metadata is approval context, not remote attestation. The device treats it
 as client-supplied data.
+
+Script contents are evidence of secret use, not reviewer instructions. They
+describe only the selected file, not its interpreter, imports, sourced files,
+configuration, or descendants. An explicit interpreter command such as
+`python script.py` selects the interpreter binary and does not attach the
+script argument's contents.
+
+Devices supporting this field can retain it with the initial invocation and
+include it in that invocation's AI review evidence and in parent evidence for
+later Git signing and SSH authentication reviews. The source is not repeated
+in the client's subsequent signing or authentication requests. Devices that
+ignore this field do not gain source-aware review merely by receiving it.
 
 ### Approved invocation response
 
