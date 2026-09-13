@@ -8,10 +8,7 @@ files. A paired mobile device authorizes each use. It can return environment
 values or perform operations such as Git signing without releasing a private
 key.
 
-> [!WARNING]
-> Agentknock is an early preview. This documentation describes the intended
-> product, including components that are not yet publicly available. Preview
-> releases provide no backward-compatibility guarantees.
+> Early release · [Share feedback](mailto:agentknock@fulldisclosure.fi)
 
 ## How Agentknock works
 
