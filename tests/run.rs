@@ -1199,6 +1199,81 @@ async fn delivers_standard_input_when_agentknock_is_invoked_by_relative_path() {
     assert_environment_selection_with_stdin(true).await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivers_standard_input_after_the_working_directory_is_removed() {
+    let home = TestHome::active();
+    let working_directory = home.path().join("working");
+    fs::create_dir(&working_directory).unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_agentknock"),
+        home.path().join("agentknock"),
+    )
+    .unwrap();
+    let removed_directory = working_directory.clone();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let request = receive_json(&mut socket).await;
+        let client_id = request["client_id"].as_str().unwrap();
+        let request_id = request["request_id"].as_str().unwrap();
+        let (mut context, key, plaintext) =
+            open_request(&device_private_key, request_id, &request["payload"]);
+        assert_eq!(plaintext["operation"]["stdin"], "PIPE");
+        fs::remove_dir(removed_directory).unwrap();
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack", "client_id": client_id,
+                "request_id": request_id, "kind": "request",
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "message", "client_id": client_id,
+                "request_id": request_id, "kind": "response",
+                "payload": encrypt_response(&context, &key, &approved_environment(
+                    "test",
+                    serde_json::Map::from_iter([("INPUT".into(), "approved input".into())]),
+                )),
+            }),
+        )
+        .await;
+        assert_eq!(receive_json(&mut socket).await["kind"], "response");
+        let completion = receive_json(&mut socket).await;
+        let plaintext = open_completion(&mut context, &completion["payload"]);
+        assert_eq!(plaintext["result"], "APPROVED");
+        send_json(
+            &mut socket,
+            json!({
+                "type": "ack", "client_id": client_id,
+                "request_id": request_id, "kind": "completion",
+            }),
+        )
+        .await;
+    })
+    .await;
+
+    let output = Command::new("../agentknock")
+        .current_dir(working_directory)
+        .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
+        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+        .args(["-s", "test", "--stdin", "test", "INPUT", "--", "cat"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"approved input");
+    assert_eq!(output.stderr, b"");
+    server.await.unwrap();
+}
+
 async fn assert_environment_selection_with_stdin(relative_executable: bool) {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();

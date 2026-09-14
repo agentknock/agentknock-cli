@@ -35,6 +35,7 @@ tests = {
         "requests_secret_use_and_executes_with_the_returned_environment",
         "selects_renames_omits_and_pipes_environment_values",
         "delivers_standard_input_when_agentknock_is_invoked_by_relative_path",
+        "delivers_standard_input_after_the_working_directory_is_removed",
         "reports_and_executes_a_shebang_script",
         "sends_maximum_size_scripts_even_with_json_escaping",
         "omits_large_script_contents_without_changing_execution",
