@@ -45,14 +45,22 @@ enum ChangeStatus {
 
 impl Repository {
     pub fn collect(message: &[u8]) -> Option<Self> {
-        let git = parent_git()?;
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        let git = match crate::process_info::executable_path(parent) {
+            Ok(path) if path.file_name() == Some(OsStr::new("git")) => path,
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathBuf::from("git"),
+            Err(_) => return None,
+        };
+        let git = git.as_path();
         let worktree = git_text(
-            &git,
+            git,
             ["rev-parse", "--path-format=absolute", "--show-toplevel"],
         );
-        let head = git_head(&git);
-        let remote = git_remote(&git, head.as_ref());
-        let (changed_path_count, changed_paths) = changed_paths(&git, message)
+        let head = git_head(git);
+        let remote = git_remote(git, head.as_ref());
+        let (changed_path_count, changed_paths) = changed_paths(git, message)
             .map(|(count, paths)| (Some(count), paths))
             .unwrap_or((None, None));
 
@@ -68,13 +76,6 @@ impl Repository {
             changed_paths,
         })
     }
-}
-
-fn parent_git() -> Option<PathBuf> {
-    // SAFETY: getppid has no preconditions.
-    let parent = unsafe { libc::getppid() };
-    let executable = crate::process_info::executable_path(parent).ok()?;
-    (executable.file_name() == Some(OsStr::new("git"))).then_some(executable)
 }
 
 fn git_head(git: &Path) -> Option<Head> {
