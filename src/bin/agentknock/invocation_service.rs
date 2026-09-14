@@ -281,6 +281,7 @@ pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
 
 impl InvocationService {
     pub fn start(
+        executable: &Path,
         agentknock_home: &Path,
         invocation: &SecretUseInvocation,
         ssh: Option<&SshSecretUse>,
@@ -288,22 +289,6 @@ impl InvocationService {
         upstream_agent_socket: Option<&OsStr>,
         options: ServiceOptions,
     ) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        let executable = {
-            // SAFETY: getauxval has no preconditions.
-            let path = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
-            if path.is_null() {
-                return Err(io::Error::other(
-                    "the executable launch path is unavailable",
-                ));
-            }
-            // SAFETY: AT_EXECFN points to a NUL-terminated pathname that remains
-            // valid for the lifetime of the process.
-            let path = unsafe { std::ffi::CStr::from_ptr(path) };
-            Path::new(".").join(OsStr::from_bytes(path.to_bytes()))
-        };
-        #[cfg(target_os = "macos")]
-        let executable = std::env::current_exe()?;
         let mut process = Command::new(executable)
             .arg(INTERNAL_ARGUMENT)
             .stdin(Stdio::piped())
@@ -1031,15 +1016,27 @@ async fn wait_for_process(process: &ProcessMonitor) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_helper(path: &Path) -> io::Result<()> {
-    let executable = format!("/proc/{}/exe", std::process::id());
-    std::os::unix::fs::symlink(executable, path)
+pub fn executable_path() -> io::Result<PathBuf> {
+    // SAFETY: getauxval has no preconditions.
+    let path = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+    if path.is_null() {
+        return Err(io::Error::other(
+            "the executable launch path is unavailable",
+        ));
+    }
+    // SAFETY: AT_EXECFN points to a NUL-terminated pathname that remains
+    // valid for the lifetime of the process.
+    let path = unsafe { std::ffi::CStr::from_ptr(path) };
+    fs::canonicalize(OsStr::from_bytes(path.to_bytes()))
 }
 
 #[cfg(target_os = "macos")]
+pub fn executable_path() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
 fn install_helper(path: &Path) -> io::Result<()> {
-    fs::copy(std::env::current_exe()?, path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    std::os::unix::fs::symlink(executable_path()?, path)
 }
 
 fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {

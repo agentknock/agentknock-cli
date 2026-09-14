@@ -72,6 +72,14 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
     assert!(metadata.is_dir());
     assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     assert!(Path::new(runtime_directory).join("agent.sock").exists());
+    let helper = Path::new(runtime_directory).join("git-sign");
+    let target = fs::read_link(&helper).unwrap();
+    assert!(target.is_absolute());
+    assert!(!target.starts_with("/proc"));
+    assert_eq!(
+        fs::canonicalize(target).unwrap(),
+        fs::canonicalize(env!("CARGO_BIN_EXE_agentknock")).unwrap()
+    );
 
     let mut unauthorized = UnixStream::connect(Path::new(runtime_directory).join("service.sock"))
         .expect("connect from a process outside the invocation");
@@ -618,8 +626,10 @@ fn start_service() -> Child {
 }
 
 fn service_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    let executable = Path::new(env!("CARGO_BIN_EXE_agentknock"));
+    let mut command = Command::new(Path::new(".").join(executable.file_name().unwrap()));
     command
+        .current_dir(executable.parent().unwrap())
         .arg("__invocation-service")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

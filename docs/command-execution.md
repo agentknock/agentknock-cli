@@ -193,7 +193,7 @@ The Linux implementation requires:
 - Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
 - The `execveat` system call.
 - The `pidfd_open` system call for deferred operations.
-- A mounted `/proc` file system with executable and process-status views for
+- A mounted `/proc` file system with process-status views for
   SSH authentication and Git signing.
 
 ### Working directory and search path
@@ -323,9 +323,9 @@ Unless `--no-git-sign` is set, the directory contains `service.sock` and a
 helper executable.
 `service.sock` is the private protocol used by the Git signing helper. The
 directory contains `agent.sock`, which implements the SSH agent protocol, when
-it is provided to the command or needed for Git signing passthrough. On Linux,
-the helper is a symlink to `/proc/<service-pid>/exe`; this lets Git invoke the
-same Agentknock binary without installing another executable or adding a
+it is provided to the command or needed for Git signing passthrough. The
+helper is a symlink to the absolute Agentknock executable path; this lets Git
+invoke Agentknock without installing another executable or adding a
 directory to `PATH`. Agentknock canonicalizes `XDG_RUNTIME_DIR` and uses it
 only when it identifies an absolute, mode-0700 directory owned by the effective
 user. Every ancestor must be owned by root or the effective user, and an
@@ -567,12 +567,9 @@ similar to the Linux script path.
 
 ### Invocation service
 
-The invocation service copies its current Agentknock executable into its
-private mode-0700 temporary directory as the Git signing helper. It uses the
-same agent and helper sockets as the Linux implementation. Copying the helper
-avoids a dependency on `/proc`, which macOS does not provide. The copied helper
-contains no secret data; the invocation token and SSH metadata remain in
-service memory.
+The invocation service uses the same helper symlink and agent and helper
+sockets as the Linux implementation. The helper contains no secret data; the
+invocation token and SSH metadata remain in service memory.
 
 The service registers the owner PID with `kqueue` using `EVFILT_PROC` and
 `NOTE_EXIT`, and exits when that process exits. It obtains a helper's peer PID

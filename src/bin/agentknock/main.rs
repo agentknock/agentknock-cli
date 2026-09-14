@@ -981,6 +981,9 @@ async fn run(
                 launcher_chain: &launcher_chain,
             };
             let mut signals = CommandSignals::new().map_err(CommandError::RunSignal)?;
+            // Resolve before approval can outlive the working directory; only
+            // require the path if the response needs an invocation service.
+            let service_executable = invocation_service::executable_path();
             let secret_use_output =
                 request_run_secrets(client, request, output, &mut signals).await?;
             let upstream_agent_socket = if ssh_passthrough && (ssh_agent || git_signing) {
@@ -1000,6 +1003,7 @@ async fn run(
                 if service_ssh.is_some() || secret_use_output.stdin_value().is_some() {
                     Some(
                         invocation_service::InvocationService::start(
+                            &service_executable.map_err(CommandError::RunInvocationService)?,
                             client.home(),
                             secret_use_output.invocation(),
                             service_ssh,

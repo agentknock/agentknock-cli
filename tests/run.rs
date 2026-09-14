@@ -1201,7 +1201,7 @@ async fn delivers_standard_input_when_agentknock_is_invoked_by_relative_path() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delivers_standard_input_after_the_working_directory_is_removed() {
+async fn starts_the_service_after_the_working_directory_is_removed() {
     let home = TestHome::active();
     let working_directory = home.path().join("working");
     fs::create_dir(&working_directory).unwrap();
@@ -1229,15 +1229,21 @@ async fn delivers_standard_input_after_the_working_directory_is_removed() {
             }),
         )
         .await;
+        let mut response = approved_environment(
+            "test",
+            serde_json::Map::from_iter([("INPUT".into(), "approved input".into())]),
+        );
+        response["secrets"]["test-ssh"] = json!({
+            "description": null,
+            "type": "ssh",
+            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB test",
+        });
         send_json(
             &mut socket,
             json!({
                 "type": "message", "client_id": client_id,
                 "request_id": request_id, "kind": "response",
-                "payload": encrypt_response(&context, &key, &approved_environment(
-                    "test",
-                    serde_json::Map::from_iter([("INPUT".into(), "approved input".into())]),
-                )),
+                "payload": encrypt_response(&context, &key, &response),
             }),
         )
         .await;
@@ -1261,7 +1267,9 @@ async fn delivers_standard_input_after_the_working_directory_is_removed() {
         .env("HOME", home.path())
         .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
-        .args(["-s", "test", "--stdin", "test", "INPUT", "--", "cat"])
+        .args([
+            "-s", "test", "-s", "test-ssh", "--stdin", "test", "INPUT", "--", "cat",
+        ])
         .output()
         .unwrap();
     assert!(
