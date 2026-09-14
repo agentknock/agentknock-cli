@@ -1191,6 +1191,15 @@ async fn custom_home_preserves_the_child_environment_with_a_read_only_home() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selects_renames_omits_and_pipes_environment_values() {
+    assert_environment_selection_with_stdin(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivers_standard_input_when_agentknock_is_invoked_by_relative_path() {
+    assert_environment_selection_with_stdin(true).await;
+}
+
+async fn assert_environment_selection_with_stdin(relative_executable: bool) {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
     let input_value = "x".repeat(128 * 1024);
@@ -1285,8 +1294,16 @@ async fn selects_renames_omits_and_pipes_environment_values() {
     })
     .await;
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    let executable = Path::new(env!("CARGO_BIN_EXE_agentknock"));
+    let mut command = if relative_executable {
+        let mut command = Command::new(Path::new(".").join(executable.file_name().unwrap()));
+        command.current_dir(executable.parent().unwrap());
+        command
+    } else {
+        Command::new(executable)
+    };
     command
+        .arg0("custom-agentknock-name")
         .env("HOME", home.path())
         .env_remove("AGENTKNOCK_HOME")
         .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)

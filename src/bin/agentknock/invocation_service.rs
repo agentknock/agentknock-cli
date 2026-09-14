@@ -289,7 +289,19 @@ impl InvocationService {
         options: ServiceOptions,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
-        let executable = "/proc/self/exe";
+        let executable = {
+            // SAFETY: getauxval has no preconditions.
+            let path = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+            if path.is_null() {
+                return Err(io::Error::other(
+                    "the executable launch path is unavailable",
+                ));
+            }
+            // SAFETY: AT_EXECFN points to a NUL-terminated pathname that remains
+            // valid for the lifetime of the process.
+            let path = unsafe { std::ffi::CStr::from_ptr(path) };
+            std::path::absolute(OsStr::from_bytes(path.to_bytes()))?
+        };
         #[cfg(target_os = "macos")]
         let executable = std::env::current_exe()?;
         let mut process = Command::new(executable)

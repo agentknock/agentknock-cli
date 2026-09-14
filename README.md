@@ -552,10 +552,9 @@ Agentknock supports these client platforms:
 
 Each archive contains the Agentknock binary and license files. The Linux
 archives contain a statically linked musl binary and do not require a system C
-library. Linux command execution requires Linux 5.8 or later. Standard-input
-secret delivery, SSH authentication, and Git signing also require a mounted
-`/proc` file system. The macOS archive requires Apple Silicon and macOS 15 or
-later.
+library. Linux command execution requires Linux 5.8 or later. SSH authentication
+and Git signing also require a mounted `/proc` file system. The macOS archive
+requires Apple Silicon and macOS 15 or later.
 
 Agentknock supports WSL2 through its Linux environment. Use the archive that
 matches the WSL2 architecture. Native Windows clients and Intel Macs are not
