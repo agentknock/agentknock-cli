@@ -125,7 +125,9 @@ Agentknock reports a standard stream as a terminal, null device, pipe, socket,
 regular file, or unknown connection. It reads launcher paths from the platform
 process interface, up to four ancestors, and orders them from the oldest
 reported ancestor to the direct launcher. Missing, inaccessible, or non-UTF-8
-process information shortens the chain.
+process information shortens the chain. Linux obtains these paths from procfs;
+when procfs is absent, it sends an empty chain. Hosts with readable procfs retain
+launcher context. Review rules must allow for unavailable context.
 
 This information helps a person or automated policy evaluate a request, but it
 is entirely client-reported. It is not attestation, and a modified client can
@@ -183,8 +185,9 @@ trust to handle them.
 Agentknock supports x86-64 and ARM64 Linux 5.8 or later, and ARM64 macOS 15 or
 later. Both implementations require UTF-8 command arguments, working-directory
 paths, and selected executable paths at the protocol boundary. Agentknock
-stops before sending the invocation request when the host cannot provide a
-required facility.
+stops before sending the invocation request if command selection fails.
+Service startup and execution can still fail after approval if the host denies
+a required facility.
 
 ## Linux implementation
 
@@ -193,8 +196,11 @@ The Linux implementation requires:
 - Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
 - The `execveat` system call.
 - The `pidfd_open` system call for deferred operations.
-- A mounted `/proc` file system with usable file-descriptor and process-status
-  views.
+- Readable procfs process-status records, or Linux 6.13 or later with
+  `PIDFD_GET_INFO`, for SSH and Git-signing ancestry checks.
+
+These operations do not require a mounted `/proc` file system. The sandbox must
+permit the listed system calls and ioctls; kernel version alone is insufficient.
 
 ### Working directory and search path
 
@@ -216,9 +222,9 @@ The search continues after errors that ordinary executable lookup treats as a
 missing candidate, including a candidate that is not executable. Other errors
 stop the search.
 
-Agentknock does not canonicalize a pathname and later reopen it. A canonical
-path is still a mutable name, not a stable reference to a file-system object.
-It also does not repeat the `PATH` search after approval because the directory
+Agentknock resolves the working-directory path with `getcwd` and checks that
+opening that path identifies the retained directory (matching device and inode).
+It does not repeat the `PATH` search after approval because the directory
 contents and final environment might then select a different command.
 
 ### Selected executable
@@ -244,17 +250,21 @@ Normal path resolution follows symbolic links. Agentknock retains the object
 to which a link resolved during selection instead of rejecting links or
 retaining the link itself.
 
-Agentknock obtains the displayed `executable_path` by reading
-`/proc/self/fd/<fd>` for the opened object. If the resulting path is not valid
-UTF-8, Agentknock stops before sending a request. The selected descriptor
-remains open during request delivery, approval, response authentication, and
-completion handoff.
+Agentknock canonicalizes the selected pathname and checks that opening the
+canonical path identifies the retained executable (matching device and inode).
+If the resulting path is not valid UTF-8, Agentknock stops before sending a
+request. Path resolution can fail if the directory or executable is renamed
+while selection is in progress. The selected descriptor remains open during
+request delivery, approval, response authentication, and completion handoff.
 
 ### Executable inspection and revalidation
 
-Agentknock tries to read the selected object through its retained descriptor.
-When the object is readable, one pass calculates the SHA-256 digest of the
-complete file and checks whether the first two bytes are `#!`.
+Agentknock opens the canonical path for reading and verifies that the reader
+identifies the retained executable (matching device and inode). It retains this
+readable descriptor for revalidation. When the object is readable, one pass
+calculates the SHA-256 digest of the complete file and checks whether the first
+two bytes are `#!`. Revoking read permission later does not revoke this already
+opened reader; execution permissions are still enforced by the kernel.
 
 The request identifies a detected shebang file as a script and another file as
 a binary. It includes the standard Base64 encoding of the 32-byte digest when
@@ -310,6 +320,16 @@ data through a private pipe. This includes the invocation identifier, a fresh
 requested standard-input value or SSH information when applicable. It does
 not pass a live HPKE context to the service.
 
+On Linux, the service uses `/proc/self/exe` when available, retaining the link
+to the running executable object. If that entry is missing, it resolves
+`AT_EXECFN`, the launch pathname in the kernel-supplied auxiliary vector.
+Agentknock does not change its working directory before resolving this path.
+The latter names an on-disk file: replacement can change which program starts,
+and removal can prevent startup. Without procfs, launching Agentknock itself
+through an anonymous descriptor requires a usable pathname for that descriptor
+to start deferred operations or standard-input delivery. Other lookup errors,
+such as denied access, are propagated rather than treated as missing procfs.
+
 For standard-input delivery, the service writes the exact UTF-8 value to a
 second pipe without adding a newline, then closes the pipe. The launcher
 replaces its standard-input descriptor with the read end immediately before
@@ -326,9 +346,13 @@ helper executable.
 `service.sock` is the private protocol used by the Git signing helper. The
 directory contains `agent.sock`, which implements the SSH agent protocol, when
 it is provided to the command or needed for Git signing passthrough. On Linux,
-the helper is a symlink to `/proc/<service-pid>/exe`; this lets Git invoke the
-same Agentknock binary without installing another executable or adding a
-directory to `PATH`. Agentknock canonicalizes `XDG_RUNTIME_DIR` and uses it
+the helper is a symlink to `/proc/<service-pid>/exe` when that entry is available.
+If it is missing, the service copies its executable into the private directory
+as a mode-0700 helper, using the same copying code as macOS. The helper contains
+no secret data; the invocation token remains in service memory. The procfs link
+identifies the running service object. The fallback copy is a writable file
+owned by the user, and its pathname source can identify a replacement.
+Agentknock canonicalizes `XDG_RUNTIME_DIR` and uses it
 only when it identifies an absolute, mode-0700 directory owned by the effective
 user. Every ancestor must be owned by root or the effective user, and an
 ancestor writable by other users must have sticky-directory protection. If
@@ -404,9 +428,14 @@ For an SSHSIG signing operation in the `git` namespace, the helper compares
 Git's requested key with the selected Agentknock public key. A match sends the
 exact signing payload supplied by Git to the invocation service. The service
 creates a new protected `GitSign` exchange containing the original invocation
-identifier and token, the SSH secret name, and those bytes. When Git invokes
-the helper directly, the helper also uses that Git executable to collect
-advisory repository, branch, and changed-path context. The changed paths come
+identifier and token, the SSH secret name, and those bytes. When the parent
+executable can be identified as Git, the helper uses that executable to collect
+advisory repository, branch, and changed-path context. A known non-Git parent
+omits this context. If the parent executable entry is missing, including when
+procfs is absent on Linux, the helper uses `git` from its inherited `PATH`.
+Queries inherit the helper's working directory and environment. The fallback
+Git can differ from the Git requesting the signature. Other process-path errors
+omit context. The changed paths come
 from the tree and first parent named by the signing payload, not from mutable
 index or worktree state. Failure to collect this context does not prevent
 signing. The service writes an approved SSHSIG response to the signature file
@@ -431,10 +460,14 @@ operating-system sandbox.
 The service opens a pidfd for the owner process, whose PID remains stable when
 the launcher replaces itself with the command. It exits when that process
 exits. Before serving a helper or agent connection, it reads the peer PID from
-the Unix socket and walks Linux parent-process records to require that the
-client is a descendant of the owner. If the owner exits during a protected
-operation, the service cancels the request and attempts a short aborted
-completion.
+the Unix socket and walks parent PIDs to require that the client is a descendant
+of the owner. It reads `/proc/<pid>/status` when available. When that record is
+missing, it opens the process with `pidfd_open` and reads its parent with
+`PIDFD_GET_INFO`. Other errors stop the walk; an unavailable interface never
+bypasses the descendant check. This preserves Linux 5.8 compatibility with
+procfs, while allowing Linux 6.13+ to operate without it. The walk is not an
+atomic snapshot: process exit, reparenting, and PID reuse can race with it. If the owner exits during a protected operation, the service
+cancels the request and attempts a short aborted completion.
 
 These checks keep ordinary unrelated processes from accidentally using an
 invocation service. They are not a same-user security boundary. The security
@@ -460,7 +493,8 @@ original arguments. It does not perform another path lookup. Every execution
 error is terminal, including an error caused by a missing loader.
 
 Descriptor execution can appear through `AT_EXECFN`, auditing, path-oriented
-policy, or program self-inspection. `/proc/self/exe` refers to the executed
+policy, or program self-inspection. When `/proc` is mounted, `/proc/self/exe`
+refers to the executed
 object, but software that depends on its exact execution path can behave
 differently.
 
@@ -536,7 +570,8 @@ Linux follow from macOS not providing a public equivalent of `execveat` or
 Agentknock opens the current directory with `O_SEARCH | O_CLOEXEC` and each
 candidate with `O_EXEC | O_CLOEXEC`. Opening the candidate checks execute
 access. Agentknock requires a regular file and retains both the candidate
-descriptor and the absolute path returned by `fcntl` with `F_GETPATH`.
+descriptor and the canonical absolute path, with the same path identity checks
+as Linux.
 
 Relative command paths and relative `PATH` entries are resolved from the
 retained current-directory descriptor. Absolute paths and `PATH` searches
@@ -551,9 +586,9 @@ as a binary.
 
 Immediately before execution, Agentknock opens the captured path again with
 `O_EXEC` and requires the device and inode numbers to match the retained
-descriptor. If a hash was reported, it also reopens the path for reading,
-checks the object identity, and recalculates the hash. A missing path, changed
-identity, unreadable previously hashed file, or hash mismatch stops execution.
+descriptor. If a hash was reported, it recalculates it through the retained
+reader for binaries or through the execution path for scripts. A missing path,
+changed identity, read failure, or hash mismatch stops execution.
 
 ### Process replacement
 
@@ -570,18 +605,16 @@ similar to the Linux script path.
 
 ### Invocation service
 
-The invocation service copies its current Agentknock executable into its
-private mode-0700 temporary directory as the Git signing helper. It uses the
-same agent and helper sockets as the Linux implementation. Copying the helper
-avoids a dependency on `/proc`, which macOS does not provide. The copied helper
-contains no secret data; the invocation token and SSH metadata remain in
-service memory.
+The invocation service uses the same helper-copying and socket implementation
+as Linux without procfs. macOS resolves the service's executable path through
+`std::env::current_exe`. The invocation
+token and SSH metadata remain in service memory.
 
 The service registers the owner PID with `kqueue` using `EVFILT_PROC` and
 `NOTE_EXIT`, and exits when that process exits. It obtains a helper's peer PID
 from the Unix-domain socket and uses the macOS process-information interface
 to require that the helper descends from the owner. These are the macOS
-counterparts of the Linux pidfd and `/proc` checks and have the same
+counterparts of the Linux pidfd checks and have the same
 best-effort, same-user security scope.
 
 ## Limits
@@ -609,8 +642,8 @@ secrets.
 - [Linux `faccessat2(2)` manual page](https://man7.org/linux/man-pages/man2/access.2.html)
 - [Linux `openat(2)` manual page](https://man7.org/linux/man-pages/man2/open.2.html)
 - [Linux `pidfd_open(2)` manual page](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)
-- [Linux `proc_pid_fd(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html)
-- [Linux `proc_pid_status(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
+- [Linux `getauxval(3)` manual page](https://man7.org/linux/man-pages/man3/getauxval.3.html)
+- [Linux pidfd ioctl interface](https://github.com/torvalds/linux/blob/v6.13/include/uapi/linux/pidfd.h)
 - [Linux `unix(7)` manual page](https://man7.org/linux/man-pages/man7/unix.7.html)
 - [macOS `execve(2)` manual page](https://keith.github.io/xcode-man-pages/execve.2.html)
 - [macOS `fcntl(2)` manual page](https://keith.github.io/xcode-man-pages/fcntl.2.html)
@@ -620,3 +653,12 @@ secrets.
 - [RFC 4252: SSH Authentication Protocol](https://www.rfc-editor.org/rfc/rfc4252.html)
 - [RFC 8332: RSA Keys with SHA-2 for SSH](https://www.rfc-editor.org/rfc/rfc8332.html)
 - [RFC 9987: SSH Agent Protocol](https://www.rfc-editor.org/rfc/rfc9987.html)
+
+## Testing without procfs
+
+On Linux, `make procfs-check` builds and runs the CLI unit tests and the command
+and invocation-service integration suites in a Bubblewrap namespace where
+`/proc` does not exist. It requires Python 3, Bubblewrap, and the same Git and
+OpenSSH tools as the normal tests. This covers environment and stdin delivery,
+script evidence, executable revalidation, SSH authentication, Git signing and
+repository context, and rejection of unrelated service clients.
