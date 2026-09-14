@@ -5,7 +5,11 @@ mod support;
 use std::{
     fs,
     io::{Read as _, Write as _},
-    os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _, net::UnixStream},
+    os::unix::{
+        ffi::OsStrExt as _,
+        fs::PermissionsExt as _,
+        net::{UnixListener, UnixStream},
+    },
     path::Path,
     process::{Child, Command, Stdio},
     thread,
@@ -274,6 +278,76 @@ fn does_not_create_git_signing_endpoints_when_disabled() {
     assert!(runtime_directory.join("agent.sock").exists());
     assert!(!runtime_directory.join("service.sock").exists());
     assert!(!runtime_directory.join("git-sign").exists());
+}
+
+#[test]
+fn git_signing_context_uses_path_and_is_optional() {
+    // The helper's parent is this test process, not Git. Only the Git in the
+    // supplied PATH can provide the fixture's repository context.
+    let git_script = "#!/bin/sh\n[ \"$*\" = 'rev-parse --path-format=absolute --show-toplevel' ] || exit 1\nprintf '%s\\n' \"$PWD\"\n";
+    for script in [Some(git_script), Some("#!/bin/sh\nexit 1\n"), None] {
+        let directory = tempfile::tempdir().unwrap();
+        let git_path = directory.path().join("git");
+        if let Some(script) = script {
+            fs::write(&git_path, script).unwrap();
+            fs::set_permissions(&git_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let helper = directory.path().join("git-sign");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_agentknock"), &helper).unwrap();
+        let key = directory.path().join("key.pub");
+        let message = directory.path().join("message");
+        fs::write(&key, PUBLIC_KEY).unwrap();
+        fs::write(&message, "test signing payload").unwrap();
+
+        let listener = UnixListener::bind(directory.path().join("service.sock")).unwrap();
+        let service = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_reader(&mut connection).unwrap();
+            assert_eq!(request["operation"], "configuration");
+            serde_json::to_writer(
+                &mut connection,
+                &json!({
+                    "status": "configuration",
+                    "public_key": PUBLIC_KEY,
+                    "ssh_passthrough": false,
+                }),
+            )
+            .unwrap();
+            drop(connection);
+            let (mut connection, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_reader(&mut connection).unwrap();
+            serde_json::to_writer(
+                &mut connection,
+                &json!({"status": "signature", "signature": "test signature"}),
+            )
+            .unwrap();
+            request
+        });
+        run(Command::new(&helper)
+            .env("PATH", directory.path())
+            .current_dir(directory.path())
+            .args(["-Y", "sign", "-n", "git", "-f"])
+            .arg(&key)
+            .arg(&message));
+        let request = service.join().unwrap();
+        assert_eq!(request["operation"], "sign");
+        assert_eq!(
+            request["message"],
+            BASE64_STANDARD.encode("test signing payload")
+        );
+        if script == Some(git_script) {
+            assert_eq!(
+                fs::canonicalize(request["repository"]["worktree"].as_str().unwrap()).unwrap(),
+                fs::canonicalize(directory.path()).unwrap()
+            );
+        } else {
+            assert!(request.get("repository").is_none());
+        }
+        assert_eq!(
+            fs::read_to_string(message.with_extension("sig")).unwrap(),
+            "test signature"
+        );
+    }
 }
 
 #[test]
