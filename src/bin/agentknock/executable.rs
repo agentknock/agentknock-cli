@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::{CString, OsStr, OsString},
     fs::File,
-    io,
+    io::{self, Seek as _},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
@@ -13,9 +13,6 @@ use std::{
     process::ChildStdout,
     ptr,
 };
-
-#[cfg(target_os = "macos")]
-use std::ffi::CStr;
 
 use agentknock::{ExecutableMode, SecretUseOutput};
 use sha2::{Digest as _, Sha256};
@@ -32,6 +29,7 @@ struct FileInspection {
 
 pub struct SelectedExecutable {
     descriptor: OwnedFd,
+    reader: Option<File>,
     command: String,
     path: String,
     hash: Option<[u8; HASH_LENGTH]>,
@@ -82,7 +80,12 @@ impl SelectedExecutable {
         }
 
         let current_directory = open_directory(Path::new("."))?;
-        let working_directory = descriptor_path(&current_directory, "working directory")?;
+        let directory_path = env::current_dir().map_err(|error| {
+            io::Error::other(format!("can't resolve working directory: {error}"))
+        })?;
+        let named_directory = open_directory(&directory_path)?;
+        require_same_file(current_directory.as_raw_fd(), named_directory.as_raw_fd())?;
+        let working_directory = utf8_path(directory_path, "working directory")?;
         let search_path = match env::var_os("PATH") {
             Some(path) => path,
             None => default_search_path()?,
@@ -148,8 +151,12 @@ impl SelectedExecutable {
         let descriptor = open_candidate(directory, candidate)?;
         require_regular_file(&descriptor)?;
         require_effective_execute_access(&descriptor)?;
-        let path = descriptor_path(&descriptor, "selected executable")?;
-        let inspection = read_selected_file(&descriptor)?;
+        let path = std::fs::canonicalize(Path::new(&working_directory).join(candidate))?;
+        let named_executable = open_candidate(libc::AT_FDCWD, &path)?;
+        require_same_file(descriptor.as_raw_fd(), named_executable.as_raw_fd())?;
+        let reader = open_reader(&descriptor, &path)?;
+        let inspection = reader.as_ref().map(read_selected_file).transpose()?;
+        let path = utf8_path(path, "selected executable")?;
         let hash = inspection.as_ref().map(|inspection| inspection.hash);
         let shebang = inspection
             .as_ref()
@@ -163,6 +170,7 @@ impl SelectedExecutable {
 
         Ok(Self {
             descriptor,
+            reader,
             command: command.to_owned(),
             path,
             hash,
@@ -278,17 +286,24 @@ impl SelectedExecutable {
         let Some(expected) = self.hash else {
             return Ok(());
         };
-        #[cfg(target_os = "linux")]
         let actual = match self.mode {
-            ExecutableMode::Binary => read_selected_file(&self.descriptor)?.map(|file| file.hash),
-            ExecutableMode::Script => Some(hash_path(
-                self.script_path
+            ExecutableMode::Binary => self
+                .reader
+                .as_ref()
+                .map(read_selected_file)
+                .transpose()?
+                .map(|file| file.hash),
+            ExecutableMode::Script => {
+                #[cfg(target_os = "linux")]
+                let path = self
+                    .script_path
                     .as_deref()
-                    .expect("a shebang script has a captured path"),
-            )?),
+                    .expect("a shebang script has a captured path");
+                #[cfg(target_os = "macos")]
+                let path = Path::new(&self.path);
+                Some(hash_path(path)?)
+            }
         };
-        #[cfg(target_os = "macos")]
-        let actual = read_selected_file(&self.descriptor)?.map(|file| file.hash);
         let Some(actual) = actual else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -475,22 +490,21 @@ fn require_effective_execute_access(descriptor: &OwnedFd) -> io::Result<()> {
     Err(error)
 }
 
-fn read_selected_file(descriptor: &OwnedFd) -> io::Result<Option<FileInspection>> {
-    #[cfg(target_os = "linux")]
-    let path = descriptor_proc_path(descriptor);
-    #[cfg(target_os = "macos")]
-    let path = descriptor_path(descriptor, "selected executable")?;
+fn open_reader(descriptor: &OwnedFd, path: &Path) -> io::Result<Option<File>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
         Err(error) => return Err(error),
     };
-    #[cfg(target_os = "macos")]
     require_same_file(descriptor.as_raw_fd(), file.as_raw_fd())?;
-    Ok(Some(inspect_file(file)?))
+    Ok(Some(file))
 }
 
-#[cfg(target_os = "linux")]
+fn read_selected_file(mut file: &File) -> io::Result<FileInspection> {
+    file.rewind()?;
+    inspect_file(file)
+}
+
 fn hash_path(path: &Path) -> io::Result<[u8; HASH_LENGTH]> {
     File::open(path).and_then(|file| inspect_file(file).map(|file| file.hash))
 }
@@ -534,53 +548,15 @@ fn inspect_file(mut file: impl io::Read) -> io::Result<FileInspection> {
     })
 }
 
-fn descriptor_path(descriptor: &OwnedFd, description: &str) -> io::Result<String> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = std::fs::read_link(descriptor_proc_path(descriptor)).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("can't read {description} through /proc/self/fd: {error}"),
-            )
-        })?;
-        path.into_os_string().into_string().map_err(|path| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{description} isn't valid UTF-8: {path:?}"),
-            )
-        })
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut path = vec![0_u8; libc::PATH_MAX as usize];
-        // SAFETY: path is a writable PATH_MAX-sized buffer, as required by F_GETPATH.
-        if unsafe {
-            libc::fcntl(
-                descriptor.as_raw_fd(),
-                libc::F_GETPATH,
-                path.as_mut_ptr().cast::<libc::c_char>(),
-            )
-        } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_GETPATH wrote a NUL-terminated path on success.
-        let path = unsafe { CStr::from_ptr(path.as_ptr().cast()) };
-        String::from_utf8(path.to_bytes().to_vec()).map_err(|path| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{description} isn't valid UTF-8: {:?}", path.into_bytes()),
-            )
-        })
-    }
+fn utf8_path(path: PathBuf, description: &str) -> io::Result<String> {
+    path.into_os_string().into_string().map_err(|path| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} isn't valid UTF-8: {path:?}"),
+        )
+    })
 }
 
-#[cfg(target_os = "linux")]
-fn descriptor_proc_path(descriptor: &OwnedFd) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
-}
-
-#[cfg(target_os = "macos")]
 fn require_same_file(left: RawFd, right: RawFd) -> io::Result<()> {
     fn status(descriptor: RawFd) -> io::Result<libc::stat> {
         let mut status = MaybeUninit::<libc::stat>::uninit();
@@ -960,6 +936,41 @@ mod tests {
             error
                 .to_string()
                 .contains("changed while Agentknock waited for the device")
+        );
+    }
+
+    #[test]
+    fn retains_the_binary_for_hash_verification_after_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("tool");
+        let retained = directory.path().join("original");
+        fs::write(&binary, b"\x7fELF original").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = SelectedExecutable::select(binary.to_str().unwrap()).unwrap();
+
+        fs::rename(&binary, &retained).unwrap();
+        fs::write(&binary, b"replacement").unwrap();
+        executable.verify_hash().unwrap();
+
+        fs::write(&retained, b"\x7fELF modified").unwrap();
+        assert_eq!(
+            executable.verify_hash().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn rejects_a_reader_for_a_replaced_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tool");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let selected = super::open_candidate(libc::AT_FDCWD, &path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert_eq!(
+            super::open_reader(&selected, &path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
         );
     }
 
