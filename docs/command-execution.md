@@ -194,7 +194,7 @@ The Linux implementation requires:
 - The `execveat` system call.
 - The `pidfd_open` system call for deferred operations.
 - A mounted `/proc` file system with executable and process-status views for
-  standard-input secret delivery, SSH authentication, and Git signing.
+  SSH authentication and Git signing.
 
 ### Working directory and search path
 
