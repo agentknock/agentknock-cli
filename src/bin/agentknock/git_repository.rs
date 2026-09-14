@@ -1,6 +1,5 @@
 use std::{
     ffi::OsStr,
-    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -45,14 +44,10 @@ enum ChangeStatus {
 
 impl Repository {
     pub fn collect(message: &[u8]) -> Option<Self> {
-        let git = parent_git()?;
-        let worktree = git_text(
-            &git,
-            ["rev-parse", "--path-format=absolute", "--show-toplevel"],
-        );
-        let head = git_head(&git);
-        let remote = git_remote(&git, head.as_ref());
-        let (changed_path_count, changed_paths) = changed_paths(&git, message)
+        let worktree = git_text(["rev-parse", "--path-format=absolute", "--show-toplevel"]);
+        let head = git_head();
+        let remote = git_remote(head.as_ref());
+        let (changed_path_count, changed_paths) = changed_paths(message)
             .map(|(count, paths)| (Some(count), paths))
             .unwrap_or((None, None));
 
@@ -70,55 +65,39 @@ impl Repository {
     }
 }
 
-fn parent_git() -> Option<PathBuf> {
-    // SAFETY: getppid has no preconditions.
-    let parent = unsafe { libc::getppid() };
-    let executable = crate::process_info::executable_path(parent).ok()?;
-    (executable.file_name() == Some(OsStr::new("git"))).then_some(executable)
-}
-
-fn git_head(git: &Path) -> Option<Head> {
-    if let Some(name) = git_text(git, ["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        let upstream = git_text(
-            git,
-            [
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{upstream}",
-            ],
-        );
+fn git_head() -> Option<Head> {
+    if let Some(name) = git_text(["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        let upstream = git_text([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ]);
         return Some(Head::Branch { name, upstream });
     }
-    git_output(git, ["rev-parse", "--verify", "HEAD"]).map(|_| Head::Detached)
+    git_output(["rev-parse", "--verify", "HEAD"]).map(|_| Head::Detached)
 }
 
-fn git_remote(git: &Path, head: Option<&Head>) -> Option<String> {
+fn git_remote(head: Option<&Head>) -> Option<String> {
     let upstream_remote = match head {
         Some(Head::Branch { name, .. }) => {
             let reference = format!("refs/heads/{name}");
-            git_text(
-                git,
-                [
-                    OsStr::new("for-each-ref"),
-                    OsStr::new("--format=%(upstream:remotename)"),
-                    OsStr::new(&reference),
-                ],
-            )
+            git_text([
+                OsStr::new("for-each-ref"),
+                OsStr::new("--format=%(upstream:remotename)"),
+                OsStr::new(&reference),
+            ])
             .filter(|remote| remote != ".")
         }
         _ => None,
     };
-    let remote = upstream_remote.or_else(|| git_text(git, ["remote"]))?;
-    let url = git_text(
-        git,
-        [
-            OsStr::new("remote"),
-            OsStr::new("get-url"),
-            OsStr::new("--"),
-            OsStr::new(&remote),
-        ],
-    )?;
+    let remote = upstream_remote.or_else(|| git_text(["remote"]))?;
+    let url = git_text([
+        OsStr::new("remote"),
+        OsStr::new("get-url"),
+        OsStr::new("--"),
+        OsStr::new(&remote),
+    ])?;
     sanitize_remote(&url)
 }
 
@@ -160,27 +139,24 @@ fn repository_identity(host: &str, path: &str) -> Option<String> {
     Some(format!("{host}/{path}"))
 }
 
-fn changed_paths(git: &Path, message: &[u8]) -> Option<(usize, Option<Vec<ChangedPath>>)> {
+fn changed_paths(message: &[u8]) -> Option<(usize, Option<Vec<ChangedPath>>)> {
     let (tree, parent) = commit_tree_and_parent(message)?;
     let base = match parent {
         Some(parent) => parent.to_owned(),
-        None => git_text(git, ["hash-object", "-t", "tree", "--stdin"])?,
+        None => git_text(["hash-object", "-t", "tree", "--stdin"])?,
     };
-    let output = git_output(
-        git,
-        [
-            OsStr::new("diff-tree"),
-            OsStr::new("--no-commit-id"),
-            OsStr::new("--name-status"),
-            OsStr::new("-r"),
-            OsStr::new("-z"),
-            OsStr::new("--no-renames"),
-            OsStr::new("--no-ext-diff"),
-            OsStr::new("--no-textconv"),
-            OsStr::new(&base),
-            OsStr::new(tree),
-        ],
-    )?;
+    let output = git_output([
+        OsStr::new("diff-tree"),
+        OsStr::new("--no-commit-id"),
+        OsStr::new("--name-status"),
+        OsStr::new("-r"),
+        OsStr::new("-z"),
+        OsStr::new("--no-renames"),
+        OsStr::new("--no-ext-diff"),
+        OsStr::new("--no-textconv"),
+        OsStr::new(&base),
+        OsStr::new(tree),
+    ])?;
     parse_changed_paths(&output)
 }
 
@@ -255,12 +231,12 @@ fn parse_changed_paths(output: &[u8]) -> Option<(usize, Option<Vec<ChangedPath>>
     }
 }
 
-fn git_text<I, S>(git: &Path, arguments: I) -> Option<String>
+fn git_text<I, S>(arguments: I) -> Option<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut output = git_output(git, arguments)?;
+    let mut output = git_output(arguments)?;
     while matches!(output.last(), Some(b'\n' | b'\r')) {
         output.pop();
     }
@@ -268,12 +244,12 @@ where
     (!text.is_empty() && !unsafe_text(&text)).then_some(text)
 }
 
-fn git_output<I, S>(git: &Path, arguments: I) -> Option<Vec<u8>>
+fn git_output<I, S>(arguments: I) -> Option<Vec<u8>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(git)
+    let output = Command::new("git")
         .args(arguments)
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
