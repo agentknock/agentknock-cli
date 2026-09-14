@@ -57,6 +57,20 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain
 
+      - &cargo-cache
+        name: Cache Cargo dependencies and build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            !target/**/incremental
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/ci.yml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/ci.yml') }}-
+
       - name: Install Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -94,6 +108,8 @@ jobs:
 
       - name: Install Rust
         run: rustup toolchain install 1.89.0 --profile minimal
+
+      - *cargo-cache
 
       - name: Check all targets
         run: cargo +1.89.0 check --locked --all-targets --all-features
@@ -324,6 +340,8 @@ jobs:
 
       - name: Install Rust
         run: rustup show active-toolchain
+
+      - *cargo-cache
 
       - name: Verify package
         run: make package-check
