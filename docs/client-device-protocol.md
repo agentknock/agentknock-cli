@@ -455,8 +455,9 @@ For an `exec` operation:
   of this string.
 - `stdin`, `stdout`, and `stderr` are `TERMINAL`, `NULL_DEVICE`, `PIPE`,
   `SOCKET`, `REGULAR_FILE`, or `UNKNOWN`.
-- `launcher_chain` contains up to four client-reported executable paths, from
-  the oldest reported ancestor to the direct launcher of Agentknock.
+- `launcher_chain` is a required array containing up to four client-reported
+  executable paths, from the oldest reported ancestor to the direct launcher
+  of Agentknock. An empty array means no launcher paths were reported.
 
 The metadata is approval context, not remote attestation. The device treats it
 as client-supplied data.

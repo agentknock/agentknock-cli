@@ -125,7 +125,10 @@ Agentknock reports a standard stream as a terminal, null device, pipe, socket,
 regular file, or unknown connection. It reads launcher paths from the platform
 process interface, up to four ancestors, and orders them from the oldest
 reported ancestor to the direct launcher. Missing, inaccessible, or non-UTF-8
-process information shortens the chain.
+process information shortens the chain; if no paths can be collected, the
+request contains `launcher_chain: []`. Linux collects this information from
+procfs, so an absent procfs produces an empty chain. macOS uses native process
+APIs and does not require procfs.
 
 This information helps a person or automated policy evaluate a request, but it
 is entirely client-reported. It is not attestation, and a modified client can
