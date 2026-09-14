@@ -979,11 +979,15 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         assert!(plaintext["operation"].get("script_contents").is_none());
         assert_eq!(plaintext["operation"]["stdout"], "PIPE");
         assert_eq!(plaintext["operation"]["stderr"], "PIPE");
-        assert!(
-            plaintext["launcher_chain"]
-                .as_array()
-                .is_some_and(|launchers| !launchers.is_empty())
-        );
+        if cfg!(target_os = "linux") && !Path::new("/proc").exists() {
+            assert_eq!(plaintext["launcher_chain"], json!([]));
+        } else {
+            assert!(
+                plaintext["launcher_chain"]
+                    .as_array()
+                    .is_some_and(|launchers| !launchers.is_empty())
+            );
+        }
         let executable_path = plaintext["operation"]["executable_path"].as_str().unwrap();
         let executable_hash = BASE64_STANDARD
             .decode(plaintext["operation"]["executable_hash"].as_str().unwrap())
@@ -1466,7 +1470,7 @@ async fn replace_selected_native_file_after_approval() -> std::process::Output {
     let home = TestHome::active();
     let selected_path = home.path().join("selected-native");
     let replacement_path = home.path().join("replacement-native");
-    fs::copy(std::env::current_exe().unwrap(), &selected_path).unwrap();
+    fs::copy(std::env::args_os().next().unwrap(), &selected_path).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_agentknock"), &replacement_path).unwrap();
     let server_selected_path = fs::canonicalize(&selected_path).unwrap();
     let device_private_key = home.device_private_key.clone();

@@ -2,7 +2,7 @@ DIST_DIR := target/dist
 DIST_LINK := target/nix-dist
 DIST_TARGET := x86_64-unknown-linux-musl
 
-.PHONY: check fix fmt-check fmt-fix clippy-check clippy-fix test installer-check installer-dist npm-check npm-dist npm-dist-check release-build docs package-check dependency-check dist dist-check
+.PHONY: procfs-check check fix fmt-check fmt-fix clippy-check clippy-fix test installer-check installer-dist npm-check npm-dist npm-dist-check release-build docs package-check dependency-check dist dist-check
 
 check: fmt-check clippy-check test installer-check npm-check release-build docs
 
@@ -23,6 +23,10 @@ clippy-fix:
 test:
 	cargo test --locked --all-targets --all-features
 	cargo test --locked --doc --all-features
+
+# Linux only; requires Python 3 and bubblewrap.
+procfs-check:
+	python3 tests/without_procfs.py
 
 installer-check:
 	sh -n install.sh
