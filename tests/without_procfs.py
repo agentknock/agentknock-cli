@@ -1,4 +1,4 @@
-"""Test executable inspection and environment/stdin-secret commands without procfs."""
+"""Test executable inspection, secret delivery, and Git helpers without procfs."""
 
 import json
 import os
@@ -8,7 +8,7 @@ import subprocess
 build = subprocess.run(
     [
         "cargo", "test", "--locked", "--all-features", "--no-run",
-        "--bin", "agentknock", "--test", "run",
+        "--bin", "agentknock", "--test", "run", "--test", "invocation_service",
         "--message-format=json-render-diagnostics",
     ],
     check=True, stdout=subprocess.PIPE, text=True,
@@ -31,6 +31,10 @@ for path in sorted(Path("/").iterdir()):
 sandbox += ["--dev", "/dev", "--tmpfs", "/tmp", "--bind", str(Path.cwd()), str(Path.cwd()), "--"]
 tests = {
     "agentknock": ["executable::tests::"],
+    "invocation_service": [
+        "creates_a_private_runtime_directory_and_follows_the_owner_lifetime",
+        "git_signing_context_uses_path_and_is_optional",
+    ],
     "run": [
         "requests_secret_use_and_executes_with_the_returned_environment",
         "selects_renames_omits_and_pipes_environment_values",
