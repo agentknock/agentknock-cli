@@ -281,6 +281,7 @@ pub fn run_git_signing_helper(arguments: &[OsString]) -> ExitCode {
 
 impl InvocationService {
     pub fn start(
+        executable: &Path,
         agentknock_home: &Path,
         invocation: &SecretUseInvocation,
         ssh: Option<&SshSecretUse>,
@@ -288,7 +289,6 @@ impl InvocationService {
         upstream_agent_socket: Option<&OsStr>,
         options: ServiceOptions,
     ) -> io::Result<Self> {
-        let executable = Path::new(".").join(executable_path()?);
         let mut process = Command::new(executable)
             .arg(INTERNAL_ARGUMENT)
             .stdin(Stdio::piped())
@@ -1016,7 +1016,7 @@ async fn wait_for_process(process: &ProcessMonitor) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn executable_path() -> io::Result<PathBuf> {
+pub fn executable_path() -> io::Result<PathBuf> {
     // SAFETY: getauxval has no preconditions.
     let path = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
     if path.is_null() {
@@ -1027,16 +1027,16 @@ fn executable_path() -> io::Result<PathBuf> {
     // SAFETY: AT_EXECFN points to a NUL-terminated pathname that remains
     // valid for the lifetime of the process.
     let path = unsafe { std::ffi::CStr::from_ptr(path) };
-    Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+    fs::canonicalize(OsStr::from_bytes(path.to_bytes()))
 }
 
 #[cfg(target_os = "macos")]
-fn executable_path() -> io::Result<PathBuf> {
+pub fn executable_path() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
 fn install_helper(path: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(std::path::absolute(executable_path()?)?, path)
+    std::os::unix::fs::symlink(executable_path()?, path)
 }
 
 fn git_signing_helper(arguments: &[OsString]) -> io::Result<()> {
