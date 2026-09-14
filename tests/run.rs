@@ -213,7 +213,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
     let server_public_key = public_key.clone();
     let server_key_blob = key_blob.clone();
     let server_agent_socket = reference_socket.clone();
-    let probe = std::env::current_exe().unwrap();
+    let probe = fs::canonicalize(std::env::args_os().next().unwrap()).unwrap();
     let expected_commands = if push_git {
         vec!["ssh".to_owned(), "git".to_owned()]
     } else {

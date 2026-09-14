@@ -700,11 +700,7 @@ async fn handle_agent_connection(
     ssh: &ServiceSsh,
     owner: &ProcessMonitor,
 ) -> io::Result<()> {
-    let peer_pid = connection
-        .peer_cred()?
-        .pid()
-        .ok_or_else(|| io::Error::other("SSH agent client has no process identifier"))?;
-    require_descendant(peer_pid, context.owner_pid)?;
+    require_invocation_client(&connection, context.owner_pid)?;
     let mut agent = AgentConnection::new(
         &ssh.selected_identity,
         context.upstream_agent_socket.as_deref(),
@@ -742,11 +738,7 @@ async fn handle_connection(
     ssh: &ServiceSsh,
     owner: &ProcessMonitor,
 ) -> io::Result<()> {
-    let peer_pid = connection
-        .peer_cred()?
-        .pid()
-        .ok_or_else(|| io::Error::other("invocation helper has no process identifier"))?;
-    require_descendant(peer_pid, context.owner_pid)?;
+    require_invocation_client(&connection, context.owner_pid)?;
     let mut input = Vec::new();
     tokio::select! {
         result = connection.read_to_end(&mut input) => { result?; }
@@ -958,6 +950,41 @@ fn open_process(pid: libc::pid_t) -> io::Result<ProcessMonitor> {
         exited,
         notification,
     })
+}
+
+fn require_invocation_client(
+    connection: &tokio::net::UnixStream,
+    owner: libc::pid_t,
+) -> io::Result<()> {
+    let peer = connection.peer_cred()?;
+    let process = peer
+        .pid()
+        .filter(|process| *process > 0)
+        .ok_or_else(|| io::Error::other("invocation client has no process identifier"))?;
+    // Check our own procfs entry: a missing peer entry can mean the peer exited.
+    #[cfg(target_os = "linux")]
+    if !fs::exists("/proc/self")? {
+        return require_same_user_and_session(process, peer.uid(), owner);
+    }
+    require_descendant(process, owner)
+}
+
+#[cfg(target_os = "linux")]
+fn require_same_user_and_session(
+    process: libc::pid_t,
+    uid: libc::uid_t,
+    owner: libc::pid_t,
+) -> io::Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    if uid != unsafe { libc::geteuid() }
+        || crate::process_info::session_id(process)? != crate::process_info::session_id(owner)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invocation client isn't in the approved command's user and session",
+        ));
+    }
+    Ok(())
 }
 
 fn require_descendant(mut process: libc::pid_t, owner: libc::pid_t) -> io::Result<()> {
@@ -1258,6 +1285,23 @@ fn progress_message(progress: RequestProgress) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_scope_requires_the_same_user_and_live_processes() {
+        let process = std::process::id() as libc::pid_t;
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        assert!(require_same_user_and_session(process, uid, process).is_ok());
+        assert_eq!(
+            require_same_user_and_session(process, uid.wrapping_add(1), process)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+        assert!(require_same_user_and_session(process, uid, libc::pid_t::MAX).is_err());
+        assert!(require_same_user_and_session(libc::pid_t::MAX, uid, libc::pid_t::MAX).is_err());
+    }
 
     #[test]
     fn accepts_only_the_git_sshsig_namespace() {

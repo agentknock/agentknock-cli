@@ -100,7 +100,7 @@ specific races:
 | Approval metadata to executable contents | Hash before the request and again before execution. | The file can change after the second hash observation. |
 | Approval wait to script execution | Rehash the captured script path immediately before `execve`. | The pathname or file can change after revalidation. |
 | Signal handling to process replacement | Block termination signals, check pending signals, then restore the caller's state. | A later signal follows the restored disposition as normal. |
-| Invocation to deferred operation | Keep the invocation token in a service tied to the command PID and check client-process ancestry. | A capable same-user process remains inside the threat boundary. |
+| Invocation to deferred operation | Keep the invocation token in a service tied to the command PID and check client-process ancestry, or the user and session when Linux procfs is absent. | A capable same-user process remains inside the threat boundary. |
 
 An executable hash is an observation, not an execution handle. Revalidating a
 hash can detect a change, but it cannot make mutable bytes immutable or make
@@ -193,8 +193,6 @@ The Linux implementation requires:
 - Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
 - The `execveat` system call.
 - The `pidfd_open` system call for deferred operations.
-- A mounted `/proc` file system with process-status views for
-  SSH authentication and Git signing.
 
 ### Working directory and search path
 
@@ -430,12 +428,15 @@ The service opens a pidfd for the owner process, whose PID remains stable when
 the launcher replaces itself with the command. It exits when that process
 exits. Before serving a helper or agent connection, it reads the peer PID from
 the Unix socket and walks Linux parent-process records to require that the
-client is a descendant of the owner. If the owner exits during a protected
-operation, the service cancels the request and attempts a short aborted
-completion.
+client is a descendant of the owner. When procfs is absent, it instead requires
+the service's effective user ID and the owner's session ID. This permits
+unrelated processes in the same user session and rejects descendants in a
+different session. Failed ancestry checks do not use this fallback. If the
+owner exits during a protected operation, the service cancels the request and
+attempts a short aborted completion.
 
-These checks keep ordinary unrelated processes from accidentally using an
-invocation service. They are not a same-user security boundary. The security
+These checks limit which local processes can use an invocation service.
+They are not a same-user security boundary. The security
 model described above still applies to the socket, process tree, invocation
 token, and service memory.
 

@@ -15,6 +15,16 @@ pub fn parent_id(process: libc::pid_t) -> io::Result<libc::pid_t> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn session_id(process: libc::pid_t) -> io::Result<libc::pid_t> {
+    // SAFETY: getsid has no preconditions.
+    let session = unsafe { libc::getsid(process) };
+    if session == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session)
+}
+
+#[cfg(target_os = "linux")]
 pub fn executable_path(process: libc::pid_t) -> io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{process}/exe"))
 }
