@@ -300,7 +300,7 @@ impl InvocationService {
             // SAFETY: AT_EXECFN points to a NUL-terminated pathname that remains
             // valid for the lifetime of the process.
             let path = unsafe { std::ffi::CStr::from_ptr(path) };
-            std::path::absolute(OsStr::from_bytes(path.to_bytes()))?
+            Path::new(".").join(OsStr::from_bytes(path.to_bytes()))
         };
         #[cfg(target_os = "macos")]
         let executable = std::env::current_exe()?;
