@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Read as _, Write as _},
     os::{
-        fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        fd::{AsRawFd as _, OwnedFd},
         unix::{
             ffi::{OsStrExt as _, OsStringExt as _},
             fs::PermissionsExt as _,
@@ -17,6 +17,9 @@ use std::{
     sync::mpsc,
     time::Duration,
 };
+
+#[cfg(target_os = "macos")]
+use std::os::fd::FromRawFd as _;
 
 #[cfg(target_os = "macos")]
 use std::sync::{
@@ -288,11 +291,7 @@ impl InvocationService {
         upstream_agent_socket: Option<&OsStr>,
         options: ServiceOptions,
     ) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        let executable = "/proc/self/exe";
-        #[cfg(target_os = "macos")]
-        let executable = std::env::current_exe()?;
-        let mut process = Command::new(executable)
+        let mut process = Command::new(current_executable()?)
             .arg(INTERNAL_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -887,15 +886,7 @@ fn close_standard_output() {
 
 #[cfg(target_os = "linux")]
 fn open_process(pid: libc::pid_t) -> io::Result<ProcessMonitor> {
-    // SAFETY: pidfd_open doesn't retain any userspace pointers. A successful
-    // call returns a newly owned close-on-exec descriptor.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pidfd_open returned a newly owned descriptor.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) };
-    tokio::io::unix::AsyncFd::new(descriptor)
+    tokio::io::unix::AsyncFd::new(crate::process_info::open(pid)?)
 }
 
 #[cfg(target_os = "macos")]
@@ -1018,15 +1009,41 @@ async fn wait_for_process(process: &ProcessMonitor) -> io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn install_helper(path: &Path) -> io::Result<()> {
-    let executable = format!("/proc/{}/exe", std::process::id());
-    std::os::unix::fs::symlink(executable, path)
+fn current_executable() -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let executable = Path::new("/proc/self/exe");
+        match fs::metadata(executable) {
+            Ok(_) => return Ok(executable.to_owned()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // SAFETY: getauxval reads the auxiliary vector supplied by the ELF loader.
+        let path = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+        if path.is_null() {
+            return Err(io::Error::other(
+                "the kernel supplied no Agentknock executable path",
+            ));
+        }
+        // SAFETY: AT_EXECFN points to a live NUL-terminated pathname.
+        let path = unsafe { std::ffi::CStr::from_ptr(path) };
+        fs::canonicalize(OsStr::from_bytes(path.to_bytes()))
+    }
+    #[cfg(target_os = "macos")]
+    std::env::current_exe()
 }
 
-#[cfg(target_os = "macos")]
 fn install_helper(path: &Path) -> io::Result<()> {
-    fs::copy(std::env::current_exe()?, path)?;
+    #[cfg(target_os = "linux")]
+    {
+        let executable = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        match fs::metadata(&executable) {
+            Ok(_) => return std::os::unix::fs::symlink(executable, path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::copy(current_executable()?, path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
