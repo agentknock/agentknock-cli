@@ -2,7 +2,7 @@
   description = "Reproducible Agentknock v1 symbolic-verification toolchain";
 
   inputs.nixpkgs.url =
-    "github:NixOS/nixpkgs/e5bdc4a41d4c072fe1e3787eaa0320a384741d44";
+    "github:NixOS/nixpkgs/ef34387ddd751e1ab8857adf4676492d32eb24ec";
   inputs.rust-overlay = {
     url = "github:oxalica/rust-overlay";
     inputs.nixpkgs.follows = "nixpkgs";
@@ -15,23 +15,23 @@
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
       };
-      rustToolchain = pkgs.rust-bin.stable."1.98.0".minimal;
+      rustToolchain = pkgs.rust-bin.stable."1.98.1".minimal;
       rustPlatform = pkgs.makeRustPlatform {
         cargo = rustToolchain;
         rustc = rustToolchain;
       };
       verifpal = rustPlatform.buildRustPackage rec {
         pname = "verifpal";
-        version = "1.4.3";
+        version = "1.4.10";
 
         src = pkgs.fetchFromGitHub {
           owner = "symbolicsoft";
           repo = "verifpal";
-          rev = "035f11d0480674a519c4835c20438f7af24f2e92";
-          hash = "sha256-UqmiO9mJiFRNsvVLuMrzvksu4QVY/9yD1hSG3vI1U90=";
+          rev = "9e525f199e0fcef6b9df1280fed69cc999ee9afc";
+          hash = "sha256-Cg8qaOGAGRYPacbv4WswcEkQrNRSh5xtO5y6gsUW3x8=";
         };
 
-        cargoHash = "sha256-48l96oZz5TvZDub+uINttQK2PLQ0MQX4I8bx+dfPYMQ=";
+        cargoHash = "sha256-c5cnkZD5XPpYab0JOF8L5h7U5GbvHBzLXH1jq4b5Y1w=";
 
         # Upstream protocol-search tests must not run on every host core.
         checkFlags = [ "--test-threads=1" ];

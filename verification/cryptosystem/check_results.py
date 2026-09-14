@@ -72,7 +72,7 @@ def verifpal_cases(directory):
 def check_verifpal(path, manifest, model, mode, sessions):
     expected = json.loads(Path(manifest).read_text())[model][mode]
     report = json.loads(Path(path).read_text())
-    require(report['version'] == '1.4.3' and report['ok'] is True, 'bad version or failed report')
+    require(report['version'] == '1.4.10' and report['ok'] is True, 'bad version or failed report')
     require(len(report['models']) == 1, 'wrong number of models')
     result = report['models'][0]
     require(result['ok'] is True and 'error' not in result, 'model failed')

@@ -176,8 +176,8 @@ first-request replacement or completion forgery.
   [Tamarin manual](https://tamarin-prover.com/manual/master/book/001_introduction.html).
 - ProVerif 2.05 is supplied by the same pin; the upstream release and manual
   are linked from the [official ProVerif site](https://bblanche.gitlabpages.inria.fr/proverif/).
-- Verifpal 1.4.3 is built from source commit
-  `035f11d0480674a519c4835c20438f7af24f2e92`, corresponding to the verified
-  [v1.4.3 release](https://github.com/symbolicsoft/verifpal/releases/tag/v1.4.3).
+- Verifpal 1.4.10 is built from source commit
+  `9e525f199e0fcef6b9df1280fed69cc999ee9afc`, corresponding to the verified
+  [v1.4.10 release](https://github.com/symbolicsoft/verifpal/releases/tag/v1.4.10).
   Its bounded-search limitations are described in the
-  [pinned upstream README](https://github.com/symbolicsoft/verifpal/blob/035f11d0480674a519c4835c20438f7af24f2e92/README.md).
+  [pinned upstream README](https://github.com/symbolicsoft/verifpal/blob/9e525f199e0fcef6b9df1280fed69cc999ee9afc/README.md).

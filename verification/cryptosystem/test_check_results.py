@@ -55,7 +55,7 @@ class ResultChecks(unittest.TestCase):
         manifest = self.root / 'cases.json'
         manifest.write_text(json.dumps({'model': {'explicit': {
             'queries': ['confidentiality? secret'], 'codes': {'2': 'c0'}}}}))
-        good = {'version': '1.4.3', 'ok': True, 'models': [{
+        good = {'version': '1.4.10', 'ok': True, 'models': [{
             'file': 'model.vp', 'ok': True, 'analysis': {
                 'model': 'model.vp', 'attacker': 'active', 'sessions': 2,
                 'assumptions': [], 'code': 'c0', 'attacks': 0, 'queries': [{

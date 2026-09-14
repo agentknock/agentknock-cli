@@ -16,7 +16,7 @@ has a separate experiment in [ProVerif](../proverif/README.md).
 bash verification/cryptosystem/verifpal/run.sh
 ```
 
-The runner pins Verifpal 1.4.3, verifies the specification hash and model
+The runner pins Verifpal 1.4.10, verifies the specification hash and model
 inventory, and checks full JSON reports against [cases.json](cases.json).
 Every query must have the expected name, kind, verdict, session bound, and
 exhausted, untruncated search envelope. Unexpected assumptions, preconditions,
@@ -33,9 +33,9 @@ use one job and two cores; upstream tests run sequentially.
 
 The exact source pin is:
 
-- release [v1.4.3](https://github.com/symbolicsoft/verifpal/releases/tag/v1.4.3);
-- annotated tag object `19bf1213b71738b75df2c5b052788ddd95714f31`;
-- source commit `035f11d0480674a519c4835c20438f7af24f2e92`;
+- release [v1.4.10](https://github.com/symbolicsoft/verifpal/releases/tag/v1.4.10);
+- annotated tag object `3985ea81ada71c5d4a60ed42ac12bafcc431b150`;
+- source commit `9e525f199e0fcef6b9df1280fed69cc999ee9afc`;
 - source and Cargo hashes in [../flake.nix](../flake.nix).
 
 Version 1.4 fixed several attack-search errors and introduced explicit AEAD
@@ -74,7 +74,7 @@ use separately derived key and nonce arguments directly. `CONCAT` otherwise
 represents the specification's unambiguous fixed-width tuples.
 
 The generic KEM is an ideal encapsulation abstraction, not an implementation of
-DHKEM(X25519). Its [pinned primitive rules](https://github.com/symbolicsoft/verifpal/blob/035f11d0480674a519c4835c20438f7af24f2e92/src/primitive/spec.rs)
+DHKEM(X25519). Its [pinned primitive rules](https://github.com/symbolicsoft/verifpal/blob/9e525f199e0fcef6b9df1280fed69cc999ee9afc/src/primitive/spec.rs)
 allow a matching private key to recover both the modeled shared secret and the
 encapsulation seed. Consequently some automatic queries report seed disclosure
 under key substitution or device-key compromise. This does not mean a real

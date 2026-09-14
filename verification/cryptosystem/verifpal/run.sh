@@ -11,7 +11,7 @@ flock -n 9 || { echo 'another Agentknock Verifpal runner is active' >&2; exit 1;
 verifpal_store=$(nix build "path:$suite_dir#verifpal" --cores 2 --max-jobs 1 --no-link --print-out-paths)
 verifpal_bin=$verifpal_store/bin/verifpal
 version=$("$verifpal_bin" --version)
-if [[ $version != 'verifpal 1.4.3' ]]; then
+if [[ $version != 'verifpal 1.4.10' ]]; then
   printf 'unexpected Verifpal version: %s\n' "$version" >&2
   exit 1
 fi
