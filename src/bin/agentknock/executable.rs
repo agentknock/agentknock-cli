@@ -153,7 +153,10 @@ impl SelectedExecutable {
         let descriptor = open_candidate(directory, candidate)?;
         require_regular_file(&descriptor)?;
         require_effective_execute_access(&descriptor)?;
-        let path = descriptor_path(&descriptor, "selected executable")?;
+        let path = std::fs::canonicalize(Path::new(&working_directory).join(candidate))?;
+        let named_executable = open_candidate(libc::AT_FDCWD, &path)?;
+        require_same_file(descriptor.as_raw_fd(), named_executable.as_raw_fd())?;
+        let path = utf8_path(path, "selected executable")?;
         let inspection = read_selected_file(&descriptor)?;
         let hash = inspection.as_ref().map(|inspection| inspection.hash);
         let shebang = inspection
@@ -539,45 +542,28 @@ fn inspect_file(mut file: impl io::Read) -> io::Result<FileInspection> {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn descriptor_path(descriptor: &OwnedFd, description: &str) -> io::Result<String> {
-    #[cfg(target_os = "linux")]
+    let mut path = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: path is a writable PATH_MAX-sized buffer, as required by F_GETPATH.
+    if unsafe {
+        libc::fcntl(
+            descriptor.as_raw_fd(),
+            libc::F_GETPATH,
+            path.as_mut_ptr().cast::<libc::c_char>(),
+        )
+    } == -1
     {
-        let path = std::fs::read_link(descriptor_proc_path(descriptor)).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("can't read {description} through /proc/self/fd: {error}"),
-            )
-        })?;
-        path.into_os_string().into_string().map_err(|path| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{description} isn't valid UTF-8: {path:?}"),
-            )
-        })
+        return Err(io::Error::last_os_error());
     }
-    #[cfg(target_os = "macos")]
-    {
-        let mut path = vec![0_u8; libc::PATH_MAX as usize];
-        // SAFETY: path is a writable PATH_MAX-sized buffer, as required by F_GETPATH.
-        if unsafe {
-            libc::fcntl(
-                descriptor.as_raw_fd(),
-                libc::F_GETPATH,
-                path.as_mut_ptr().cast::<libc::c_char>(),
-            )
-        } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_GETPATH wrote a NUL-terminated path on success.
-        let path = unsafe { CStr::from_ptr(path.as_ptr().cast()) };
-        String::from_utf8(path.to_bytes().to_vec()).map_err(|path| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{description} isn't valid UTF-8: {:?}", path.into_bytes()),
-            )
-        })
-    }
+    // SAFETY: F_GETPATH wrote a NUL-terminated path on success.
+    let path = unsafe { CStr::from_ptr(path.as_ptr().cast()) };
+    String::from_utf8(path.to_bytes().to_vec()).map_err(|path| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} isn't valid UTF-8: {:?}", path.into_bytes()),
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
