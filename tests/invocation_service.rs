@@ -9,6 +9,7 @@ use std::{
         ffi::OsStrExt as _,
         fs::PermissionsExt as _,
         net::{UnixListener, UnixStream},
+        process::CommandExt as _,
     },
     path::Path,
     process::{Child, Command, Stdio},
@@ -41,12 +42,27 @@ impl Drop for ChildGuard {
 
 #[test]
 fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
-    let mut owner = ChildGuard(
-        Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("start invocation owner"),
-    );
+    check_service_scope(false);
+    check_service_scope(true);
+}
+
+fn check_service_scope(separate_session: bool) {
+    let mut command = Command::new("sleep");
+    command.arg("30");
+    if separate_session {
+        // SAFETY: setsid is async-signal-safe and touches no userspace memory.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut owner = ChildGuard(command.spawn().expect("start invocation owner"));
+    let permitted =
+        cfg!(target_os = "linux") && !fs::exists("/proc/self").unwrap() && !separate_session;
     let mut service = ChildGuard(start_service());
     let response = send_startup(
         &mut service.0,
@@ -81,30 +97,42 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
         fs::canonicalize(env!("CARGO_BIN_EXE_agentknock")).unwrap()
     );
 
-    let mut unauthorized = UnixStream::connect(Path::new(runtime_directory).join("service.sock"))
+    let mut client = UnixStream::connect(Path::new(runtime_directory).join("service.sock"))
         .expect("connect from a process outside the invocation");
-    if let Err(error) = unauthorized.write_all(br#"{"operation":"configuration"}"#) {
+    if let Err(error) = client.write_all(br#"{"operation":"configuration"}"#) {
         assert!(matches!(
             error.kind(),
             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
         ));
     }
-    let _ = unauthorized.shutdown(std::net::Shutdown::Write);
+    let _ = client.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
-    if let Err(error) = unauthorized.read_to_end(&mut response) {
+    if let Err(error) = client.read_to_end(&mut response) {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     }
-    assert!(response.is_empty());
+    if permitted {
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["status"], "configuration");
+        assert_eq!(response["public_key"], PUBLIC_KEY);
+    } else {
+        assert!(response.is_empty());
+    }
     assert!(service.0.try_wait().unwrap().is_none());
 
-    let mut unauthorized = UnixStream::connect(Path::new(runtime_directory).join("agent.sock"))
+    let mut client = UnixStream::connect(Path::new(runtime_directory).join("agent.sock"))
         .expect("connect to the SSH agent from outside the invocation");
-    let _ = unauthorized.write_all(&[0, 0, 0, 1, 11]);
+    let _ = client.write_all(&[0, 0, 0, 1, 11]);
+    let _ = client.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
-    if let Err(error) = unauthorized.read_to_end(&mut response) {
+    if let Err(error) = client.read_to_end(&mut response) {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     }
-    assert!(response.is_empty());
+    if permitted {
+        assert_eq!(response[4], 12); // SSH_AGENT_IDENTITIES_ANSWER
+        assert_eq!(u32::from_be_bytes(response[5..9].try_into().unwrap()), 1);
+    } else {
+        assert!(response.is_empty());
+    }
     assert!(service.0.try_wait().unwrap().is_none());
 
     owner.0.kill().unwrap();
