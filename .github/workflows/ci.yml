@@ -333,11 +333,11 @@ jobs:
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
           startsWith(github.head_ref, 'release-plz-')
-        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260 # v0.5.132
+        uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         with:
           command: release
           dry_run: true
-          version: 0.3.161
+          version: 0.3.167
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -393,9 +393,9 @@ jobs:
 
       - name: Prepare or publish release
         id: release-plz
-        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260 # v0.5.132
+        uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         with:
-          version: 0.3.161
+          version: 0.3.167
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
