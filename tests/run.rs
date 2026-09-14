@@ -1741,6 +1741,41 @@ fn rejects_a_missing_command_before_sending_an_invocation() {
     assert!(!stderr.contains("relay"), "{stderr}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn reports_an_unavailable_working_directory_without_calling_the_command_missing() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let home = TestHome::active();
+    let directory = tempfile::tempdir().unwrap();
+    let path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
+    command
+        .current_dir(directory.path())
+        .env("HOME", home.path())
+        .env_remove("AGENTKNOCK_HOME")
+        .env("AGENTKNOCK_TEST_RELAY_URL", "ws://127.0.0.1:1")
+        .args(["-s", "test", "--", "true"]);
+    // SAFETY: rmdir is async-signal-safe, and path remains live in the child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::rmdir(path.as_ptr()) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("can't resolve working directory"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("did not contact the device"), "{stderr}");
+    assert!(!stderr.contains("wasn't found"), "{stderr}");
+}
+
 #[test]
 fn rejects_a_duplicate_secret() {
     for arguments in [

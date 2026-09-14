@@ -82,7 +82,12 @@ impl SelectedExecutable {
         }
 
         let current_directory = open_directory(Path::new("."))?;
-        let working_directory = descriptor_path(&current_directory, "working directory")?;
+        let directory_path = env::current_dir().map_err(|error| {
+            io::Error::other(format!("can't resolve working directory: {error}"))
+        })?;
+        let named_directory = open_directory(&directory_path)?;
+        require_same_file(current_directory.as_raw_fd(), named_directory.as_raw_fd())?;
+        let working_directory = utf8_path(directory_path, "working directory")?;
         let search_path = match env::var_os("PATH") {
             Some(path) => path,
             None => default_search_path()?,
@@ -580,7 +585,15 @@ fn descriptor_proc_path(descriptor: &OwnedFd) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
 }
 
-#[cfg(target_os = "macos")]
+fn utf8_path(path: PathBuf, description: &str) -> io::Result<String> {
+    path.into_os_string().into_string().map_err(|path| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} isn't valid UTF-8: {path:?}"),
+        )
+    })
+}
+
 fn require_same_file(left: RawFd, right: RawFd) -> io::Result<()> {
     fn status(descriptor: RawFd) -> io::Result<libc::stat> {
         let mut status = MaybeUninit::<libc::stat>::uninit();
