@@ -5,7 +5,9 @@ mod support;
 use std::{
     fs,
     io::{Read as _, Write as _},
-    os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _, net::UnixStream},
+    os::unix::{
+        ffi::OsStrExt as _, fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _,
+    },
     path::Path,
     process::{Child, Command, Stdio},
     thread,
@@ -68,6 +70,17 @@ fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
     assert!(metadata.is_dir());
     assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     assert!(Path::new(runtime_directory).join("agent.sock").exists());
+    let helper = fs::symlink_metadata(Path::new(runtime_directory).join("git-sign")).unwrap();
+    if cfg!(target_os = "linux") && std::env::var_os("AGENTKNOCK_TEST_WITHOUT_PROCFS").is_none() {
+        assert!(helper.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(Path::new(runtime_directory).join("git-sign")).unwrap(),
+            Path::new(&format!("/proc/{}/exe", service.0.id()))
+        );
+    } else {
+        assert!(helper.is_file());
+        assert_eq!(helper.permissions().mode() & 0o777, 0o700);
+    }
 
     let mut unauthorized = UnixStream::connect(Path::new(runtime_directory).join("service.sock"))
         .expect("connect from a process outside the invocation");
@@ -546,6 +559,7 @@ fn start_service() -> Child {
 fn service_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentknock"));
     command
+        .arg0("unrelated-argv-zero")
         .arg("__invocation-service")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -854,7 +868,7 @@ async fn owner_exit_allows_abort_completion_and_retry() {
             })).await;
         }).await;
         let mut owner = ChildGuard(
-            Command::new(std::env::current_exe().unwrap())
+            Command::new(support::test_executable())
                 .args(["--exact", "signing_owner_probe", "--nocapture"])
                 .env(
                     "AGENTKNOCK_TEST_SIGNING_OWNER",

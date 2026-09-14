@@ -35,6 +35,11 @@ use tokio::{
 use tokio_websockets::{Message, ServerBuilder, WebSocketStream};
 use ulid::Ulid;
 
+// Test binaries are launched by absolute pathname, including when procfs is hidden.
+pub fn test_executable() -> PathBuf {
+    fs::canonicalize(std::env::args_os().next().unwrap()).unwrap()
+}
+
 pub type Aead = ChaCha20Poly1305;
 pub type Kdf = HkdfSha256;
 pub type Kem = X25519HkdfSha256;
