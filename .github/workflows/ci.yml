@@ -62,14 +62,20 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install OpenSSH server
+      - name: Install Linux test dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes openssh-server
+          sudo apt-get install --yes openssh-server bubblewrap
 
       - name: Run checks and integration tests
         run: make check
+
+      - name: Test command preparation and execution without procfs
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          make procfs-check
 
       - name: Check minimum Rust version on macOS
         if: runner.os == 'macOS'

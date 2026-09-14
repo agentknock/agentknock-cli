@@ -193,8 +193,8 @@ The Linux implementation requires:
 - Linux 5.8 or later for `faccessat2` with `AT_EMPTY_PATH` and `AT_EACCESS`.
 - The `execveat` system call.
 - The `pidfd_open` system call for deferred operations.
-- A mounted `/proc` file system with usable file-descriptor and process-status
-  views.
+- A mounted `/proc` file system with executable and process-status views for
+  standard-input secret delivery, SSH authentication, and Git signing.
 
 ### Working directory and search path
 
@@ -216,9 +216,7 @@ The search continues after errors that ordinary executable lookup treats as a
 missing candidate, including a candidate that is not executable. Other errors
 stop the search.
 
-Agentknock does not canonicalize a pathname and later reopen it. A canonical
-path is still a mutable name, not a stable reference to a file-system object.
-It also does not repeat the `PATH` search after approval because the directory
+Agentknock does not repeat the `PATH` search after approval because the directory
 contents and final environment might then select a different command.
 
 ### Selected executable
@@ -244,8 +242,8 @@ Normal path resolution follows symbolic links. Agentknock retains the object
 to which a link resolved during selection instead of rejecting links or
 retaining the link itself.
 
-Agentknock obtains the displayed `executable_path` by reading
-`/proc/self/fd/<fd>` for the opened object. If the resulting path is not valid
+Agentknock obtains the displayed `executable_path` by canonicalizing the
+selected pathname. If the resulting path is not valid
 UTF-8, Agentknock stops before sending a request. The selected descriptor
 remains open during request delivery, approval, response authentication, and
 completion handoff.
@@ -536,7 +534,7 @@ Linux follow from macOS not providing a public equivalent of `execveat` or
 Agentknock opens the current directory with `O_SEARCH | O_CLOEXEC` and each
 candidate with `O_EXEC | O_CLOEXEC`. Opening the candidate checks execute
 access. Agentknock requires a regular file and retains both the candidate
-descriptor and the absolute path returned by `fcntl` with `F_GETPATH`.
+descriptor and the canonicalized absolute path.
 
 Relative command paths and relative `PATH` entries are resolved from the
 retained current-directory descriptor. Absolute paths and `PATH` searches
@@ -551,9 +549,8 @@ as a binary.
 
 Immediately before execution, Agentknock opens the captured path again with
 `O_EXEC` and requires the device and inode numbers to match the retained
-descriptor. If a hash was reported, it also reopens the path for reading,
-checks the object identity, and recalculates the hash. A missing path, changed
-identity, unreadable previously hashed file, or hash mismatch stops execution.
+descriptor. If a hash was reported, it recalculates it as described above.
+A missing path, changed identity, read failure, or hash mismatch stops execution.
 
 ### Process replacement
 
@@ -609,7 +606,6 @@ secrets.
 - [Linux `faccessat2(2)` manual page](https://man7.org/linux/man-pages/man2/access.2.html)
 - [Linux `openat(2)` manual page](https://man7.org/linux/man-pages/man2/open.2.html)
 - [Linux `pidfd_open(2)` manual page](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)
-- [Linux `proc_pid_fd(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html)
 - [Linux `proc_pid_status(5)` manual page](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
 - [Linux `unix(7)` manual page](https://man7.org/linux/man-pages/man7/unix.7.html)
 - [macOS `execve(2)` manual page](https://keith.github.io/xcode-man-pages/execve.2.html)
