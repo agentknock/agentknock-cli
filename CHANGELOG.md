@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/agentknock/agentknock-cli/compare/v0.6.0...v0.6.1) - 2026-09-14
+
+### Fixed
+
+- allow SSH and Git signing without procfs
+- resolve the service executable before approval
+- symlink Git signing helpers to the executable path
+- *(deps)* refresh project dependencies and build tools
+- preserve relative invocation-service launch paths
+- start invocation services using executable launch paths
+- inspect executables through retained readable descriptors
+- resolve executable paths without procfs
+- resolve the working directory without procfs
+- collect Git repository context through PATH
+
+### Other
+
+- simplify the early release notice
+
 ## [0.6.0](https://github.com/agentknock/agentknock-cli/compare/v0.5.0...v0.6.0) - 2026-09-12
 
 ### Added
