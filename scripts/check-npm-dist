@@ -11,6 +11,14 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+check_sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum --check "$1"
+	else
+		shasum -a 256 --check "$1"
+	fi
+}
+
 version=$(awk '
 	/^\[package\]$/ { package = 1; next }
 	/^\[/ { package = 0 }
@@ -29,7 +37,7 @@ package=agentknock-$version.tgz
 
 (
 	cd "$dist_dir"
-	sha256sum --check "$package.sha256"
+	check_sha256 "$package.sha256"
 )
 
 npm install --ignore-scripts --no-audit --no-fund --prefix "$test_dir" \
