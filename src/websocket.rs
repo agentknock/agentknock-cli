@@ -19,11 +19,9 @@ use tokio_websockets::{
     ClientBuilder, Connector, Limits, MaybeTlsStream, Message, WebSocketStream, upgrade,
 };
 
-use crate::{ApplicationInfo, Client, config::Pairing, proxy};
+use crate::{ApplicationInfo, Client, config::Pairing, protocol, proxy};
 
 const RELAY_URL: &str = "wss://relay.agentknock.dev";
-const LIBRARY_PRODUCT_NAME: &str = env!("CARGO_PKG_NAME");
-const LIBRARY_PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(all(feature = "integration-tests", debug_assertions))]
 const TEST_RELAY_URL_ENV: &str = "AGENTKNOCK_TEST_RELAY_URL";
 const MAXIMUM_FRAME_SIZE: usize = 256 * 1024;
@@ -74,7 +72,7 @@ enum ConnectionKind {
 }
 
 fn user_agent(application: &ApplicationInfo) -> HeaderValue {
-    let library = product(LIBRARY_PRODUCT_NAME, LIBRARY_PRODUCT_VERSION)
+    let library = product(protocol::LIBRARY_NAME, protocol::LIBRARY_VERSION)
         .expect("the Cargo package name and version are valid HTTP product tokens");
     let value = match product(application.name(), application.version()) {
         Some(application) if application != library => format!("{application} {library}"),

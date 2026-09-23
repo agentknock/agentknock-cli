@@ -9,7 +9,7 @@ use crate::{
     Client, RequestError, RequestProgress,
     config::{ConfigurationError, clear_rotation_key, read_pairing_from},
     crypto::Session,
-    protocol::{self, Method, Response},
+    protocol::{self, EmptyMessage, Method, MethodRequest, Response},
     websocket::RelayExchange,
 };
 
@@ -177,7 +177,7 @@ impl Client {
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
         let plaintext = self
-            .encode(&ListRequest {
+            .encode(&MethodRequest {
                 method: Method::SecretList,
             })
             .map_err(RequestError::other)?;
@@ -341,14 +341,6 @@ impl Client {
         }
     }
 }
-
-#[derive(Serialize)]
-struct ListRequest {
-    method: Method,
-}
-
-#[derive(Serialize)]
-struct EmptyMessage {}
 
 #[derive(Deserialize)]
 struct ListResponse {

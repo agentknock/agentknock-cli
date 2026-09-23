@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use crate::{ApplicationInfo, Client, crypto, crypto::Session};
 
-const LIBRARY_NAME: &str = "agentknock";
-const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const LIBRARY_NAME: &str = env!("CARGO_PKG_NAME");
+pub(crate) const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Serialize)]
 pub(crate) enum Method {
@@ -18,6 +18,17 @@ pub(crate) enum Method {
     GitSign,
     SshAuthenticate,
 }
+
+/// A request whose contents are only its method.
+#[derive(Serialize)]
+pub(crate) struct MethodRequest {
+    pub(crate) method: Method,
+}
+
+/// A response or completion without contents.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EmptyMessage {}
 
 pub(crate) fn encode<T>(
     application_info: &ApplicationInfo,

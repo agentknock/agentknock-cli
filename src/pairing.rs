@@ -23,7 +23,7 @@ use crate::{
         self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
         derive_pairing_commitment, derive_psk_rotation, generate_client_secret, seal_pairing,
     },
-    protocol::{self, Method, Response},
+    protocol::{self, EmptyMessage, Method, MethodRequest, Response},
     websocket::RelayExchange,
 };
 
@@ -432,15 +432,6 @@ struct PairingRequest {
     version: &'static str,
     commitment: String,
 }
-
-#[derive(Serialize)]
-struct MethodRequest {
-    method: Method,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyMessage {}
 
 #[derive(Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
