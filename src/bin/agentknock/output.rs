@@ -24,17 +24,37 @@ impl OutputMode {
     }
 }
 
+/// How diagnostics are written to standard error.
+///
+/// Diagnostics are prefixed when they can be interleaved with a command's output.
+#[derive(Clone, Copy)]
+pub enum Diagnostics {
+    Prefixed,
+    Plain,
+}
+
+impl Diagnostics {
+    pub fn print(self, message: impl Display) {
+        for line in message.to_string().lines() {
+            match self {
+                Self::Prefixed => eprintln!("AGENTKNOCK: {line}"),
+                Self::Plain => eprintln!("{line}"),
+            }
+        }
+    }
+}
+
 pub struct Progress<M> {
     current: Cell<Option<RequestProgress>>,
     mode: OutputMode,
-    prefixed: bool,
+    diagnostics: Diagnostics,
     message: M,
 }
 
 impl<M: Fn(RequestProgress) -> &'static str> Progress<M> {
     pub fn plain(message: M) -> Self {
         Self {
-            prefixed: false,
+            diagnostics: Diagnostics::Plain,
             ..Self::for_command(OutputMode::Normal, message)
         }
     }
@@ -43,7 +63,7 @@ impl<M: Fn(RequestProgress) -> &'static str> Progress<M> {
         Self {
             current: Cell::new(None),
             mode,
-            prefixed: true,
+            diagnostics: Diagnostics::Prefixed,
             message,
         }
     }
@@ -75,18 +95,16 @@ impl<M: Fn(RequestProgress) -> &'static str> Progress<M> {
     }
 
     fn print(&self, message: impl Display) {
-        if self.prefixed {
-            print_message(message);
-        } else {
-            eprintln!("{message}");
-        }
+        self.diagnostics.print(message);
     }
 }
 
 pub fn print_message(message: impl Display) {
-    for line in message.to_string().lines() {
-        eprintln!("AGENTKNOCK: {line}");
-    }
+    Diagnostics::Prefixed.print(message);
+}
+
+pub fn print_plain_error(message: impl Display) {
+    Diagnostics::Plain.print(message);
 }
 
 fn progress_report(message: &str, elapsed: Duration) -> String {
@@ -116,6 +134,7 @@ fn format_elapsed_time(elapsed: Duration) -> String {
         parts.join(" ")
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,7 +29,7 @@ use agentknock::{
 use clap::{ArgAction, Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use executable::{CommandEnvironment, SelectedExecutable, SignalState};
 use futures_util::FutureExt as _;
-use output::{OutputMode, Progress, print_message};
+use output::{Diagnostics, OutputMode, Progress, print_message, print_plain_error};
 use ssh_key::{LineEnding, PrivateKey};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -915,7 +915,7 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
                     print_plain_error(format_args!(
                         "Agentknock couldn't select its home directory: {error}"
                     ));
-                    print_plain_configuration_action(&error);
+                    print_configuration_action(Diagnostics::Plain, &error);
                 }
             }
             return ExitCode::FAILURE;
@@ -1545,30 +1545,27 @@ fn print_command_error(error: &CommandError, output: OutputMode) {
             print_run_request_error(error);
         }
         CommandError::RunSelection { program, source } => {
-            match source.kind() {
+            let suggestion = match source.kind() {
                 io::ErrorKind::NotFound => {
                     print_message(format_args!("Command {program:?} wasn't found."));
+                    Some("Suggested action: Check the command name or path.")
                 }
                 io::ErrorKind::PermissionDenied => {
                     print_message(format_args!(
                         "Agentknock can't run command {program:?}: {source}"
                     ));
+                    Some("Suggested action: Check the command's execute permissions.")
                 }
                 _ => {
                     print_message(format_args!(
                         "Agentknock couldn't prepare command {program:?}: {source}"
                     ));
+                    None
                 }
-            }
+            };
             print_message("Agentknock did not contact the device.");
-            match source.kind() {
-                io::ErrorKind::NotFound => {
-                    print_message("Suggested action: Check the command name or path.");
-                }
-                io::ErrorKind::PermissionDenied => {
-                    print_message("Suggested action: Check the command's execute permissions.");
-                }
-                _ => {}
+            if let Some(suggestion) = suggestion {
+                print_message(suggestion);
             }
         }
         CommandError::RunSignal(source) => {
@@ -1637,7 +1634,7 @@ fn print_pairing_status_error(error: &ConfigurationError) {
     print_plain_error(format_args!(
         "Agentknock couldn't read the pairing status: {error}"
     ));
-    print_plain_configuration_action(error);
+    print_configuration_action(Diagnostics::Plain, error);
 }
 
 fn print_upload_error(error: &SecretUploadError) {
@@ -1651,8 +1648,7 @@ fn print_upload_error(error: &SecretUploadError) {
             ConfigurationError::NoPairing { .. },
         )) => {
             print_plain_error("Agentknock isn't paired, so it can't send the secret upload.");
-            print_plain_error("Suggested action: Get a pairing address, then run:");
-            print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
+            suggest_pairing_start(Diagnostics::Plain);
         }
         SecretUploadError::Request(RequestError::Configuration(
             ConfigurationError::PairingPending { .. },
@@ -1660,14 +1656,13 @@ fn print_upload_error(error: &SecretUploadError) {
             print_plain_error(
                 "Pairing is waiting for confirmation, so Agentknock can't send the secret upload.",
             );
-            print_plain_error("Suggested action: After you approve the pairing, run:");
-            print_plain_error("agentknock pairing finish");
+            suggest_pairing_finish(Diagnostics::Plain);
         }
         SecretUploadError::Request(RequestError::Configuration(error)) => {
             print_plain_error(format_args!(
                 "Agentknock couldn't send the secret upload: {error}"
             ));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
         SecretUploadError::Request(RequestError::RelayUnavailable { failures }) => {
             print_plain_error(format_args!(
@@ -1678,11 +1673,11 @@ fn print_upload_error(error: &SecretUploadError) {
             );
         }
         SecretUploadError::Request(RequestError::Unauthenticated { code, message }) => {
-            print_plain_unauthenticated_report(code, message);
+            print_unauthenticated_report(Diagnostics::Plain, code, message);
             print_plain_error(
                 "Agentknock didn't receive authenticated confirmation that the device saved the upload.",
             );
-            print_plain_unauthenticated_action(code);
+            print_unauthenticated_action(Diagnostics::Plain, code);
         }
         SecretUploadError::Request(RequestError::ClientInactive { message }) => {
             print_plain_error(format_args!(
@@ -1699,11 +1694,6 @@ fn print_upload_error(error: &SecretUploadError) {
             print_plain_error("Agentknock received a signal and canceled the secret upload.");
             print_plain_error("The device might still have received the upload.");
         }
-        SecretUploadError::Request(error) => {
-            print_plain_error(format_args!(
-                "Agentknock couldn't send the secret upload: {error}"
-            ));
-        }
         _ => {
             print_plain_error(format_args!(
                 "Agentknock couldn't send the secret upload: {error}"
@@ -1716,19 +1706,17 @@ fn print_list_error(error: &RequestError) {
     match error {
         RequestError::Configuration(ConfigurationError::NoPairing { .. }) => {
             print_plain_error("Agentknock isn't paired, so it can't list secrets.");
-            print_plain_error("Suggested action: Get a pairing address, then run:");
-            print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
+            suggest_pairing_start(Diagnostics::Plain);
         }
         RequestError::Configuration(ConfigurationError::PairingPending { .. }) => {
             print_plain_error(
                 "Pairing is waiting for confirmation, so Agentknock can't list secrets.",
             );
-            print_plain_error("Suggested action: After you approve the pairing, run:");
-            print_plain_error("agentknock pairing finish");
+            suggest_pairing_finish(Diagnostics::Plain);
         }
         RequestError::Configuration(error) => {
             print_plain_error(format_args!("Agentknock couldn't list secrets: {error}"));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
         RequestError::RelayUnavailable { .. } => {
             print_plain_error(format_args!("Agentknock couldn't list secrets: {error}"));
@@ -1736,10 +1724,10 @@ fn print_list_error(error: &RequestError) {
             print_plain_error("agentknock secret list");
         }
         RequestError::Unauthenticated { code, message } => {
-            print_plain_unauthenticated_report(code, message);
+            print_unauthenticated_report(Diagnostics::Plain, code, message);
             print_plain_error("Agentknock didn't receive a secret list.");
             print_plain_error("The unauthenticated report didn't change the local pairing.");
-            print_plain_unauthenticated_action(code);
+            print_unauthenticated_action(Diagnostics::Plain, code);
         }
         RequestError::ClientInactive { message } => {
             print_plain_error(format_args!(
@@ -1813,10 +1801,10 @@ fn print_run_request_error(error: &RequestError) {
             );
         }
         RequestError::Unauthenticated { code, message } => {
-            print_unauthenticated_report(code, message);
+            print_unauthenticated_report(Diagnostics::Prefixed, code, message);
             print_message("The command didn't run.");
             print_message("The unauthenticated report didn't change the local pairing.");
-            print_unauthenticated_action(code);
+            print_unauthenticated_action(Diagnostics::Prefixed, code);
         }
         RequestError::ClientInactive { message } => {
             print_message(format_args!(
@@ -1827,12 +1815,6 @@ fn print_run_request_error(error: &RequestError) {
         RequestError::DeviceRejected { code, message } => {
             print_message(format_args!(
                 "The device couldn't process the request ({code}): {message}"
-            ));
-            print_message("The command didn't run.");
-        }
-        RequestError::Other(source) => {
-            print_message(format_args!(
-                "Agentknock couldn't prepare the selected secrets for the command: {source}"
             ));
             print_message("The command didn't run.");
         }
@@ -1850,33 +1832,27 @@ fn print_run_request_error(error: &RequestError) {
 }
 
 fn print_run_configuration_error(error: &ConfigurationError) {
+    let out = Diagnostics::Prefixed;
     match error {
         ConfigurationError::NoPairing { .. } => {
             print_message("Agentknock isn't paired, so the command didn't run.");
-            print_message("Suggested action: Get a pairing address, then run:");
-            print_message("agentknock pairing start <PAIRING_ADDRESS>");
+            suggest_pairing_start(out);
         }
         ConfigurationError::PairingPending { .. } => {
             print_message("Pairing is waiting for confirmation, so the command didn't run.");
-            print_message("Suggested action: After you approve the pairing, run:");
-            print_message("agentknock pairing finish");
+            suggest_pairing_finish(out);
         }
         ConfigurationError::InsecurePermissions { path, mode } => {
             print_message(format_args!(
                 "Pairing file {path:?} has permissions {mode:04o}. Agentknock requires 0600."
             ));
             print_message("The command didn't run.");
-            print_message("Suggested action: Run:");
-            print_message(format_args!("chmod 600 {}", shell_word(path)));
         }
         ConfigurationError::HomeNotSet | ConfigurationError::InvalidHome { .. } => {
             print_message(format_args!(
                 "Agentknock couldn't select its home directory: {error}"
             ));
             print_message("The command didn't run.");
-            print_message(
-                "Suggested action: Use --agentknock-home or set AGENTKNOCK_HOME to an absolute directory path.",
-            );
         }
         ConfigurationError::Invalid { path, source } => {
             print_message(format_args!("Pairing file {path:?} isn't valid: {source}"));
@@ -1885,7 +1861,6 @@ fn print_run_configuration_error(error: &ConfigurationError) {
         ConfigurationError::InvalidSystemTime(_) => {
             print_message(format_args!("The system clock isn't valid: {error}"));
             print_message("The command didn't run.");
-            print_message("Suggested action: Correct the system clock.");
         }
         _ => {
             print_message(format_args!(
@@ -1893,6 +1868,7 @@ fn print_run_configuration_error(error: &ConfigurationError) {
             ));
         }
     }
+    print_configuration_action(out, error);
 }
 
 fn print_start_pairing_error(error: &RequestError) {
@@ -1909,7 +1885,7 @@ fn print_start_pairing_error(error: &RequestError) {
         }
         RequestError::Configuration(error) => {
             print_plain_error(format_args!("Agentknock couldn't start pairing: {error}"));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
         RequestError::RelayUnavailable { failures } => {
             print_plain_error(format_args!(
@@ -1920,9 +1896,9 @@ fn print_start_pairing_error(error: &RequestError) {
             );
         }
         RequestError::Unauthenticated { code, message } => {
-            print_plain_unauthenticated_report(code, message);
+            print_unauthenticated_report(Diagnostics::Plain, code, message);
             print_plain_error("Pairing didn't start. The local pairing state is unchanged.");
-            print_plain_unauthenticated_action(code);
+            print_unauthenticated_action(Diagnostics::Plain, code);
         }
         RequestError::Interrupted => {
             print_plain_error("Agentknock received a signal and canceled pairing.");
@@ -1938,8 +1914,7 @@ fn print_finish_pairing_error(error: &RequestError) {
     match error {
         RequestError::Configuration(ConfigurationError::NoPairing { .. }) => {
             print_plain_error("No pairing is waiting for confirmation.");
-            print_plain_error("Suggested action: Get a pairing address, then run:");
-            print_plain_error("agentknock pairing start <PAIRING_ADDRESS>");
+            suggest_pairing_start(Diagnostics::Plain);
         }
         RequestError::Configuration(ConfigurationError::PairingNotPending { .. }) => {
             print_plain_error(
@@ -1948,7 +1923,7 @@ fn print_finish_pairing_error(error: &RequestError) {
         }
         RequestError::Configuration(error) => {
             print_plain_error(format_args!("Agentknock couldn't finish pairing: {error}"));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
         RequestError::PairingRejected => {
             print_plain_error(
@@ -1958,9 +1933,9 @@ fn print_finish_pairing_error(error: &RequestError) {
             print_plain_error("agentknock pairing abort");
         }
         RequestError::Unauthenticated { code, message } => {
-            print_plain_unauthenticated_report(code, message);
+            print_unauthenticated_report(Diagnostics::Plain, code, message);
             print_plain_error("The unauthenticated report didn't change the local pairing.");
-            print_plain_unauthenticated_action(code);
+            print_unauthenticated_action(Diagnostics::Plain, code);
         }
         RequestError::ClientInactive { message } => {
             print_plain_error(format_args!(
@@ -2001,7 +1976,7 @@ fn print_abort_pairing_error(error: &ConfigurationError) {
             print_plain_error(format_args!(
                 "Agentknock couldn't discard the pending pairing: {error}"
             ));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
     }
 }
@@ -2020,7 +1995,7 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
             print_plain_error(format_args!(
                 "Agentknock couldn't start pairing removal: {error}"
             ));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
         PairingRemoveError::Request(RequestError::Interrupted) => {
             print_plain_error("Agentknock received a signal and canceled pairing removal.");
@@ -2029,8 +2004,8 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
         PairingRemoveError::Request(error) => {
             match error {
                 RequestError::Unauthenticated { code, message } => {
-                    print_plain_unauthenticated_report(code, message);
-                    print_plain_unauthenticated_action(code);
+                    print_unauthenticated_report(Diagnostics::Plain, code, message);
+                    print_unauthenticated_action(Diagnostics::Plain, code);
                 }
                 RequestError::ClientInactive { message } => {
                     print_plain_error(format_args!(
@@ -2060,7 +2035,7 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
             print_plain_error(format_args!(
                 "The device removed the pairing, but Agentknock couldn't remove the local pairing: {error}"
             ));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
         _ => {
             print_plain_error(format_args!(
@@ -2070,34 +2045,29 @@ fn print_remove_pairing_error(error: &PairingRemoveError) {
     }
 }
 
-fn print_unauthenticated_report(code: &str, message: &str) {
-    print_message(format_args!(
+fn print_unauthenticated_report(out: Diagnostics, code: &str, message: &str) {
+    out.print(format_args!(
         "Received an unauthenticated error report ({code:?}): {message:?}"
     ));
-    print_message("The report could have come from the relay instead of the device.");
+    out.print("The report could have come from the relay instead of the device.");
 }
 
-fn print_plain_unauthenticated_report(code: &str, message: &str) {
-    print_plain_error(format_args!(
-        "Received an unauthenticated error report ({code:?}): {message:?}"
-    ));
-    print_plain_error("The report could have come from the relay instead of the device.");
-}
-
-fn print_unauthenticated_action(code: &str) {
+fn print_unauthenticated_action(out: Diagnostics, code: &str) {
     if code == "UNSUPPORTED_PROTOCOL_VERSION" {
-        print_message(
+        out.print(
             "Suggested action: Use Agentknock and device software that support the same protocol version.",
         );
     }
 }
 
-fn print_plain_unauthenticated_action(code: &str) {
-    if code == "UNSUPPORTED_PROTOCOL_VERSION" {
-        print_plain_error(
-            "Suggested action: Use Agentknock and device software that support the same protocol version.",
-        );
-    }
+fn suggest_pairing_start(out: Diagnostics) {
+    out.print("Suggested action: Get a pairing address, then run:");
+    out.print("agentknock pairing start <PAIRING_ADDRESS>");
+}
+
+fn suggest_pairing_finish(out: Diagnostics) {
+    out.print("Suggested action: After you approve the pairing, run:");
+    out.print("agentknock pairing finish");
 }
 
 fn print_force_remove_pairing_error(error: &ConfigurationError) {
@@ -2109,24 +2079,24 @@ fn print_force_remove_pairing_error(error: &ConfigurationError) {
             print_plain_error(format_args!(
                 "Agentknock couldn't remove the local pairing: {error}"
             ));
-            print_plain_configuration_action(error);
+            print_configuration_action(Diagnostics::Plain, error);
         }
     }
 }
 
-fn print_plain_configuration_action(error: &ConfigurationError) {
+fn print_configuration_action(out: Diagnostics, error: &ConfigurationError) {
     match error {
         ConfigurationError::InsecurePermissions { path, .. } => {
-            print_plain_error("Suggested action: Run:");
-            print_plain_error(format_args!("chmod 600 {}", shell_word(path)));
+            out.print("Suggested action: Run:");
+            out.print(format_args!("chmod 600 {}", shell_word(path)));
         }
         ConfigurationError::HomeNotSet | ConfigurationError::InvalidHome { .. } => {
-            print_plain_error(
+            out.print(
                 "Suggested action: Use --agentknock-home or set AGENTKNOCK_HOME to an absolute directory path.",
             );
         }
         ConfigurationError::InvalidSystemTime(_) => {
-            print_plain_error("Suggested action: Correct the system clock.");
+            out.print("Suggested action: Correct the system clock.");
         }
         _ => {}
     }
@@ -2141,12 +2111,6 @@ fn shell_word(path: &Path) -> String {
             || "<PATH>".into(),
             |path| format!("'{}'", path.replace('\'', r"'\''")),
         )
-}
-
-fn print_plain_error(message: impl std::fmt::Display) {
-    for line in message.to_string().lines() {
-        eprintln!("{line}");
-    }
 }
 
 fn print_received_secrets(secret_use_output: &SecretUseOutput, stdin_source: Option<(&str, &str)>) {
