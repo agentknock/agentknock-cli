@@ -255,3 +255,23 @@ impl From<GitSignChangeStatus> for GitSignChangeStatusPayload {
 struct ApprovedSignature {
     signature: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_change_statuses_on_the_wire() {
+        for (status, name) in [
+            (GitSignChangeStatus::Added, "ADDED"),
+            (GitSignChangeStatus::Deleted, "DELETED"),
+            (GitSignChangeStatus::Modified, "MODIFIED"),
+            (GitSignChangeStatus::TypeChanged, "TYPE_CHANGED"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(GitSignChangeStatusPayload::from(status)).unwrap(),
+                name
+            );
+        }
+    }
+}

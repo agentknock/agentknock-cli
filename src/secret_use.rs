@@ -672,6 +672,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn names_executable_modes_and_stream_kinds_on_the_wire() {
+        fn wire(value: impl Serialize) -> serde_json::Value {
+            serde_json::to_value(value).unwrap()
+        }
+        assert_eq!(wire(ExecutableMode::Binary), "BINARY");
+        assert_eq!(wire(ExecutableMode::Script), "SCRIPT");
+        for (kind, name) in [
+            (StreamKind::Terminal, "TERMINAL"),
+            (StreamKind::NullDevice, "NULL_DEVICE"),
+            (StreamKind::Pipe, "PIPE"),
+            (StreamKind::Socket, "SOCKET"),
+            (StreamKind::RegularFile, "REGULAR_FILE"),
+            (StreamKind::Unknown, "UNKNOWN"),
+        ] {
+            assert_eq!(wire(StreamKindMessage::from(kind)), name);
+        }
+    }
+
+    #[test]
     fn coalesces_equal_environment_values_from_different_secrets() {
         let secrets = BTreeMap::from([
             ("first".into(), environment_secret([("TOKEN", "same")])),

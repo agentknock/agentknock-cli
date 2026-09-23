@@ -436,3 +436,22 @@ impl TryFrom<ListedSecretMessage> for Secret {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_upload_modes_on_the_wire() {
+        for (mode, name) in [
+            (SecretUploadMode::Create, "CREATE"),
+            (SecretUploadMode::Replace, "REPLACE"),
+            (SecretUploadMode::Update, "UPDATE"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(SecretUploadModeMessage::from(mode)).unwrap(),
+                name
+            );
+        }
+    }
+}
