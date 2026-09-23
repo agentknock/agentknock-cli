@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::{CString, OsStr, OsString},
     fs::File,
-    io::{self, Seek as _},
+    io::{self, Read as _, Seek as _},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
@@ -94,64 +94,52 @@ impl SelectedExecutable {
         Self::select_from(command, current_directory, working_directory, &search_path)
     }
 
+    // Relative candidates resolve against the opened working directory; openat
+    // ignores it for absolute candidates.
     fn select_from(
         command: &str,
         current_directory: OwnedFd,
         working_directory: String,
         search_path: &OsStr,
     ) -> io::Result<Self> {
+        let directory = current_directory.as_raw_fd();
         if command.contains('/') {
-            let candidate = PathBuf::from(command);
-            let directory = if candidate.is_absolute() {
-                libc::AT_FDCWD
-            } else {
-                current_directory.as_raw_fd()
-            };
-            return Self::from_candidate(command, &candidate, directory, working_directory);
+            return Self::from_candidate(
+                command,
+                Path::new(command),
+                directory,
+                &working_directory,
+            );
         }
 
-        let mut access_denied = false;
+        // Like execvp, report a permission failure over a later search miss.
         let mut final_error = io::Error::from_raw_os_error(libc::ENOENT);
-        for directory in env::split_paths(search_path) {
-            let candidate = directory.join(command);
-            let directory_descriptor = if directory.is_absolute() {
-                libc::AT_FDCWD
-            } else {
-                current_directory.as_raw_fd()
-            };
-            match Self::from_candidate(
-                command,
-                &candidate,
-                directory_descriptor,
-                working_directory.clone(),
-            ) {
+        for search_directory in env::split_paths(search_path) {
+            let candidate = search_directory.join(command);
+            match Self::from_candidate(command, &candidate, directory, &working_directory) {
                 Ok(executable) => return Ok(executable),
-                Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
-                    access_denied = true;
-                    final_error = error;
+                Err(error) if error.raw_os_error() == Some(libc::EACCES) => final_error = error,
+                Err(error) if is_search_miss(&error) => {
+                    if final_error.raw_os_error() != Some(libc::EACCES) {
+                        final_error = error;
+                    }
                 }
-                Err(error) if is_search_miss(&error) => final_error = error,
                 Err(error) => return Err(error),
             }
         }
-
-        if access_denied {
-            Err(io::Error::from_raw_os_error(libc::EACCES))
-        } else {
-            Err(final_error)
-        }
+        Err(final_error)
     }
 
     fn from_candidate(
         command: &str,
         candidate: &Path,
         directory: RawFd,
-        working_directory: String,
+        working_directory: &str,
     ) -> io::Result<Self> {
         let descriptor = open_candidate(directory, candidate)?;
         require_regular_file(&descriptor)?;
         require_effective_execute_access(&descriptor)?;
-        let path = std::fs::canonicalize(Path::new(&working_directory).join(candidate))?;
+        let path = std::fs::canonicalize(Path::new(working_directory).join(candidate))?;
         let named_executable = open_candidate(libc::AT_FDCWD, &path)?;
         require_same_file(descriptor.as_raw_fd(), named_executable.as_raw_fd())?;
         let reader = open_reader(&descriptor, &path)?;
@@ -178,7 +166,7 @@ impl SelectedExecutable {
             script_contents,
             #[cfg(target_os = "linux")]
             script_path: shebang.then(|| candidate.to_owned()),
-            working_directory,
+            working_directory: working_directory.to_owned(),
         })
     }
 
@@ -445,15 +433,18 @@ fn open_at(directory: RawFd, path: &Path, flags: libc::c_int) -> io::Result<Owne
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
-fn require_regular_file(descriptor: &OwnedFd) -> io::Result<()> {
-    let mut metadata = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: metadata is a valid output pointer and fstat initializes it on success.
-    if unsafe { libc::fstat(descriptor.as_raw_fd(), metadata.as_mut_ptr()) } == -1 {
+fn file_status(descriptor: RawFd) -> io::Result<libc::stat> {
+    let mut status = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: status is a valid output pointer and fstat does not retain it.
+    if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: fstat initialized metadata on success.
-    let metadata = unsafe { metadata.assume_init() };
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+    // SAFETY: fstat initialized status on success.
+    Ok(unsafe { status.assume_init() })
+}
+
+fn require_regular_file(descriptor: &OwnedFd) -> io::Result<()> {
+    if file_status(descriptor.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
     Ok(())
@@ -510,37 +501,24 @@ fn hash_path(path: &Path) -> io::Result<[u8; HASH_LENGTH]> {
 }
 
 fn inspect_file(mut file: impl io::Read) -> io::Result<FileInspection> {
+    // Read one byte past the script limit to tell whether a script fits.
+    let mut head = Vec::new();
+    (&mut file)
+        .take(MAXIMUM_SCRIPT_SIZE as u64 + 1)
+        .read_to_end(&mut head)?;
     let mut hash = Sha256::new();
-    let mut prefix = [0_u8; 2];
-    let mut prefix_length = 0;
-    let mut script_bytes = Vec::new();
-    let mut too_large = false;
-    let mut buffer = [0_u8; READ_BUFFER_LENGTH];
+    hash.update(&head);
+    let mut buffer = vec![0; READ_BUFFER_LENGTH];
     loop {
         let length = file.read(&mut buffer)?;
         if length == 0 {
             break;
         }
-        if prefix_length < prefix.len() {
-            let copied = (prefix.len() - prefix_length).min(length);
-            prefix[prefix_length..prefix_length + copied].copy_from_slice(&buffer[..copied]);
-            prefix_length += copied;
-        }
         hash.update(&buffer[..length]);
-        // Keep a possible one-byte shebang prefix across short reads. Once the
-        // prefix rules out a script, don't retain any more executable bytes.
-        if prefix[..prefix_length] == b"#!"[..prefix_length] && !too_large {
-            if script_bytes.len() + length > MAXIMUM_SCRIPT_SIZE {
-                too_large = true;
-                script_bytes.clear();
-            } else {
-                script_bytes.extend_from_slice(&buffer[..length]);
-            }
-        }
     }
-    let shebang = prefix_length == 2 && prefix == *b"#!";
-    let script_contents =
-        (shebang && !too_large).then(|| String::from_utf8_lossy(&script_bytes).into_owned());
+    let shebang = head.starts_with(b"#!");
+    let script_contents = (shebang && head.len() <= MAXIMUM_SCRIPT_SIZE)
+        .then(|| String::from_utf8_lossy(&head).into_owned());
     Ok(FileInspection {
         hash: hash.finalize().into(),
         shebang,
@@ -558,18 +536,8 @@ fn utf8_path(path: PathBuf, description: &str) -> io::Result<String> {
 }
 
 fn require_same_file(left: RawFd, right: RawFd) -> io::Result<()> {
-    fn status(descriptor: RawFd) -> io::Result<libc::stat> {
-        let mut status = MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: status is a valid output pointer and fstat does not retain it.
-        if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: fstat initialized status on success.
-        Ok(unsafe { status.assume_init() })
-    }
-
-    let left = status(left)?;
-    let right = status(right)?;
+    let left = file_status(left)?;
+    let right = file_status(right)?;
     if left.st_dev == right.st_dev && left.st_ino == right.st_ino {
         Ok(())
     } else {
@@ -702,7 +670,6 @@ fn default_signal_action() -> io::Result<libc::sigaction> {
     // SAFETY: A zeroed sigaction is valid after its mask is initialized below.
     let mut action = unsafe { MaybeUninit::<libc::sigaction>::zeroed().assume_init() };
     action.sa_sigaction = libc::SIG_DFL;
-    action.sa_flags = 0;
     // SAFETY: sa_mask is a valid output pointer.
     if unsafe { libc::sigemptyset(&mut action.sa_mask) } == -1 {
         return Err(io::Error::last_os_error());

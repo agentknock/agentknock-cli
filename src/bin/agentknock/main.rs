@@ -12,9 +12,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
-    fs,
-    io::{self, IsTerminal as _},
+    fs::{self, File},
+    io::{self, IsTerminal},
     mem,
+    os::{
+        fd::AsFd,
+        unix::fs::{FileTypeExt as _, MetadataExt as _},
+    },
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
@@ -1000,10 +1004,10 @@ async fn run_command(client: &Client, run: RunOperation) -> Result<(), CommandEr
             stdin: if stdin_source.is_some() {
                 StreamKind::Pipe
             } else {
-                standard_stream_kind(0, io::stdin().is_terminal())
+                standard_stream_kind(io::stdin())
             },
-            stdout: standard_stream_kind(1, io::stdout().is_terminal()),
-            stderr: standard_stream_kind(2, io::stderr().is_terminal()),
+            stdout: standard_stream_kind(io::stdout()),
+            stderr: standard_stream_kind(io::stderr()),
         },
         reason: reason.as_deref(),
         launcher_chain: &launcher_chain,
@@ -2137,42 +2141,31 @@ fn print_secrets(secrets: &Secrets) {
     );
 }
 
-fn standard_stream_kind(file_descriptor: u8, terminal: bool) -> StreamKind {
-    if terminal {
+fn standard_stream_kind(stream: impl AsFd + IsTerminal) -> StreamKind {
+    if stream.is_terminal() {
         return StreamKind::Terminal;
     }
-
-    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: status is a valid output pointer and fstat does not retain it.
-    if unsafe { libc::fstat(file_descriptor.into(), status.as_mut_ptr()) } == -1 {
+    let Ok(metadata) = stream
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|descriptor| File::from(descriptor).metadata())
+    else {
         return StreamKind::Unknown;
-    }
-    // SAFETY: fstat initialized status on success.
-    let status = unsafe { status.assume_init() };
-    let file_type = status.st_mode & libc::S_IFMT;
-
-    if file_type == libc::S_IFIFO {
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_fifo() {
         StreamKind::Pipe
-    } else if file_type == libc::S_IFSOCK {
+    } else if file_type.is_socket() {
         StreamKind::Socket
-    } else if file_type == libc::S_IFREG {
+    } else if file_type.is_file() {
         StreamKind::RegularFile
-    } else if file_type == libc::S_IFCHR && is_null_device(status.st_rdev) {
+    } else if file_type.is_char_device()
+        && fs::metadata("/dev/null").is_ok_and(|null| null.rdev() == metadata.rdev())
+    {
         StreamKind::NullDevice
     } else {
         StreamKind::Unknown
     }
-}
-
-fn is_null_device(device: libc::dev_t) -> bool {
-    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let path = c"/dev/null";
-    // SAFETY: path and status are valid for the duration of stat.
-    if unsafe { libc::stat(path.as_ptr(), status.as_mut_ptr()) } == -1 {
-        return false;
-    }
-    // SAFETY: stat initialized status on success.
-    unsafe { status.assume_init() }.st_rdev == device
 }
 
 fn launcher_chain() -> Vec<String> {
@@ -3006,6 +2999,27 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn classifies_standard_stream_kinds() {
+        use std::{fs::File, os::fd::OwnedFd, os::unix::net::UnixStream};
+
+        use agentknock::StreamKind;
+
+        use super::standard_stream_kind;
+
+        let file = tempfile::tempfile().unwrap();
+        let (socket, _) = UnixStream::pair().unwrap();
+        assert_eq!(
+            standard_stream_kind(File::open("/dev/null").unwrap()),
+            StreamKind::NullDevice
+        );
+        assert_eq!(standard_stream_kind(file), StreamKind::RegularFile);
+        assert_eq!(
+            standard_stream_kind(OwnedFd::from(socket)),
+            StreamKind::Socket
+        );
     }
 
     #[test]
