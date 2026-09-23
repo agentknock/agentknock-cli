@@ -117,7 +117,9 @@ fn sanitize_remote(url: &str) -> Option<String> {
         return repository_identity(host, path);
     }
 
-    let host_start = url.rsplit_once('@').map_or(0, |(user, _)| user.len() + 1);
+    // A user name ends before the host, which ends at the first colon or bracket.
+    let host_end = url.find([':', '['])?;
+    let host_start = url[..host_end].rfind('@').map_or(0, |index| index + 1);
     let host_and_path = &url[host_start..];
     let separator = if host_and_path.starts_with('[') {
         host_and_path.find("]:").map(|index| index + 1)?
@@ -325,6 +327,14 @@ mod tests {
         assert_eq!(
             sanitize_remote("git@example.com:owner/project.git"),
             Some("example.com/owner/project".into())
+        );
+        assert_eq!(
+            sanitize_remote("git@example.com:owner/team@example.git"),
+            Some("example.com/owner/team@example".into())
+        );
+        assert_eq!(
+            sanitize_remote("git@[::1]:owner/project.git"),
+            Some("[::1]/owner/project".into())
         );
         assert_eq!(sanitize_remote("../project"), None);
         assert_eq!(sanitize_remote("file:///home/example/project"), None);
