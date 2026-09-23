@@ -61,7 +61,6 @@ pub(crate) struct RelayExchange {
     request_id: String,
     socket: Option<Socket>,
     request: Option<OutgoingMessage>,
-    response: Option<Value>,
     completion: Option<OutgoingMessage>,
 }
 
@@ -182,7 +181,6 @@ impl RelayExchange {
             request_id: request_id.to_owned(),
             socket: None,
             request: None,
-            response: None,
             completion: None,
         })
     }
@@ -209,21 +207,13 @@ impl RelayExchange {
         )?);
 
         let mut retry = RetryState::new(NORMAL_RETRY_POLICY);
+        let mut response = None;
         loop {
-            let reconnected = self.ensure_connected(&mut retry).await?;
-            if reconnected {
-                if self.request_message().acknowledged {
-                    if !self.send_resume(&mut retry).await? {
-                        continue;
-                    }
-                } else if !self.send_request(&mut retry).await? {
-                    continue;
-                }
+            if self.connect(&mut retry).await?.is_none() {
+                continue;
             }
-
-            let incoming = match self.receive(&mut retry).await? {
-                Some(incoming) => incoming,
-                None => continue,
+            let Some(incoming) = self.receive(&mut retry).await? else {
+                continue;
             };
             match incoming {
                 IncomingFrame::Ack {
@@ -246,22 +236,20 @@ impl RelayExchange {
                 } => {
                     self.request_mut().acknowledged = true;
                     delivered();
-                    if self.response.is_none() {
-                        self.response = Some(payload);
-                    }
+                    response.get_or_insert(payload);
                     if self.send_ack(MessageKind::Response, &mut retry).await? {
-                        return self.decode_response();
+                        return decode_response(response);
                     }
                 }
                 IncomingFrame::State {
                     exchange,
                     request,
-                    response,
+                    response: response_state,
                     ..
                 } => {
                     self.apply_request_state(request, &mut delivered);
-                    if response == MessageState::Delivered {
-                        return self.decode_response();
+                    if response_state == MessageState::Delivered {
+                        return decode_response(response);
                     }
                     if matches!(exchange, ExchangeState::Settled | ExchangeState::Expired) {
                         return Err(Error::MissingResponse);
@@ -332,16 +320,9 @@ impl RelayExchange {
 
         let mut retry = RetryState::new(policy);
         loop {
-            let reconnected = self.ensure_connected(&mut retry).await?;
-            if reconnected {
-                if self.request_message().acknowledged {
-                    if !self.send_resume(&mut retry).await? {
-                        continue;
-                    }
-                } else if !self.send_request(&mut retry).await? {
-                    continue;
-                }
-            }
+            let Some(reconnected) = self.connect(&mut retry).await? else {
+                continue;
+            };
 
             if !self.request_message().acknowledged {
                 let Some(incoming) = self.receive(&mut retry).await? else {
@@ -362,11 +343,9 @@ impl RelayExchange {
                     }
                     IncomingFrame::Message {
                         kind: MessageKind::Response,
-                        payload,
                         ..
                     } => {
                         self.request_mut().acknowledged = true;
-                        self.response.get_or_insert(payload);
                         if !self.send_ack(MessageKind::Response, &mut retry).await? {
                             continue;
                         }
@@ -393,10 +372,8 @@ impl RelayExchange {
                 }
                 IncomingFrame::Message {
                     kind: MessageKind::Response,
-                    payload,
                     ..
                 } => {
-                    self.response.get_or_insert(payload);
                     if !self.send_ack(MessageKind::Response, &mut retry).await? {
                         continue;
                     }
@@ -424,6 +401,24 @@ impl RelayExchange {
             payload,
         })
         .map_err(Error::InvalidJson)
+    }
+
+    /// Connects if needed and, after reconnecting, resends or resumes the request.
+    ///
+    /// Returns whether it reconnected, or `None` if the resend failed.
+    async fn connect(&mut self, retry: &mut RetryState) -> Result<Option<bool>, Error> {
+        let reconnected = self.ensure_connected(retry).await?;
+        if reconnected {
+            let sent = if self.request_message().acknowledged {
+                self.send_resume(retry).await?
+            } else {
+                self.send_request(retry).await?
+            };
+            if !sent {
+                return Ok(None);
+            }
+        }
+        Ok(Some(reconnected))
     }
 
     async fn ensure_connected(&mut self, retry: &mut RetryState) -> Result<bool, Error> {
@@ -514,16 +509,7 @@ impl RelayExchange {
     }
 
     async fn send_text(&mut self, encoded: String, retry: &mut RetryState) -> Result<bool, Error> {
-        if encoded.len() > MAXIMUM_FRAME_SIZE {
-            return Err(Error::FrameTooLarge(encoded.len()));
-        }
-        let result = self
-            .socket
-            .as_mut()
-            .expect("socket is connected")
-            .send(Message::text(encoded))
-            .await;
-        match result {
+        match self.socket().send(Message::text(encoded)).await {
             Ok(()) => Ok(true),
             Err(error) => {
                 self.socket = None;
@@ -535,71 +521,42 @@ impl RelayExchange {
 
     async fn receive(&mut self, retry: &mut RetryState) -> Result<Option<IncomingFrame>, Error> {
         loop {
-            let message = match tokio::time::timeout(
-                PING_INTERVAL,
-                self.socket.as_mut().expect("socket is connected").next(),
-            )
-            .await
-            {
+            let message = match tokio::time::timeout(PING_INTERVAL, self.socket().next()).await {
                 Ok(message) => message,
                 Err(_) => {
-                    if let Err(error) = self
-                        .socket
-                        .as_mut()
-                        .expect("socket is connected")
-                        .send(Message::ping(Vec::new()))
-                        .await
-                    {
-                        self.socket = None;
-                        retry.failed_with(error.to_string()).await?;
-                        return Ok(None);
+                    if let Err(error) = self.socket().send(Message::ping(Vec::new())).await {
+                        return self.disconnect(retry, error.to_string()).await;
                     }
-                    match tokio::time::timeout(
-                        PONG_TIMEOUT,
-                        self.socket.as_mut().expect("socket is connected").next(),
-                    )
-                    .await
-                    {
-                        Ok(message) => message,
-                        Err(_) => {
-                            self.socket = None;
-                            retry
-                                .failed_with("relay didn't answer a WebSocket ping".into())
-                                .await?;
-                            return Ok(None);
-                        }
-                    }
+                    let Ok(message) =
+                        tokio::time::timeout(PONG_TIMEOUT, self.socket().next()).await
+                    else {
+                        return self
+                            .disconnect(retry, "relay didn't answer a WebSocket ping".into())
+                            .await;
+                    };
+                    message
                 }
             };
-
-            let Some(message) = message else {
-                self.socket = None;
-                retry
-                    .failed_with("relay closed the WebSocket".into())
-                    .await?;
-                return Ok(None);
-            };
             let message = match message {
-                Ok(message) => message,
-                Err(error) => {
-                    self.socket = None;
-                    retry.failed_with(error.to_string()).await?;
-                    return Ok(None);
+                Some(Ok(message)) => message,
+                Some(Err(error)) => return self.disconnect(retry, error.to_string()).await,
+                None => {
+                    return self
+                        .disconnect(retry, "relay closed the WebSocket".into())
+                        .await;
                 }
             };
             if let Some((code, reason)) = message.as_close() {
                 let code = u16::from(code);
-                self.socket = None;
                 if matches!(code, 4002 | 4003) {
+                    self.socket = None;
                     return Err(Error::ClientInactive {
                         code,
                         reason: reason.to_owned(),
                     });
                 }
-                retry
-                    .failed_with(format!("relay closed the WebSocket ({code} {reason})"))
-                    .await?;
-                return Ok(None);
+                let error = format!("relay closed the WebSocket ({code} {reason})");
+                return self.disconnect(retry, error).await;
             }
             // tokio-websockets queues the pong itself and flushes it on the next read.
             if message.is_ping() || message.is_pong() {
@@ -643,6 +600,20 @@ impl RelayExchange {
         }
     }
 
+    async fn disconnect(
+        &mut self,
+        retry: &mut RetryState,
+        error: String,
+    ) -> Result<Option<IncomingFrame>, Error> {
+        self.socket = None;
+        retry.failed_with(error).await?;
+        Ok(None)
+    }
+
+    fn socket(&mut self) -> &mut Socket {
+        self.socket.as_mut().expect("socket is connected")
+    }
+
     fn validate(&self, incoming: IncomingFrame) -> Result<IncomingFrame, Error> {
         if let Some(client_id) = incoming.client_id()
             && client_id != self.client_id
@@ -675,17 +646,6 @@ impl RelayExchange {
         }
     }
 
-    fn decode_response<R: DeserializeOwned>(&self) -> Result<R, Error> {
-        let response = self.response.clone().ok_or(Error::MissingResponse)?;
-        match serde_json::from_value(response).map_err(Error::InvalidJson)? {
-            ApplicationResponse::Message(response) => Ok(response),
-            ApplicationResponse::Error(error) => Err(Error::Unauthenticated {
-                code: error.error,
-                message: error.message,
-            }),
-        }
-    }
-
     fn request_message(&self) -> &OutgoingMessage {
         self.request.as_ref().expect("request exists")
     }
@@ -700,6 +660,17 @@ impl RelayExchange {
 
     fn completion_mut(&mut self) -> &mut OutgoingMessage {
         self.completion.as_mut().expect("completion exists")
+    }
+}
+
+fn decode_response<R: DeserializeOwned>(response: Option<Value>) -> Result<R, Error> {
+    let response = response.ok_or(Error::MissingResponse)?;
+    match serde_json::from_value(response).map_err(Error::InvalidJson)? {
+        ApplicationResponse::Message(response) => Ok(response),
+        ApplicationResponse::Error(error) => Err(Error::Unauthenticated {
+            code: error.error,
+            message: error.message,
+        }),
     }
 }
 
