@@ -1330,6 +1330,8 @@ fn uses_legacy_pem_private_key_format(encoded: &str) -> bool {
     encoded.starts_with("-----BEGIN RSA PRIVATE KEY-----")
         || encoded.starts_with("-----BEGIN DSA PRIVATE KEY-----")
         || encoded.starts_with("-----BEGIN EC PRIVATE KEY-----")
+        || encoded.starts_with("-----BEGIN PRIVATE KEY-----")
+        || encoded.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----")
 }
 
 fn read_environment_variable(name: &str) -> Result<String, SecretInputError> {
