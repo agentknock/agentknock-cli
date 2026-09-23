@@ -20,8 +20,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use support::{
-    ChildGuard, TestHome, accept, encrypt_response, isolated_command, open_completion,
-    open_request, receive_json, run, send_json, wait_for_path, websocket_server,
+    ChildGuard, TestHome, accept, agent_request, isolated_command, open_completion, put_ssh_string,
+    receive_json, receive_request, run, send_json, wait_for_path, websocket_server,
 };
 
 #[cfg(target_os = "linux")]
@@ -224,7 +224,8 @@ fn exposes_the_selected_key_through_ssh_auth_sock() {
                 "secret": "test-ssh",
                 "public_key": PUBLIC_KEY,
             },
-            "upstream_agent_socket": BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
+            "upstream_agent_socket":
+                BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
             "ssh_agent": true,
             "git_signing": true,
             "ssh_passthrough": true,
@@ -311,7 +312,9 @@ fn does_not_create_git_signing_endpoints_when_disabled() {
 fn git_signing_context_uses_path_and_is_optional() {
     // The helper's parent is this test process, not Git. Only the Git in the
     // supplied PATH can provide the fixture's repository context.
-    let git_script = "#!/bin/sh\n[ \"$*\" = 'rev-parse --path-format=absolute --show-toplevel' ] || exit 1\nprintf '%s\\n' \"$PWD\"\n";
+    let git_script = "#!/bin/sh\n\
+        [ \"$*\" = 'rev-parse --path-format=absolute --show-toplevel' ] || exit 1\n\
+        printf '%s\\n' \"$PWD\"\n";
     for script in [Some(git_script), Some("#!/bin/sh\nexit 1\n"), None] {
         let directory = tempfile::tempdir().unwrap();
         let git_path = directory.path().join("git");
@@ -632,12 +635,7 @@ fn checks_git_signing_key_passthrough(ssh_agent: bool, ssh_passthrough: bool) {
 }
 
 fn request_identities(connection: &mut UnixStream) -> Vec<u8> {
-    connection.write_all(&[0, 0, 0, 1, 11]).unwrap();
-    let mut length = [0; 4];
-    connection.read_exact(&mut length).unwrap();
-    let mut response = vec![0; u32::from_be_bytes(length) as usize];
-    connection.read_exact(&mut response).unwrap();
-    response
+    agent_request(connection, &[11]) // SSH_AGENTC_REQUEST_IDENTITIES
 }
 
 fn start_service() -> Child {
@@ -771,36 +769,24 @@ fn request_signature(directory: &Path, kind: SignatureKind) -> bool {
             response["status"] == "signature"
         }
         SignatureKind::Ssh => {
-            fn string(output: &mut Vec<u8>, value: &[u8]) {
-                output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-                output.extend_from_slice(value);
-            }
             let key = BASE64_STANDARD
                 .decode(PUBLIC_KEY.split_whitespace().nth(1).unwrap())
                 .unwrap();
             let mut message = Vec::new();
-            string(&mut message, b"test session identifier");
+            put_ssh_string(&mut message, b"test session identifier");
             message.push(50); // SSH_MSG_USERAUTH_REQUEST
-            string(&mut message, b"test-user");
-            string(&mut message, b"ssh-connection");
-            string(&mut message, b"publickey");
+            put_ssh_string(&mut message, b"test-user");
+            put_ssh_string(&mut message, b"ssh-connection");
+            put_ssh_string(&mut message, b"publickey");
             message.push(1);
-            string(&mut message, b"ssh-ed25519");
-            string(&mut message, &key);
+            put_ssh_string(&mut message, b"ssh-ed25519");
+            put_ssh_string(&mut message, &key);
             let mut packet = vec![13]; // SSH_AGENTC_SIGN_REQUEST
-            string(&mut packet, &key);
-            string(&mut packet, &message);
+            put_ssh_string(&mut packet, &key);
+            put_ssh_string(&mut packet, &message);
             packet.extend_from_slice(&0u32.to_be_bytes());
             let mut connection = UnixStream::connect(directory.join("agent.sock")).unwrap();
-            connection
-                .write_all(&(packet.len() as u32).to_be_bytes())
-                .unwrap();
-            connection.write_all(&packet).unwrap();
-            let mut length = [0; 4];
-            connection.read_exact(&mut length).unwrap();
-            let mut response = vec![0; u32::from_be_bytes(length) as usize];
-            connection.read_exact(&mut response).unwrap();
-            response[0] == 14 // SSH_AGENT_SIGN_RESPONSE
+            agent_request(&mut connection, &packet)[0] == 14 // SSH_AGENT_SIGN_RESPONSE
         }
     }
 }
@@ -848,25 +834,20 @@ async fn check_failed_signature(
     let private_key = home.device_private_key.clone();
     let (url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let (mut context, key, plaintext) = open_request(&private_key, request["request_id"].as_str().unwrap(), &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &private_key).await;
         assert_eq!(plaintext["method"], kind.method());
-        let mut response = encrypt_response(&context, &key, &response);
-        if corrupt { response["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into(); }
-        send_json(&mut socket, json!({
-            "type": "message", "client_id": request["client_id"], "request_id": request["request_id"],
-            "kind": "response", "payload": response,
-        })).await;
+        let mut response = request.response(&response);
+        if corrupt {
+            response["payload"]["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into();
+        }
+        send_json(&mut socket, response).await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        assert_eq!(completion["kind"], "completion");
-        let completion = open_completion(&mut context, &completion["payload"]);
+        let completion = request.receive_completion(&mut socket).await;
         assert_eq!(completion["result"], result);
         assert_eq!(completion["reason"], reason);
-        send_json(&mut socket, json!({
-            "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "completion",
-        })).await;
-    }).await;
+        send_json(&mut socket, request.ack("completion")).await;
+    })
+    .await;
     let (mut service, directory) = signature_service(&home, &url, std::process::id());
     assert!(!request_signature(&directory, kind));
     server.await.unwrap();
@@ -913,27 +894,23 @@ async fn owner_exit_allows_abort_completion_and_retry() {
         let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
         let (url, server) = websocket_server(move |listener| async move {
             let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
-            let (mut context, _, plaintext) = open_request(&private_key, request["request_id"].as_str().unwrap(), &request["payload"]);
+            let (mut request, plaintext) = receive_request(&mut socket, &private_key).await;
             assert_eq!(plaintext["method"], kind.method());
             ready_tx.send(()).unwrap();
             exited_rx.await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            send_json(&mut socket, json!({
-                "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "request",
-            })).await;
+            send_json(&mut socket, request.ack("request")).await;
             let completion = receive_json(&mut socket).await;
-            let plaintext = open_completion(&mut context, &completion["payload"]);
+            let plaintext = open_completion(&mut request.context, &completion["payload"]);
             assert_eq!(plaintext["result"], "ABORTED");
             assert_eq!(plaintext["reason"], "CANCELLED");
             drop(socket); // Force a retry before the completion is acknowledged.
             let (_, mut socket) = accept(&listener).await;
             assert_eq!(receive_json(&mut socket).await["type"], "resume");
             assert_eq!(receive_json(&mut socket).await, completion);
-            send_json(&mut socket, json!({
-                "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "completion",
-            })).await;
-        }).await;
+            send_json(&mut socket, request.ack("completion")).await;
+        })
+        .await;
         let mut owner = ChildGuard(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "signing_owner_probe", "--nocapture"])

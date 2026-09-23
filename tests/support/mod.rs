@@ -5,8 +5,8 @@ use std::{
     fs,
     fs::OpenOptions,
     future::Future,
-    io::Read as _,
-    os::unix::fs::OpenOptionsExt,
+    io::{Read as _, Write as _},
+    os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command},
     thread,
@@ -212,6 +212,29 @@ pub fn child_stderr(child: &mut Child) -> String {
     stderr
 }
 
+/// Sends one SSH agent request and returns the agent's response.
+pub fn agent_request(connection: &mut UnixStream, request: &[u8]) -> Vec<u8> {
+    connection
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .unwrap();
+    connection.write_all(request).unwrap();
+    let mut length = [0; 4];
+    connection.read_exact(&mut length).unwrap();
+    let mut response = vec![0; u32::from_be_bytes(length) as usize];
+    connection.read_exact(&mut response).unwrap();
+    response
+}
+
+pub fn put_ssh_string(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+pub fn take_ssh_string(input: &[u8]) -> (&[u8], &[u8]) {
+    let length = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    (&input[4..4 + length], &input[4 + length..])
+}
+
 pub async fn websocket_server<F, Fut, T>(handler: F) -> (String, JoinHandle<T>)
 where
     F: FnOnce(TcpListener) -> Fut + Send + 'static,
@@ -307,34 +330,6 @@ pub fn assert_authenticated_request(request: &http::Request<()>) {
     );
 }
 
-pub fn open_request(
-    device_private_key: &<Kem as KemTrait>::PrivateKey,
-    request_id: &str,
-    request: &Value,
-) -> (ReceiverContext, Vec<u8>, Value) {
-    let key = BASE64_STANDARD
-        .decode(request["key"].as_str().unwrap())
-        .unwrap();
-    let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&key).unwrap();
-    let request_id = request_id.parse::<Ulid>().unwrap();
-    let device_id = DEVICE_ID.parse::<Ulid>().unwrap().to_bytes();
-    let client_id = CLIENT_ID.parse::<Ulid>().unwrap().to_bytes();
-    let info = [PROTOCOL_VERSION_INFO, device_id, request_id.to_bytes()].concat();
-    let psk = PskBundle::new(&CLIENT_PSK, &client_id).unwrap();
-    let mut context = setup_receiver::<Aead, Kdf, Kem>(
-        &OpModeR::Psk(psk),
-        device_private_key,
-        &encapped_key,
-        &info,
-    )
-    .unwrap();
-    let ciphertext = BASE64_STANDARD
-        .decode(request["ciphertext"].as_str().unwrap())
-        .unwrap();
-    let plaintext = context.open(&ciphertext, b"").unwrap();
-    (context, key, serde_json::from_slice(&plaintext).unwrap())
-}
-
 pub fn encrypt_response(context: &ReceiverContext, encapped_key: &[u8], response: &Value) -> Value {
     let public_nonce = [0x77; 32];
     let mut salt = Vec::with_capacity(encapped_key.len() + public_nonce.len());
@@ -364,4 +359,107 @@ pub fn open_completion(context: &mut ReceiverContext, completion: &Value) -> Val
         .unwrap();
     let plaintext = context.open(&ciphertext, b"").unwrap();
     serde_json::from_slice(&plaintext).unwrap()
+}
+
+/// The device's side of one request exchange.
+pub struct ReceivedRequest {
+    pub client_id: String,
+    pub request_id: String,
+    pub context: ReceiverContext,
+    pub key: Vec<u8>,
+}
+
+impl ReceivedRequest {
+    /// Opens a request frame from the test pairing and returns its plaintext.
+    pub fn open(
+        device_private_key: &<Kem as KemTrait>::PrivateKey,
+        frame: &Value,
+    ) -> (Self, Value) {
+        Self::open_as(device_private_key, CLIENT_ID, &CLIENT_PSK, frame)
+    }
+
+    /// Opens a request frame from the given client and returns its plaintext.
+    pub fn open_as(
+        device_private_key: &<Kem as KemTrait>::PrivateKey,
+        client_id: &str,
+        client_psk: &[u8],
+        frame: &Value,
+    ) -> (Self, Value) {
+        assert_eq!(frame["client_id"], client_id);
+        let request_id = frame["request_id"].as_str().unwrap().to_owned();
+        let payload = &frame["payload"];
+        let key = BASE64_STANDARD
+            .decode(payload["key"].as_str().unwrap())
+            .unwrap();
+        let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&key).unwrap();
+        let info = [
+            PROTOCOL_VERSION_INFO,
+            DEVICE_ID.parse::<Ulid>().unwrap().to_bytes(),
+            request_id.parse::<Ulid>().unwrap().to_bytes(),
+        ]
+        .concat();
+        let psk_id = client_id.parse::<Ulid>().unwrap().to_bytes();
+        let psk = PskBundle::new(client_psk, &psk_id).unwrap();
+        let mut context = setup_receiver::<Aead, Kdf, Kem>(
+            &OpModeR::Psk(psk),
+            device_private_key,
+            &encapped_key,
+            &info,
+        )
+        .unwrap();
+        let ciphertext = BASE64_STANDARD
+            .decode(payload["ciphertext"].as_str().unwrap())
+            .unwrap();
+        let plaintext = context.open(&ciphertext, b"").unwrap();
+        let request = Self {
+            client_id: client_id.to_owned(),
+            request_id,
+            context,
+            key,
+        };
+        (request, serde_json::from_slice(&plaintext).unwrap())
+    }
+
+    pub fn ack(&self, kind: &str) -> Value {
+        self.frame("ack", kind)
+    }
+
+    pub fn receipt(&self) -> Value {
+        self.frame("receipt", "request")
+    }
+
+    pub fn response(&self, response: &Value) -> Value {
+        let mut frame = self.frame("message", "response");
+        frame["payload"] = encrypt_response(&self.context, &self.key, response);
+        frame
+    }
+
+    /// Receives the client's completion and returns its plaintext.
+    pub async fn receive_completion<S>(&mut self, socket: &mut WebSocketStream<S>) -> Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let completion = receive_json(socket).await;
+        assert_eq!(completion["kind"], "completion");
+        open_completion(&mut self.context, &completion["payload"])
+    }
+
+    fn frame(&self, frame_type: &str, kind: &str) -> Value {
+        json!({
+            "type": frame_type,
+            "client_id": self.client_id,
+            "request_id": self.request_id,
+            "kind": kind,
+        })
+    }
+}
+
+pub async fn receive_request<S>(
+    socket: &mut WebSocketStream<S>,
+    device_private_key: &<Kem as KemTrait>::PrivateKey,
+) -> (ReceivedRequest, Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ReceivedRequest::open(device_private_key, &receive_json(socket).await)
 }

@@ -16,7 +16,7 @@ use base64::{
 };
 use hkdf::Hkdf;
 use hpke::{
-    Deserializable, Kem as KemTrait, OpModeR, PskBundle, Serializable,
+    Deserializable, Kem as KemTrait, OpModeR, Serializable,
     hybrid_array::Array,
     kdf::{HkdfSha256, Kdf as KdfTrait},
     setup_receiver,
@@ -26,9 +26,9 @@ use sha2::Sha256;
 use ulid::Ulid;
 
 use support::{
-    Aead, DEVICE_ID, Kem, PROTOCOL_VERSION_INFO, ReceiverContext, TestHome, accept,
-    assert_authenticated_request, encrypt_response, interrupt, open_completion, open_request,
-    receive_json, send_json, websocket_server,
+    Aead, DEVICE_ID, Kem, PROTOCOL_VERSION_INFO, ReceivedRequest, TestHome, accept,
+    assert_authenticated_request, interrupt, receive_json, receive_request, send_json,
+    websocket_server,
 };
 
 const ADDRESS_ID: &str = "9e6f33bf47382846903dffa0962ea313";
@@ -270,12 +270,7 @@ async fn pairing_finish_does_not_activate_a_replacement_pairing() {
     let expected_id = replacement_id.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let (context, key, _) = open_request(
-            &device_private_key,
-            request["request_id"].as_str().unwrap(),
-            &request["payload"],
-        );
+        let (request, _) = receive_request(&mut socket, &device_private_key).await;
         // Simulate aborting and restarting pairing while finish awaits its response.
         let mut replacement: Value =
             serde_json::from_slice(&fs::read(&pairing_path).unwrap()).unwrap();
@@ -283,13 +278,7 @@ async fn pairing_finish_does_not_activate_a_replacement_pairing() {
         fs::write(&pairing_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
         send_json(
             &mut socket,
-            json!({
-                "type": "message",
-                "client_id": request["client_id"],
-                "request_id": request["request_id"],
-                "kind": "response",
-                "payload": encrypt_response(&context, &key, &json!({"result": "ACCEPTED"})),
-            }),
+            request.response(&json!({"result": "ACCEPTED"})),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
@@ -490,56 +479,21 @@ async fn start_and_finish_pairing(custom_home: bool) {
             format!("agentknock/{}", env!("CARGO_PKG_VERSION"))
         );
         let finish_request = receive_json(&mut socket).await;
-        let finish_request_id = finish_request["request_id"].as_str().unwrap().to_owned();
-        let (mut finish_context, key, finish_plaintext) = open_authenticated_request(
+        let (mut finish, finish_plaintext) = ReceivedRequest::open_as(
             &device_private_key,
             &client_id,
             &client_psk,
-            &finish_request_id,
-            &finish_request["payload"],
+            &finish_request,
         );
         assert_eq!(finish_plaintext["method"], "PairingFinish");
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": finish_request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": finish_request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &finish_context,
-                    &key,
-                    &json!({"result": "ACCEPTED"}),
-                ),
-            }),
-        )
-        .await;
+        send_json(&mut socket, finish.ack("request")).await;
+        send_json(&mut socket, finish.response(&json!({"result": "ACCEPTED"}))).await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let finish_completion = receive_json(&mut socket).await;
         assert_eq!(
-            open_completion(&mut finish_context, &finish_completion["payload"])["result"],
+            finish.receive_completion(&mut socket).await["result"],
             "ACCEPTED"
         );
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": finish_request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, finish.ack("completion")).await;
 
         PairingResult {
             client_id,
@@ -639,38 +593,15 @@ async fn removes_pairing_after_an_authenticated_device_response() {
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (upgrade, mut socket) = accept(&listener).await;
         assert_authenticated_request(&upgrade);
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["method"], "PairingRemove");
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(&context, &key, &json!({})),
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("request")).await;
+        send_json(&mut socket, request.response(&json!({}))).await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
+        let completion = request.receive_completion(&mut socket).await;
         assert!(!pairing_path.exists());
         assert_eq!(
-            open_completion(&mut context, &completion["payload"]),
+            completion,
             json!({
                 "app_info": {
                     "name": "agentknock",
@@ -682,16 +613,7 @@ async fn removes_pairing_after_an_authenticated_device_response() {
                 },
             })
         );
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -707,37 +629,4 @@ async fn removes_pairing_after_an_authenticated_device_response() {
     );
     assert!(!home.pairing_path().exists());
     server.await.unwrap();
-}
-
-fn open_authenticated_request(
-    device_private_key: &<Kem as KemTrait>::PrivateKey,
-    client_id: &str,
-    client_psk: &[u8],
-    request_id: &str,
-    request: &Value,
-) -> (ReceiverContext, Vec<u8>, Value) {
-    let key = BASE64_STANDARD
-        .decode(request["key"].as_str().unwrap())
-        .unwrap();
-    let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&key).unwrap();
-    let client_id = client_id.parse::<Ulid>().unwrap().to_bytes();
-    let info = [
-        PROTOCOL_VERSION_INFO,
-        DEVICE_ID.parse::<Ulid>().unwrap().to_bytes(),
-        request_id.parse::<Ulid>().unwrap().to_bytes(),
-    ]
-    .concat();
-    let psk = PskBundle::new(client_psk, &client_id).unwrap();
-    let mut context = setup_receiver::<Aead, HkdfSha256, Kem>(
-        &OpModeR::Psk(psk),
-        device_private_key,
-        &encapped_key,
-        &info,
-    )
-    .unwrap();
-    let ciphertext = BASE64_STANDARD
-        .decode(request["ciphertext"].as_str().unwrap())
-        .unwrap();
-    let plaintext = context.open(&ciphertext, b"").unwrap();
-    (context, key, serde_json::from_slice(&plaintext).unwrap())
 }

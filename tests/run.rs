@@ -4,7 +4,7 @@ mod support;
 
 use std::{
     fs,
-    io::{Read as _, Write as _},
+    io::Read as _,
     net::{TcpListener, TcpStream},
     os::unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
@@ -21,9 +21,9 @@ use sha2::{Digest as _, Sha256};
 use tokio_websockets::Message;
 
 use support::{
-    ChildGuard, TestHome, accept, assert_authenticated_request, child_stderr, encrypt_response,
-    interrupt, isolated_command, open_completion, open_request, receive_json, run, send_json,
-    wait_for_path, websocket_server,
+    ChildGuard, ReceivedRequest, TestHome, accept, agent_request, assert_authenticated_request,
+    child_stderr, interrupt, isolated_command, open_completion, put_ssh_string, receive_json,
+    receive_request, run, send_json, take_ssh_string, wait_for_path, websocket_server,
 };
 
 fn approved_environment(secret: &str, variables: serde_json::Map<String, Value>) -> Value {
@@ -213,62 +213,30 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
     let (relay_url, server) = websocket_server(move |listener| async move {
         for expected_command in expected_commands {
             let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
-            let client_id = request["client_id"].as_str().unwrap().to_owned();
-            let invocation_id = request["request_id"].as_str().unwrap().to_owned();
-            let (mut context, key, plaintext) =
-                open_request(&device_private_key, &invocation_id, &request["payload"]);
+            let (mut invocation, plaintext) =
+                receive_request(&mut socket, &device_private_key).await;
             assert_eq!(plaintext["method"], "Invocation");
             assert_eq!(plaintext["operation"]["command"], expected_command);
             let invocation_token = plaintext["invocation_token"].as_str().unwrap().to_owned();
+            send_json(&mut socket, invocation.ack("request")).await;
             send_json(
                 &mut socket,
-                json!({
-                    "type": "ack",
-                    "client_id": client_id,
-                    "request_id": invocation_id,
-                    "kind": "request",
-                }),
-            )
-            .await;
-            send_json(
-                &mut socket,
-                json!({
-                    "type": "message",
-                    "client_id": client_id,
-                    "request_id": invocation_id,
-                    "kind": "response",
-                    "payload": encrypt_response(
-                        &context,
-                        &key,
-                        &json!({
-                            "result": "APPROVED",
-                            "secrets": {
-                                "ssh-login": {
-                                    "type": "ssh",
-                                    "public_key": server_public_key,
-                                },
-                            },
-                        }),
-                    ),
-                }),
+                invocation.response(&json!({
+                    "result": "APPROVED",
+                    "secrets": {
+                        "ssh-login": {
+                            "type": "ssh",
+                            "public_key": server_public_key,
+                        },
+                    },
+                })),
             )
             .await;
             assert_eq!(receive_json(&mut socket).await["kind"], "response");
-            let completion = receive_json(&mut socket).await;
-            let completion = open_completion(&mut context, &completion["payload"]);
+            let completion = invocation.receive_completion(&mut socket).await;
             assert_eq!(completion["result"], "APPROVED");
             assert!(completion.get("signature").is_none());
-            send_json(
-                &mut socket,
-                json!({
-                    "type": "ack",
-                    "client_id": client_id,
-                    "request_id": invocation_id,
-                    "kind": "completion",
-                }),
-            )
-            .await;
+            send_json(&mut socket, invocation.ack("completion")).await;
             drop(socket);
 
             if !authenticate {
@@ -276,13 +244,9 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
             }
 
             let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
-            let client_id = request["client_id"].as_str().unwrap().to_owned();
-            let request_id = request["request_id"].as_str().unwrap().to_owned();
-            let (mut context, key, plaintext) =
-                open_request(&device_private_key, &request_id, &request["payload"]);
+            let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
             assert_eq!(plaintext["method"], "SshAuthenticate");
-            assert_eq!(plaintext["invocation_id"], invocation_id);
+            assert_eq!(plaintext["invocation_id"], invocation.request_id);
             assert_eq!(plaintext["invocation_token"], invocation_token);
             assert_eq!(plaintext["secret"], "ssh-login");
             assert!(plaintext.get("algorithm").is_none());
@@ -295,49 +259,20 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
                 &message,
                 ssh_signature_flags(&message),
             );
+            send_json(&mut socket, request.ack("request")).await;
             send_json(
                 &mut socket,
-                json!({
-                    "type": "ack",
-                    "client_id": client_id,
-                    "request_id": request_id,
-                    "kind": "request",
-                }),
-            )
-            .await;
-            send_json(
-                &mut socket,
-                json!({
-                    "type": "message",
-                    "client_id": client_id,
-                    "request_id": request_id,
-                    "kind": "response",
-                    "payload": encrypt_response(
-                        &context,
-                        &key,
-                        &json!({
-                            "result": "APPROVED",
-                            "signature": BASE64_STANDARD.encode(signature),
-                        }),
-                    ),
-                }),
+                request.response(&json!({
+                    "result": "APPROVED",
+                    "signature": BASE64_STANDARD.encode(signature),
+                })),
             )
             .await;
             assert_eq!(receive_json(&mut socket).await["kind"], "response");
-            let completion = receive_json(&mut socket).await;
-            let completion = open_completion(&mut context, &completion["payload"]);
+            let completion = request.receive_completion(&mut socket).await;
             assert_eq!(completion["result"], "APPROVED");
             assert!(completion.get("signature").is_none());
-            send_json(
-                &mut socket,
-                json!({
-                    "type": "ack",
-                    "client_id": client_id,
-                    "request_id": request_id,
-                    "kind": "completion",
-                }),
-            )
-            .await;
+            send_json(&mut socket, request.ack("completion")).await;
         }
     })
     .await;
@@ -557,73 +492,36 @@ async fn signs_a_git_commit_with_an_ssh_secret(
     let server_repository = repository.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let invocation_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &invocation_id, &request["payload"]);
+        let (mut invocation, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["method"], "Invocation");
         let invocation_token = plaintext["invocation_token"].as_str().unwrap().to_owned();
         assert_eq!(BASE64_STANDARD.decode(&invocation_token).unwrap().len(), 32);
+        send_json(&mut socket, invocation.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": invocation_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": invocation_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "secrets": {
-                            "git-signing": {
-                                "type": "ssh",
-                                "public_key": server_public_key,
-                            },
-                        },
-                    }),
-                ),
-            }),
+            invocation.response(&json!({
+                "result": "APPROVED",
+                "secrets": {
+                    "git-signing": {
+                        "type": "ssh",
+                        "public_key": server_public_key,
+                    },
+                },
+            })),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
         assert_eq!(
-            open_completion(&mut context, &completion["payload"])["result"],
+            invocation.receive_completion(&mut socket).await["result"],
             "APPROVED"
         );
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": invocation_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, invocation.ack("completion")).await;
         drop(socket);
 
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["method"], "GitSign");
-        assert_eq!(plaintext["invocation_id"], invocation_id);
+        assert_eq!(plaintext["invocation_id"], invocation.request_id);
         assert_eq!(plaintext["invocation_token"], invocation_token);
         assert_eq!(plaintext["secret"], "git-signing");
         assert!(plaintext.get("namespace").is_none());
@@ -665,50 +563,21 @@ async fn signs_a_git_commit_with_an_ssh_secret(
         signature_path.push(".sig");
         let signature = fs::read_to_string(signature_path).unwrap();
 
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "signature": signature,
-                    }),
-                ),
-            }),
+            request.response(&json!({
+                "result": "APPROVED",
+                "signature": signature,
+            })),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
         assert_eq!(
-            open_completion(&mut context, &completion["payload"])["result"],
+            request.receive_completion(&mut socket).await["result"],
             "APPROVED"
         );
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -849,14 +718,7 @@ fn sign_with_agent(socket_path: &Path, key_blob: &[u8], message: &[u8], flags: u
     put_ssh_string(&mut request, message);
     request.extend_from_slice(&flags.to_be_bytes());
     let mut connection = UnixStream::connect(socket_path).unwrap();
-    connection
-        .write_all(&(request.len() as u32).to_be_bytes())
-        .unwrap();
-    connection.write_all(&request).unwrap();
-    let mut length = [0; 4];
-    connection.read_exact(&mut length).unwrap();
-    let mut response = vec![0; u32::from_be_bytes(length) as usize];
-    connection.read_exact(&mut response).unwrap();
+    let response = agent_request(&mut connection, &request);
     assert_eq!(
         response.first(),
         Some(&14),
@@ -865,16 +727,6 @@ fn sign_with_agent(socket_path: &Path, key_blob: &[u8], message: &[u8], flags: u
     let (signature, trailing) = take_ssh_string(&response[1..]);
     assert!(trailing.is_empty());
     signature.to_vec()
-}
-
-fn put_ssh_string(output: &mut Vec<u8>, value: &[u8]) {
-    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    output.extend_from_slice(value);
-}
-
-fn take_ssh_string(input: &[u8]) -> (&[u8], &[u8]) {
-    let length = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
-    (&input[4..4 + length], &input[4 + length..])
 }
 
 fn ssh_signature_flags(message: &[u8]) -> u32 {
@@ -904,12 +756,8 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         let frame = receive_json(&mut socket).await;
         assert_eq!(frame["type"], "message");
         assert_eq!(frame["kind"], "request");
-        let client_id = frame["client_id"].as_str().unwrap().to_owned();
-        let request_id = frame["request_id"].as_str().unwrap().to_owned();
-        let request = frame["payload"].clone();
-        assert!(request.get("pairing_id").is_none());
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &request);
+        assert!(frame["payload"].get("pairing_id").is_none());
+        let (mut request, plaintext) = ReceivedRequest::open(&device_private_key, &frame);
         assert_eq!(plaintext["method"], "Invocation");
         assert_eq!(
             plaintext["secrets"],
@@ -947,55 +795,27 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         assert_eq!(plaintext["lib_info"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(plaintext.get("cli_version").is_none());
 
+        send_json(&mut socket, request.ack("request")).await;
+        send_json(&mut socket, request.receipt()).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "receipt",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "secrets": {
-                            "github": {
-                                "description": "GitHub access",
-                                "type": "environment",
-                                "variables": {
-                                    "AGENTKNOCK_EXEC_TEST": {"value": "secret"},
-                                },
-                            },
-                            "cloudflare": {
-                                "description": "Cloudflare access",
-                                "type": "environment",
-                                "variables": {},
-                            }
+            request.response(&json!({
+                "result": "APPROVED",
+                "secrets": {
+                    "github": {
+                        "description": "GitHub access",
+                        "type": "environment",
+                        "variables": {
+                            "AGENTKNOCK_EXEC_TEST": {"value": "secret"},
                         },
-                    }),
-                ),
-            }),
+                    },
+                    "cloudflare": {
+                        "description": "Cloudflare access",
+                        "type": "environment",
+                        "variables": {},
+                    }
+                },
+            })),
         )
         .await;
 
@@ -1006,19 +826,10 @@ async fn requests_secret_use_and_executes_with_the_returned_environment() {
         let completion = receive_json(&mut socket).await;
         assert_eq!(completion["type"], "message");
         assert_eq!(completion["kind"], "completion");
-        let completion_plaintext = open_completion(&mut context, &completion["payload"]);
+        let completion_plaintext = open_completion(&mut request.context, &completion["payload"]);
         assert_eq!(completion_plaintext["result"], "APPROVED");
         assert!(completion_plaintext.get("secrets").is_none());
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
 
         plaintext
     })
@@ -1064,25 +875,17 @@ async fn custom_home_preserves_the_child_environment_with_a_read_only_home() {
         let device_private_key = pairing.device_private_key.clone();
         let (relay_url, server) = websocket_server(move |listener| async move {
             let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
-            let (mut context, key, _) = open_request(
-                &device_private_key,
-                request["request_id"].as_str().unwrap(),
-                &request["payload"],
-            );
-            send_json(&mut socket, json!({
-                "type": "message", "client_id": request["client_id"],
-                "request_id": request["request_id"], "kind": "response",
-                "payload": encrypt_response(&context, &key, &approved_environment("test", serde_json::Map::new())),
-            })).await;
+            let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
+            let response = approved_environment("test", serde_json::Map::new());
+            send_json(&mut socket, request.response(&response)).await;
             assert_eq!(receive_json(&mut socket).await["kind"], "response");
-            let completion = receive_json(&mut socket).await;
-            assert_eq!(open_completion(&mut context, &completion["payload"])["result"], "APPROVED");
-            send_json(&mut socket, json!({
-                "type": "ack", "client_id": request["client_id"],
-                "request_id": request["request_id"], "kind": "completion",
-            })).await;
-        }).await;
+            assert_eq!(
+                request.receive_completion(&mut socket).await["result"],
+                "APPROVED"
+            );
+            send_json(&mut socket, request.ack("completion")).await;
+        })
+        .await;
 
         let inherited_home = if use_option {
             pairing.path().join("another pairing")
@@ -1154,21 +957,12 @@ async fn starts_the_service_after_the_working_directory_is_removed() {
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap();
-        let request_id = request["request_id"].as_str().unwrap();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, request_id, &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["operation"]["stdin"], "PIPE");
         fs::remove_dir(removed_directory).unwrap();
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack", "client_id": client_id,
-                "request_id": request_id, "kind": "request",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("request")).await;
+        let public_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB test";
         let mut response = approved_environment(
             "test",
             serde_json::Map::from_iter([("INPUT".into(), "approved input".into())]),
@@ -1176,29 +970,13 @@ async fn starts_the_service_after_the_working_directory_is_removed() {
         response["secrets"]["test-ssh"] = json!({
             "description": null,
             "type": "ssh",
-            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB test",
+            "public_key": public_key,
         });
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message", "client_id": client_id,
-                "request_id": request_id, "kind": "response",
-                "payload": encrypt_response(&context, &key, &response),
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.response(&response)).await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let plaintext = open_completion(&mut context, &completion["payload"]);
+        let plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(plaintext["result"], "APPROVED");
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack", "client_id": client_id,
-                "request_id": request_id, "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -1228,11 +1006,7 @@ async fn assert_environment_selection_with_stdin(relative_executable: bool) {
     let server_input_value = input_value.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let frame = receive_json(&mut socket).await;
-        let client_id = frame["client_id"].as_str().unwrap().to_owned();
-        let request_id = frame["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &frame["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(
             plaintext["secrets"],
             json!({
@@ -1252,67 +1026,38 @@ async fn assert_environment_selection_with_stdin(relative_executable: bool) {
         );
         assert_eq!(plaintext["operation"]["stdin"], "PIPE");
 
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &json!({
-                        "result": "APPROVED",
-                        "secrets": {
-                            "cloudflare": {
-                                "description": null,
-                                "type": "environment",
-                                "variables": {
-                                    "CF_VISIBLE": {"value": "visible"},
-                                },
-                            },
-                            "github": {
-                                "description": null,
-                                "type": "environment",
-                                "variables": {
-                                    "GH_INPUT": {"value": server_input_value},
-                                    "GH_TOKEN": {"value": "renamed"},
-                                },
-                            },
+            request.response(&json!({
+                "result": "APPROVED",
+                "secrets": {
+                    "cloudflare": {
+                        "description": null,
+                        "type": "environment",
+                        "variables": {
+                            "CF_VISIBLE": {"value": "visible"},
                         },
-                    }),
-                ),
-            }),
+                    },
+                    "github": {
+                        "description": null,
+                        "type": "environment",
+                        "variables": {
+                            "GH_INPUT": {"value": server_input_value},
+                            "GH_TOKEN": {"value": "renamed"},
+                        },
+                    },
+                },
+            })),
         )
         .await;
 
         let response_ack = receive_json(&mut socket).await;
         assert_eq!(response_ack["type"], "ack");
         assert_eq!(response_ack["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let completion_plaintext = open_completion(&mut context, &completion["payload"]);
+        let completion_plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(completion_plaintext["result"], "APPROVED");
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -1425,11 +1170,7 @@ async fn assert_shebang_request(script_contents: &[u8], expected_contents: Optio
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["operation"]["executable_mode"], "SCRIPT");
         assert_eq!(plaintext["operation"]["executable_path"], expected_path);
         assert_eq!(plaintext["operation"]["executable_hash"], expected_hash);
@@ -1437,53 +1178,21 @@ async fn assert_shebang_request(script_contents: &[u8], expected_contents: Optio
             plaintext["operation"].get("script_contents"),
             expected_contents.map(Value::String).as_ref(),
         );
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &approved_environment(
-                        "test",
-                        serde_json::Map::from_iter([(
-                            "AGENTKNOCK_SCRIPT_TEST".into(),
-                            "approved".into(),
-                        )]),
-                    ),
-                ),
-            }),
+            request.response(&approved_environment(
+                "test",
+                serde_json::Map::from_iter([("AGENTKNOCK_SCRIPT_TEST".into(), "approved".into())]),
+            )),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
         assert_eq!(
-            open_completion(&mut context, &completion["payload"])["result"],
+            request.receive_completion(&mut socket).await["result"],
             "APPROVED"
         );
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -1512,64 +1221,31 @@ async fn replace_selected_native_file_after_approval() -> std::process::Output {
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["operation"]["executable_mode"], "BINARY");
         assert_eq!(
             plaintext["operation"]["executable_path"],
             server_selected_path.to_str().unwrap()
         );
         fs::rename(&replacement_path, &server_selected_path).unwrap();
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &approved_environment(
-                        "test",
-                        serde_json::Map::from_iter([
-                            ("AGENTKNOCK_PINNED_EXEC_TEST".into(), "selected".into()),
-                            (
-                                "PATH".into(),
-                                "/agentknock-returned-path-must-not-be-searched".into(),
-                            ),
-                        ]),
+            request.response(&approved_environment(
+                "test",
+                serde_json::Map::from_iter([
+                    ("AGENTKNOCK_PINNED_EXEC_TEST".into(), "selected".into()),
+                    (
+                        "PATH".into(),
+                        "/agentknock-returned-path-must-not-be-searched".into(),
                     ),
-                ),
-            }),
+                ]),
+            )),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let _: Value = open_completion(&mut context, &completion["payload"]);
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        request.receive_completion(&mut socket).await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -1620,49 +1296,16 @@ async fn restores_sigpipe_before_executing_the_command() {
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, _) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
+        let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &approved_environment("test", serde_json::Map::new()),
-                ),
-            }),
+            request.response(&approved_environment("test", serde_json::Map::new())),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let _: Value = open_completion(&mut context, &completion["payload"]);
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        request.receive_completion(&mut socket).await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -1846,48 +1489,16 @@ async fn resends_the_exact_request_when_the_connection_closes_before_ack() {
         assert_authenticated_request(&second_upgrade);
         let second = receive_json(&mut socket).await;
         assert_eq!(second, first);
-        let client_id = second["client_id"].as_str().unwrap().to_owned();
-        let request_id = second["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, _) =
-            open_request(&device_private_key, &request_id, &second["payload"]);
+        let (mut request, _) = ReceivedRequest::open(&device_private_key, &second);
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &approved_environment("github", serde_json::Map::new()),
-                ),
-            }),
+            request.response(&approved_environment("github", serde_json::Map::new())),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let _: Value = open_completion(&mut context, &completion["payload"]);
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        request.receive_completion(&mut socket).await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -1910,32 +1521,21 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut first_socket) = accept(&listener).await;
-        let request = receive_json(&mut first_socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        send_json(
-            &mut first_socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
+        let (mut request, _) = receive_request(&mut first_socket, &device_private_key).await;
+        send_json(&mut first_socket, request.ack("request")).await;
         first_socket.send(Message::close(None, "")).await.unwrap();
         drop(first_socket);
 
         let (_, mut second_socket) = accept(&listener).await;
         let resume = receive_json(&mut second_socket).await;
         assert_eq!(resume["type"], "resume");
-        assert_eq!(resume["request_id"], request_id);
+        assert_eq!(resume["request_id"], request.request_id);
         send_json(
             &mut second_socket,
             json!({
                 "type": "state",
-                "client_id": client_id,
-                "request_id": request_id,
+                "client_id": request.client_id,
+                "request_id": request.request_id,
                 "exchange": "open",
                 "request": "accepted",
                 "response": "absent",
@@ -1943,26 +1543,14 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
             }),
         )
         .await;
-        let (mut context, key, _) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
         send_json(
             &mut second_socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &approved_environment("github", serde_json::Map::new()),
-                ),
-            }),
+            request.response(&approved_environment("github", serde_json::Map::new())),
         )
         .await;
         assert_eq!(receive_json(&mut second_socket).await["kind"], "response");
         let first_completion = receive_json(&mut second_socket).await;
-        let _: Value = open_completion(&mut context, &first_completion["payload"]);
+        open_completion(&mut request.context, &first_completion["payload"]);
         second_socket.send(Message::close(None, "")).await.unwrap();
         drop(second_socket);
 
@@ -1973,8 +1561,8 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
             &mut third_socket,
             json!({
                 "type": "state",
-                "client_id": client_id,
-                "request_id": request_id,
+                "client_id": request.client_id,
+                "request_id": request.request_id,
                 "exchange": "open",
                 "request": "delivered",
                 "response": "delivered",
@@ -1984,16 +1572,7 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
         .await;
         let second_completion = receive_json(&mut third_socket).await;
         assert_eq!(second_completion, first_completion);
-        send_json(
-            &mut third_socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut third_socket, request.ack("completion")).await;
     })
     .await;
 
@@ -2018,40 +1597,17 @@ async fn signal_before_response_sends_an_aborted_completion() {
     let (release_sender, release_receiver) = mpsc::sync_channel(0);
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, _, _) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
+        let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
+        send_json(&mut socket, request.ack("request")).await;
         ready_sender.send(()).unwrap();
         release_receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
 
-        let completion = receive_json(&mut socket).await;
-        let plaintext = open_completion(&mut context, &completion["payload"]);
+        let plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(plaintext["result"], "ABORTED");
         assert_eq!(plaintext["reason"], "CANCELLED");
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -2093,11 +1649,10 @@ async fn relay_errors_retry_the_exact_request_and_completion() {
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap();
-        let request_id = request["request_id"].as_str().unwrap();
+        let frame = receive_json(&mut socket).await;
+        let (mut request, _) = ReceivedRequest::open(&device_private_key, &frame);
         let retry = json!({
-            "type": "error", "client_id": client_id, "request_id": request_id,
+            "type": "error", "client_id": request.client_id, "request_id": request.request_id,
             "error": "TEMPORARILY_UNAVAILABLE", "message": "Try again.",
             "retryable": true, "retry_after_ms": 0,
         });
@@ -2105,22 +1660,16 @@ async fn relay_errors_retry_the_exact_request_and_completion() {
         drop(socket);
 
         let (_, mut socket) = accept(&listener).await;
-        assert_eq!(receive_json(&mut socket).await, request);
-        let (mut context, key, _) =
-            open_request(&device_private_key, request_id, &request["payload"]);
+        assert_eq!(receive_json(&mut socket).await, frame);
         send_json(
             &mut socket,
-            json!({
-                "type": "message", "client_id": client_id, "request_id": request_id,
-                "kind": "response", "payload": encrypt_response(&context, &key,
-                    &approved_environment("test", serde_json::Map::new())),
-            }),
+            request.response(&approved_environment("test", serde_json::Map::new())),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
         let completion = receive_json(&mut socket).await;
         assert_eq!(
-            open_completion(&mut context, &completion["payload"])["result"],
+            open_completion(&mut request.context, &completion["payload"])["result"],
             "APPROVED"
         );
         send_json(&mut socket, retry).await;
@@ -2130,13 +1679,11 @@ async fn relay_errors_retry_the_exact_request_and_completion() {
         assert_eq!(
             receive_json(&mut socket).await,
             json!({
-                "type": "resume", "client_id": client_id, "request_id": request_id,
+                "type": "resume", "client_id": request.client_id, "request_id": request.request_id,
             })
         );
         assert_eq!(receive_json(&mut socket).await, completion);
-        send_json(&mut socket, json!({
-            "type": "ack", "client_id": client_id, "request_id": request_id, "kind": "completion",
-        })).await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -2158,42 +1705,45 @@ async fn relay_errors_retry_the_exact_request_and_completion() {
 async fn relay_rejection_still_attempts_an_aborted_completion() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
-    let (relay_url, server) =
-        websocket_server(move |listener| async move {
-            let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
-            let client_id = request["client_id"].as_str().unwrap();
-            let request_id = request["request_id"].as_str().unwrap();
-            let (mut context, _, _) =
-                open_request(&device_private_key, request_id, &request["payload"]);
-            send_json(&mut socket, json!({
-            "type": "ack", "client_id": client_id, "request_id": request_id, "kind": "request",
-        })).await;
-            send_json(
-                &mut socket,
-                json!({
-                    "type": "error", "client_id": client_id, "request_id": request_id,
-                    "error": "REQUEST_REJECTED", "message": "Request rejected.", "retryable": false,
-                }),
-            )
-            .await;
-            let completion = receive_json(&mut socket).await;
-            assert_eq!(completion["kind"], "completion");
-            let plaintext = open_completion(&mut context, &completion["payload"]);
-            assert_eq!(plaintext["result"], "ABORTED");
-            assert_eq!(plaintext["reason"], "INVALID_RESPONSE");
-            assert!(
-                plaintext["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("REQUEST_REJECTED")
-            );
-            send_json(&mut socket, json!({
-            "type": "error", "client_id": client_id, "request_id": request_id,
-            "error": "COMPLETION_REJECTED", "message": "Completion rejected.", "retryable": false,
-        })).await;
-        })
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
+        send_json(&mut socket, request.ack("request")).await;
+        send_json(
+            &mut socket,
+            json!({
+                "type": "error",
+                "client_id": request.client_id,
+                "request_id": request.request_id,
+                "error": "REQUEST_REJECTED",
+                "message": "Request rejected.",
+                "retryable": false,
+            }),
+        )
         .await;
+        let plaintext = request.receive_completion(&mut socket).await;
+        assert_eq!(plaintext["result"], "ABORTED");
+        assert_eq!(plaintext["reason"], "INVALID_RESPONSE");
+        assert!(
+            plaintext["message"]
+                .as_str()
+                .unwrap()
+                .contains("REQUEST_REJECTED")
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "error",
+                "client_id": request.client_id,
+                "request_id": request.request_id,
+                "error": "COMPLETION_REJECTED",
+                "message": "Completion rejected.",
+                "retryable": false,
+            }),
+        )
+        .await;
+    })
+    .await;
 
     let output = home
         .relay_command(relay_url)
@@ -2234,51 +1784,18 @@ async fn check_aborted_response(
     let device_private_key = home.device_private_key.clone();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, _) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
-        let mut response = encrypt_response(&context, &key, &response);
+        let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
+        let mut response = request.response(&response);
         if corrupt_ciphertext {
-            response["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into();
+            response["payload"]["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into();
         }
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": response,
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("request")).await;
+        send_json(&mut socket, response).await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let plaintext = open_completion(&mut context, &completion["payload"]);
+        let plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(plaintext["result"], "ABORTED");
         assert_eq!(plaintext["reason"], reason);
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -2303,61 +1820,25 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
     let (release_sender, release_receiver) = mpsc::sync_channel(0);
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let client_id = request["client_id"].as_str().unwrap().to_owned();
-        let request_id = request["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, _) =
-            open_request(&device_private_key, &request_id, &request["payload"]);
+        let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &approved_environment(
-                        "github",
-                        serde_json::Map::from_iter([(
-                            "AGENTKNOCK_MUST_NOT_EXEC".into(),
-                            "yes".into(),
-                        )]),
-                    ),
-                ),
-            }),
+            request.response(&approved_environment(
+                "github",
+                serde_json::Map::from_iter([("AGENTKNOCK_MUST_NOT_EXEC".into(), "yes".into())]),
+            )),
         )
         .await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        let plaintext = open_completion(&mut context, &completion["payload"]);
+        let plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(plaintext["result"], "APPROVED");
         ready_sender.send(()).unwrap();
         release_receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
 
@@ -2389,17 +1870,13 @@ async fn cancellation_bounds_the_entire_completion_handoff() {
     // Neither a missing request ack nor a missing completion ack may prolong cancellation.
     for acknowledge_request in [false, true] {
         let home = TestHome::active();
+        let device_private_key = home.device_private_key.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (relay_url, server) = websocket_server(move |listener| async move {
             let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
+            let (request, _) = receive_request(&mut socket, &device_private_key).await;
             if acknowledge_request {
-                send_json(&mut socket, json!({
-                    "type": "ack",
-                    "client_id": request["client_id"],
-                    "request_id": request["request_id"],
-                    "kind": "request",
-                })).await;
+                send_json(&mut socket, request.ack("request")).await;
             }
             ready_tx.send(()).unwrap();
             // Keep the transport healthy without acknowledging the handoff.
@@ -2409,7 +1886,8 @@ async fn cancellation_bounds_the_entire_completion_handoff() {
                 tokio::select! {
                     message = socket.next() => match message {
                         Some(Ok(message)) if message.is_text() => {
-                            let message: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
+                            let message: Value =
+                                serde_json::from_str(message.as_text().unwrap()).unwrap();
                             assert_eq!(message["kind"], "completion");
                             saw_completion = true;
                         }
@@ -2422,7 +1900,8 @@ async fn cancellation_bounds_the_entire_completion_handoff() {
                 }
             }
             assert_eq!(saw_completion, acknowledge_request);
-        }).await;
+        })
+        .await;
         let mut child = ChildGuard(
             home.relay_command(relay_url)
                 .args(["-s", "test", "--", "env"])
