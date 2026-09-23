@@ -212,17 +212,9 @@ impl Client {
         let plaintext = self.encode(&FinishPairingResult::Accepted)?;
         let completion = session.seal_completion(&plaintext)?;
         finish_pending_pairing(&pairing_path, &pairing.client_id())?;
-        let interrupted = tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => true,
-            result = relay.complete(&completion) => {
-                result?;
-                false
-            }
-        };
-        if interrupted {
-            let _ = relay.complete_briefly(&completion).await;
-        }
+        relay
+            .complete_or_cancel(&completion, cancellation.as_mut())
+            .await?;
         progress(RequestProgress::Completed);
 
         Ok(())

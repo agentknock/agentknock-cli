@@ -133,18 +133,14 @@ impl Client {
         };
         let plaintext = self.encode(&outcome)?;
         let completion = session.seal_completion(&plaintext)?;
-        tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => {
-                let _ = relay.complete_briefly(&completion).await;
-                Err(RequestError::Interrupted)
-            }
-            handoff = relay.complete(&completion) => {
-                handoff?;
-                progress(RequestProgress::Completed);
-                result
-            }
+        if relay
+            .complete_or_cancel(&completion, cancellation.as_mut())
+            .await?
+        {
+            return Err(RequestError::Interrupted);
         }
+        progress(RequestProgress::Completed);
+        result
     }
 }
 

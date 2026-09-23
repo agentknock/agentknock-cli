@@ -201,17 +201,9 @@ impl Client {
         };
         let plaintext = self.encode(&EmptyMessage {})?;
         let completion = session.seal_completion(&plaintext)?;
-        let interrupted = tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => true,
-            result = relay.complete(&completion) => {
-                result?;
-                false
-            }
-        };
-        if interrupted {
-            let _ = relay.complete_briefly(&completion).await;
-        }
+        relay
+            .complete_or_cancel(&completion, cancellation.as_mut())
+            .await?;
         progress(RequestProgress::Completed);
 
         response
