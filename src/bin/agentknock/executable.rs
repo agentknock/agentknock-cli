@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::{CString, OsStr, OsString},
     fs::File,
-    io::{self, Seek as _},
+    io::{self, Read as _, Seek as _},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
@@ -501,37 +501,24 @@ fn hash_path(path: &Path) -> io::Result<[u8; HASH_LENGTH]> {
 }
 
 fn inspect_file(mut file: impl io::Read) -> io::Result<FileInspection> {
+    // Read one byte past the script limit to tell whether a script fits.
+    let mut head = Vec::new();
+    (&mut file)
+        .take(MAXIMUM_SCRIPT_SIZE as u64 + 1)
+        .read_to_end(&mut head)?;
     let mut hash = Sha256::new();
-    let mut prefix = [0_u8; 2];
-    let mut prefix_length = 0;
-    let mut script_bytes = Vec::new();
-    let mut too_large = false;
-    let mut buffer = [0_u8; READ_BUFFER_LENGTH];
+    hash.update(&head);
+    let mut buffer = vec![0; READ_BUFFER_LENGTH];
     loop {
         let length = file.read(&mut buffer)?;
         if length == 0 {
             break;
         }
-        if prefix_length < prefix.len() {
-            let copied = (prefix.len() - prefix_length).min(length);
-            prefix[prefix_length..prefix_length + copied].copy_from_slice(&buffer[..copied]);
-            prefix_length += copied;
-        }
         hash.update(&buffer[..length]);
-        // Keep a possible one-byte shebang prefix across short reads. Once the
-        // prefix rules out a script, don't retain any more executable bytes.
-        if prefix[..prefix_length] == b"#!"[..prefix_length] && !too_large {
-            if script_bytes.len() + length > MAXIMUM_SCRIPT_SIZE {
-                too_large = true;
-                script_bytes.clear();
-            } else {
-                script_bytes.extend_from_slice(&buffer[..length]);
-            }
-        }
     }
-    let shebang = prefix_length == 2 && prefix == *b"#!";
-    let script_contents =
-        (shebang && !too_large).then(|| String::from_utf8_lossy(&script_bytes).into_owned());
+    let shebang = head.starts_with(b"#!");
+    let script_contents = (shebang && head.len() <= MAXIMUM_SCRIPT_SIZE)
+        .then(|| String::from_utf8_lossy(&head).into_owned());
     Ok(FileInspection {
         hash: hash.finalize().into(),
         shebang,
