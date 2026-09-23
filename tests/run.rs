@@ -4,7 +4,7 @@ mod support;
 
 use std::{
     fs,
-    io::{Read as _, Write as _},
+    io::Read as _,
     net::{TcpListener, TcpStream},
     os::unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
@@ -21,9 +21,9 @@ use sha2::{Digest as _, Sha256};
 use tokio_websockets::Message;
 
 use support::{
-    ChildGuard, ReceivedRequest, TestHome, accept, assert_authenticated_request, child_stderr,
-    interrupt, isolated_command, open_completion, receive_json, receive_request, run, send_json,
-    wait_for_path, websocket_server,
+    ChildGuard, ReceivedRequest, TestHome, accept, agent_request, assert_authenticated_request,
+    child_stderr, interrupt, isolated_command, open_completion, put_ssh_string, receive_json,
+    receive_request, run, send_json, take_ssh_string, wait_for_path, websocket_server,
 };
 
 fn approved_environment(secret: &str, variables: serde_json::Map<String, Value>) -> Value {
@@ -718,14 +718,7 @@ fn sign_with_agent(socket_path: &Path, key_blob: &[u8], message: &[u8], flags: u
     put_ssh_string(&mut request, message);
     request.extend_from_slice(&flags.to_be_bytes());
     let mut connection = UnixStream::connect(socket_path).unwrap();
-    connection
-        .write_all(&(request.len() as u32).to_be_bytes())
-        .unwrap();
-    connection.write_all(&request).unwrap();
-    let mut length = [0; 4];
-    connection.read_exact(&mut length).unwrap();
-    let mut response = vec![0; u32::from_be_bytes(length) as usize];
-    connection.read_exact(&mut response).unwrap();
+    let response = agent_request(&mut connection, &request);
     assert_eq!(
         response.first(),
         Some(&14),
@@ -734,16 +727,6 @@ fn sign_with_agent(socket_path: &Path, key_blob: &[u8], message: &[u8], flags: u
     let (signature, trailing) = take_ssh_string(&response[1..]);
     assert!(trailing.is_empty());
     signature.to_vec()
-}
-
-fn put_ssh_string(output: &mut Vec<u8>, value: &[u8]) {
-    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    output.extend_from_slice(value);
-}
-
-fn take_ssh_string(input: &[u8]) -> (&[u8], &[u8]) {
-    let length = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
-    (&input[4..4 + length], &input[4 + length..])
 }
 
 fn ssh_signature_flags(message: &[u8]) -> u32 {

@@ -20,8 +20,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use support::{
-    ChildGuard, TestHome, accept, isolated_command, open_completion, receive_json, receive_request,
-    run, send_json, wait_for_path, websocket_server,
+    ChildGuard, TestHome, accept, agent_request, isolated_command, open_completion, put_ssh_string,
+    receive_json, receive_request, run, send_json, wait_for_path, websocket_server,
 };
 
 #[cfg(target_os = "linux")]
@@ -632,12 +632,7 @@ fn checks_git_signing_key_passthrough(ssh_agent: bool, ssh_passthrough: bool) {
 }
 
 fn request_identities(connection: &mut UnixStream) -> Vec<u8> {
-    connection.write_all(&[0, 0, 0, 1, 11]).unwrap();
-    let mut length = [0; 4];
-    connection.read_exact(&mut length).unwrap();
-    let mut response = vec![0; u32::from_be_bytes(length) as usize];
-    connection.read_exact(&mut response).unwrap();
-    response
+    agent_request(connection, &[11]) // SSH_AGENTC_REQUEST_IDENTITIES
 }
 
 fn start_service() -> Child {
@@ -771,36 +766,24 @@ fn request_signature(directory: &Path, kind: SignatureKind) -> bool {
             response["status"] == "signature"
         }
         SignatureKind::Ssh => {
-            fn string(output: &mut Vec<u8>, value: &[u8]) {
-                output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-                output.extend_from_slice(value);
-            }
             let key = BASE64_STANDARD
                 .decode(PUBLIC_KEY.split_whitespace().nth(1).unwrap())
                 .unwrap();
             let mut message = Vec::new();
-            string(&mut message, b"test session identifier");
+            put_ssh_string(&mut message, b"test session identifier");
             message.push(50); // SSH_MSG_USERAUTH_REQUEST
-            string(&mut message, b"test-user");
-            string(&mut message, b"ssh-connection");
-            string(&mut message, b"publickey");
+            put_ssh_string(&mut message, b"test-user");
+            put_ssh_string(&mut message, b"ssh-connection");
+            put_ssh_string(&mut message, b"publickey");
             message.push(1);
-            string(&mut message, b"ssh-ed25519");
-            string(&mut message, &key);
+            put_ssh_string(&mut message, b"ssh-ed25519");
+            put_ssh_string(&mut message, &key);
             let mut packet = vec![13]; // SSH_AGENTC_SIGN_REQUEST
-            string(&mut packet, &key);
-            string(&mut packet, &message);
+            put_ssh_string(&mut packet, &key);
+            put_ssh_string(&mut packet, &message);
             packet.extend_from_slice(&0u32.to_be_bytes());
             let mut connection = UnixStream::connect(directory.join("agent.sock")).unwrap();
-            connection
-                .write_all(&(packet.len() as u32).to_be_bytes())
-                .unwrap();
-            connection.write_all(&packet).unwrap();
-            let mut length = [0; 4];
-            connection.read_exact(&mut length).unwrap();
-            let mut response = vec![0; u32::from_be_bytes(length) as usize];
-            connection.read_exact(&mut response).unwrap();
-            response[0] == 14 // SSH_AGENT_SIGN_RESPONSE
+            agent_request(&mut connection, &packet)[0] == 14 // SSH_AGENT_SIGN_RESPONSE
         }
     }
 }

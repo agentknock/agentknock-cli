@@ -5,8 +5,8 @@ use std::{
     fs,
     fs::OpenOptions,
     future::Future,
-    io::Read as _,
-    os::unix::fs::OpenOptionsExt,
+    io::{Read as _, Write as _},
+    os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command},
     thread,
@@ -210,6 +210,29 @@ pub fn child_stderr(child: &mut Child) -> String {
         let _ = input.read_to_string(&mut stderr);
     }
     stderr
+}
+
+/// Sends one SSH agent request and returns the agent's response.
+pub fn agent_request(connection: &mut UnixStream, request: &[u8]) -> Vec<u8> {
+    connection
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .unwrap();
+    connection.write_all(request).unwrap();
+    let mut length = [0; 4];
+    connection.read_exact(&mut length).unwrap();
+    let mut response = vec![0; u32::from_be_bytes(length) as usize];
+    connection.read_exact(&mut response).unwrap();
+    response
+}
+
+pub fn put_ssh_string(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+pub fn take_ssh_string(input: &[u8]) -> (&[u8], &[u8]) {
+    let length = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    (&input[4..4 + length], &input[4 + length..])
 }
 
 pub async fn websocket_server<F, Fut, T>(handler: F) -> (String, JoinHandle<T>)
