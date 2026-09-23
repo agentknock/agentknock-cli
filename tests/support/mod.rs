@@ -365,3 +365,74 @@ pub fn open_completion(context: &mut ReceiverContext, completion: &Value) -> Val
     let plaintext = context.open(&ciphertext, b"").unwrap();
     serde_json::from_slice(&plaintext).unwrap()
 }
+
+/// The device's side of one request exchange.
+pub struct ReceivedRequest {
+    pub client_id: String,
+    pub request_id: String,
+    pub context: ReceiverContext,
+    pub key: Vec<u8>,
+}
+
+impl ReceivedRequest {
+    /// Opens a request frame from the test pairing and returns its plaintext.
+    pub fn open(
+        device_private_key: &<Kem as KemTrait>::PrivateKey,
+        frame: &Value,
+    ) -> (Self, Value) {
+        let client_id = frame["client_id"].as_str().unwrap().to_owned();
+        let request_id = frame["request_id"].as_str().unwrap().to_owned();
+        let (context, key, plaintext) =
+            open_request(device_private_key, &request_id, &frame["payload"]);
+        let request = Self {
+            client_id,
+            request_id,
+            context,
+            key,
+        };
+        (request, plaintext)
+    }
+
+    pub fn ack(&self, kind: &str) -> Value {
+        self.frame("ack", kind)
+    }
+
+    pub fn receipt(&self) -> Value {
+        self.frame("receipt", "request")
+    }
+
+    pub fn response(&self, response: &Value) -> Value {
+        let mut frame = self.frame("message", "response");
+        frame["payload"] = encrypt_response(&self.context, &self.key, response);
+        frame
+    }
+
+    /// Receives the client's completion and returns its plaintext.
+    pub async fn receive_completion<S>(&mut self, socket: &mut WebSocketStream<S>) -> Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let completion = receive_json(socket).await;
+        assert_eq!(completion["kind"], "completion");
+        open_completion(&mut self.context, &completion["payload"])
+    }
+
+    fn frame(&self, frame_type: &str, kind: &str) -> Value {
+        json!({
+            "type": frame_type,
+            "client_id": self.client_id,
+            "request_id": self.request_id,
+            "kind": kind,
+        })
+    }
+}
+
+pub async fn receive_request<S>(
+    socket: &mut WebSocketStream<S>,
+    device_private_key: &<Kem as KemTrait>::PrivateKey,
+) -> (ReceivedRequest, Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ReceivedRequest::open(device_private_key, &receive_json(socket).await)
+}

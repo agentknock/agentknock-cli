@@ -8,8 +8,8 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 
 use support::{
-    TestHome, accept, assert_authenticated_request, encrypt_response, http_connect_proxy,
-    interrupt, open_completion, open_request, receive_json, send_json, websocket_server,
+    TestHome, accept, assert_authenticated_request, http_connect_proxy, interrupt, receive_json,
+    receive_request, send_json, websocket_server,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19,11 +19,7 @@ async fn lists_secret_metadata_without_secret_values() {
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (upgrade, mut socket) = accept(&listener).await;
         assert_authenticated_request(&upgrade);
-        let frame = receive_json(&mut socket).await;
-        let client_id = frame["client_id"].as_str().unwrap().to_owned();
-        let request_id = frame["request_id"].as_str().unwrap().to_owned();
-        let (mut context, key, plaintext) =
-            open_request(&device_private_key, &request_id, &frame["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &device_private_key).await;
         assert_eq!(plaintext["method"], "SecretList");
         assert_eq!(plaintext["app_info"]["name"], "agentknock");
         assert_eq!(plaintext["app_info"]["version"], env!("CARGO_PKG_VERSION"));
@@ -31,61 +27,41 @@ async fn lists_secret_metadata_without_secret_values() {
         assert_eq!(plaintext["lib_info"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(plaintext.get("cli_version").is_none());
 
+        send_json(&mut socket, request.ack("request")).await;
         send_json(
             &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "request",
-            }),
-        )
-        .await;
-        send_json(
-            &mut socket,
-            json!({
-                "type": "message",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "response",
-                "payload": encrypt_response(
-                    &context,
-                    &key,
-                    &json!({
-                        "secrets": {
-                            "github": {
-                                "description": "GitHub API access",
-                                "type": "environment",
-                                "variables": ["GH_TOKEN"],
-                            },
-                            "cloudflare": {
-                                "description": "Cloudflare deployment access",
-                                "type": "environment",
-                                "variables": ["CF_API_TOKEN", "CF_ACCOUNT_ID"],
-                            },
-                            "production-ssh": {
-                                "description": "Production host access",
-                                "type": "ssh",
-                                "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample user@host",
-                            },
-                            "future": {
-                                "description": "A future secret type",
-                                "type": "future_type",
-                                "future_metadata": {"value": true},
-                                "variables": {"different": "shape"},
-                                "public_key": 42,
-                            },
-                        },
-                    }),
-                ),
-            }),
+            request.response(&json!({
+                "secrets": {
+                    "github": {
+                        "description": "GitHub API access",
+                        "type": "environment",
+                        "variables": ["GH_TOKEN"],
+                    },
+                    "cloudflare": {
+                        "description": "Cloudflare deployment access",
+                        "type": "environment",
+                        "variables": ["CF_API_TOKEN", "CF_ACCOUNT_ID"],
+                    },
+                    "production-ssh": {
+                        "description": "Production host access",
+                        "type": "ssh",
+                        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample user@host",
+                    },
+                    "future": {
+                        "description": "A future secret type",
+                        "type": "future_type",
+                        "future_metadata": {"value": true},
+                        "variables": {"different": "shape"},
+                        "public_key": 42,
+                    },
+                },
+            })),
         )
         .await;
         let response_ack = receive_json(&mut socket).await;
         assert_eq!(response_ack["kind"], "response");
-        let completion = receive_json(&mut socket).await;
         assert_eq!(
-            open_completion(&mut context, &completion["payload"]),
+            request.receive_completion(&mut socket).await,
             json!({
                 "app_info": {
                     "name": "agentknock",
@@ -97,16 +73,7 @@ async fn lists_secret_metadata_without_secret_values() {
                 },
             })
         );
-        send_json(
-            &mut socket,
-            json!({
-                "type": "ack",
-                "client_id": client_id,
-                "request_id": request_id,
-                "kind": "completion",
-            }),
-        )
-        .await;
+        send_json(&mut socket, request.ack("completion")).await;
     })
     .await;
     let (proxy_url, proxy) = http_connect_proxy().await;
