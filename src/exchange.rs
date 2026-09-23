@@ -55,13 +55,15 @@ impl Client {
                 if let Some(completion) =
                     seal_aborted(self, &mut session, reason, error.to_string())
                 {
+                    // The relay already failed, so the abort gets only a brief handoff attempt.
+                    // Cancellation, even if already pending, still gets that attempt.
                     tokio::select! {
                         biased;
                         _ = cancellation.as_mut() => {
                             let _ = relay.complete_briefly(&completion).await;
                             return Err(RequestError::Interrupted);
                         }
-                        _ = relay.complete(&completion) => {}
+                        _ = relay.complete_briefly(&completion) => {}
                     }
                 }
                 return Err(error);

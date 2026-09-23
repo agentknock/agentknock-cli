@@ -584,23 +584,8 @@ impl RelayExchange {
                     .await?;
                 return Ok(None);
             }
-            if message.is_ping() {
-                let payload = message.into_payload();
-                if let Err(error) = self
-                    .socket
-                    .as_mut()
-                    .expect("socket is connected")
-                    .send(Message::pong(payload))
-                    .await
-                {
-                    self.socket = None;
-                    retry.failed_with(error.to_string()).await?;
-                    return Ok(None);
-                }
-                retry.succeeded();
-                continue;
-            }
-            if message.is_pong() {
+            // tokio-websockets queues the pong itself and flushes it on the next read.
+            if message.is_ping() || message.is_pong() {
                 retry.succeeded();
                 continue;
             }
