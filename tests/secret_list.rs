@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::{process::Stdio, sync::mpsc, time::Duration};
+use std::{process::Stdio, time::Duration};
 
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
@@ -175,8 +175,8 @@ async fn reports_inactive_client_without_suggesting_recovery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_cancels_a_waiting_secret_list_request() {
     let home = TestHome::active();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
         let request = receive_json(&mut socket).await;
@@ -191,8 +191,9 @@ async fn signal_cancels_a_waiting_secret_list_request() {
         )
         .await;
         ready_sender.send(()).unwrap();
-        release_receiver
-            .recv_timeout(Duration::from_secs(5))
+        tokio::time::timeout(Duration::from_secs(5), release_receiver)
+            .await
+            .unwrap()
             .unwrap();
     })
     .await;
@@ -204,7 +205,10 @@ async fn signal_cancels_a_waiting_secret_list_request() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready_receiver)
+        .await
+        .unwrap()
+        .unwrap();
     interrupt(&child);
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();

@@ -9,7 +9,6 @@ use std::{
     os::unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
     thread,
     time::Duration,
 };
@@ -1593,15 +1592,16 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
 async fn signal_before_response_sends_an_aborted_completion() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
         let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
         send_json(&mut socket, request.ack("request")).await;
         ready_sender.send(()).unwrap();
-        release_receiver
-            .recv_timeout(Duration::from_secs(5))
+        tokio::time::timeout(Duration::from_secs(5), release_receiver)
+            .await
+            .unwrap()
             .unwrap();
 
         let plaintext = request.receive_completion(&mut socket).await;
@@ -1618,7 +1618,10 @@ async fn signal_before_response_sends_an_aborted_completion() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready_receiver)
+        .await
+        .unwrap()
+        .unwrap();
     interrupt(&child);
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1816,8 +1819,8 @@ async fn check_aborted_response(
 async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
         let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
@@ -1834,8 +1837,9 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
         let plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(plaintext["result"], "APPROVED");
         ready_sender.send(()).unwrap();
-        release_receiver
-            .recv_timeout(Duration::from_secs(5))
+        tokio::time::timeout(Duration::from_secs(5), release_receiver)
+            .await
+            .unwrap()
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         send_json(&mut socket, request.ack("completion")).await;
@@ -1849,7 +1853,10 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready_receiver)
+        .await
+        .unwrap()
+        .unwrap();
     interrupt(&child);
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();

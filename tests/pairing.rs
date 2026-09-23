@@ -6,7 +6,6 @@ use std::{
     fs,
     os::unix::{ffi::OsStringExt as _, fs::PermissionsExt as _},
     process::Stdio,
-    sync::mpsc,
     time::Duration,
 };
 
@@ -185,8 +184,8 @@ async fn cancel_start_pairing(replace_pairing: bool) {
     let home = TestHome::empty();
     let pairing_path = home.pairing_path();
     let device_public_key = home.device_public_key.clone();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (upgrade, mut socket) = accept(&listener).await;
         let client_id = upgrade.uri().path().rsplit('/').next().unwrap().to_owned();
@@ -227,8 +226,9 @@ async fn cancel_start_pairing(replace_pairing: bool) {
             fs::write(&pairing_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
         }
         ready_sender.send(()).unwrap();
-        release_receiver
-            .recv_timeout(Duration::from_secs(5))
+        tokio::time::timeout(Duration::from_secs(5), release_receiver)
+            .await
+            .unwrap()
             .unwrap();
     })
     .await;
@@ -240,7 +240,10 @@ async fn cancel_start_pairing(replace_pairing: bool) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready_receiver)
+        .await
+        .unwrap()
+        .unwrap();
     interrupt(&child);
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
