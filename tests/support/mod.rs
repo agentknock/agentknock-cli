@@ -1,12 +1,16 @@
 #![allow(dead_code)]
 
 use std::{
+    ffi::OsStr,
     fs,
     fs::OpenOptions,
     future::Future,
+    io::Read as _,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{
@@ -50,6 +54,17 @@ pub const CLIENT_PSK: [u8; 32] = [0x42; 32];
 pub const CLIENT_TOKEN: [u8; 32] = [0x24; 32];
 pub const PROTOCOL_VERSION_INFO: [u8; 16] = *b"agentknock-v1\0\0\0";
 const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
+// Agentknock honors these even for the loopback test relay.
+const PROXY_VARIABLES: [&str; 8] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
 
 pub struct TestHome {
     directory: tempfile::TempDir,
@@ -117,6 +132,84 @@ impl TestHome {
     pub fn pairing_path(&self) -> PathBuf {
         self.directory.path().join(".agentknock/pairing.json")
     }
+
+    pub fn command(&self) -> Command {
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_agentknock"));
+        command.env("HOME", self.path());
+        command
+    }
+
+    pub fn relay_command(&self, relay_url: impl AsRef<OsStr>) -> Command {
+        let mut command = self.command();
+        command.env("AGENTKNOCK_TEST_RELAY_URL", relay_url);
+        command
+    }
+}
+
+/// Builds a command that ignores the developer's Agentknock home and proxies.
+pub fn isolated_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env_remove("AGENTKNOCK_HOME");
+    for variable in PROXY_VARIABLES {
+        command.env_remove(variable);
+    }
+    command
+}
+
+pub struct ChildGuard(pub Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+pub fn run(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub fn interrupt(child: &Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+pub fn wait_for_path(path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        if child.try_wait().unwrap().is_some() {
+            panic!(
+                "process exited before creating {}: {}",
+                path.display(),
+                child_stderr(child)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process didn't create {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Stops the child and returns what it wrote to a piped stderr.
+pub fn child_stderr(child: &mut Child) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut input) = child.stderr.take() {
+        let _ = input.read_to_string(&mut stderr);
+    }
+    stderr
 }
 
 pub async fn websocket_server<F, Fut, T>(handler: F) -> (String, JoinHandle<T>)

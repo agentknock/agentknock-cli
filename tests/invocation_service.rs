@@ -20,8 +20,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use support::{
-    TestHome, accept, encrypt_response, open_completion, open_request, receive_json, send_json,
-    websocket_server,
+    ChildGuard, TestHome, accept, encrypt_response, isolated_command, open_completion,
+    open_request, receive_json, run, send_json, wait_for_path, websocket_server,
 };
 
 #[cfg(target_os = "linux")]
@@ -30,15 +30,6 @@ use std::path::PathBuf;
 const STARTUP: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const PUBLIC_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB test";
-
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 #[test]
 fn creates_a_private_runtime_directory_and_follows_the_owner_lifetime() {
@@ -655,7 +646,7 @@ fn start_service() -> Child {
 
 fn service_command() -> Command {
     let executable = Path::new(env!("CARGO_BIN_EXE_agentknock"));
-    let mut command = Command::new(Path::new(".").join(executable.file_name().unwrap()));
+    let mut command = isolated_command(Path::new(".").join(executable.file_name().unwrap()));
     command
         .current_dir(executable.parent().unwrap())
         .arg("__invocation-service")
@@ -691,15 +682,6 @@ fn start_ready_service(mut command: Command) -> (ChildGuard, PathBuf) {
     (service, runtime_directory)
 }
 
-fn run(command: &mut Command) {
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 fn send_startup(service: &mut Child, request: &Value) -> Value {
     serde_json::to_writer(service.stdin.take().unwrap(), request).unwrap();
     read_startup_response(&mut service.stdout.take().unwrap()).expect("startup response")
@@ -725,19 +707,6 @@ fn wait_for_exit(process: &mut Child) {
             return;
         }
         assert!(Instant::now() < deadline, "invocation service didn't exit");
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn wait_for_path(path: &Path, process: &mut Child) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
-        assert!(
-            process.try_wait().unwrap().is_none(),
-            "process exited before creating {}",
-            path.display()
-        );
-        assert!(Instant::now() < deadline, "process didn't create a socket");
         thread::sleep(Duration::from_millis(10));
     }
 }
