@@ -11,6 +11,7 @@
 mod client;
 mod config;
 mod crypto;
+mod error;
 mod exchange;
 mod git_sign;
 mod pairing;
@@ -23,14 +24,14 @@ mod websocket;
 
 pub use client::{ApplicationInfo, Client, PairingStatus, RequestProgress};
 pub use config::ConfigurationError;
+pub use error::{DenialReason, RequestError};
 pub use git_sign::{
     GitSignChangeStatus, GitSignChangedPath, GitSignHead, GitSignRepository, GitSignRequest,
 };
 pub use pairing::{PairingRemoveError, PairingSas};
 pub use secret_use::{
-    DenialReason, EnvironmentVariableOptions, ExecutableMode, RequestError, SecretUseInvocation,
-    SecretUseOperation, SecretUseOptions, SecretUseOutput, SecretUseRequest, SshSecretUse,
-    StreamKind,
+    EnvironmentVariableOptions, ExecutableMode, SecretUseInvocation, SecretUseOperation,
+    SecretUseOptions, SecretUseOutput, SecretUseRequest, SshSecretUse, StreamKind,
 };
 pub use secrets::{Secret, SecretUpload, SecretUploadError, SecretUploadMode, Secrets};
 pub use ssh_authentication::{SshAuthenticationRequest, SshSignatureAlgorithm};
