@@ -9,7 +9,6 @@ use std::{
     os::unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
     thread,
     time::Duration,
 };
@@ -339,18 +338,18 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
 
     let remote = home.path().join("remote.git");
     let repository = home.path().join("git-worktree");
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["init", "--bare", "--quiet"])
         .arg(&remote));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["init", "--quiet", "--initial-branch=main"])
         .arg(&repository));
     fs::write(repository.join("example.txt"), "example\n").unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["-C"])
         .arg(&repository)
         .args(["add", "example.txt"]));
-    run(Command::new("git").args(["-C"]).arg(&repository).args([
+    run(isolated_command("git").args(["-C"]).arg(&repository).args([
         "-c",
         "user.name=Agentknock Test",
         "-c",
@@ -363,7 +362,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         "Initial commit",
     ]));
     let remote_url = format!("ssh://{user}@127.0.0.1:{port}{}", remote.display());
-    run(Command::new("git").args(["-C"]).arg(&repository).args([
+    run(isolated_command("git").args(["-C"]).arg(&repository).args([
         "remote",
         "add",
         "origin",
@@ -389,7 +388,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         child_stderr(&mut sshd.0),
     );
     server.await.unwrap();
-    let pushed = Command::new("git")
+    let pushed = isolated_command("git")
         .args(["--git-dir"])
         .arg(&remote)
         .args(["rev-parse", "refs/heads/main"])
@@ -434,10 +433,10 @@ async fn signs_a_git_commit_with_an_ssh_secret(
     let temporary_directory = home.path().join("temporary files");
     fs::create_dir(&repository).unwrap();
     fs::create_dir(&temporary_directory).unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["init", "--quiet", "--initial-branch=main"])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args([
             "remote",
             "add",
@@ -446,10 +445,10 @@ async fn signs_a_git_commit_with_an_ssh_secret(
         ])
         .current_dir(&repository));
     fs::write(repository.join("example.txt"), "example\n").unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["add", "example.txt"])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args([
             "-c",
             "user.name=Agentknock Test",
@@ -463,15 +462,15 @@ async fn signs_a_git_commit_with_an_ssh_secret(
             "Base commit",
         ])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["branch", "--set-upstream-to=origin/main", "main"])
         .current_dir(&repository));
     fs::write(repository.join("example.txt"), "changed\n").unwrap();
     fs::write(repository.join("new.txt"), "new\n").unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["add", "example.txt", "new.txt"])
         .current_dir(&repository));
 
@@ -622,7 +621,7 @@ async fn signs_a_git_commit_with_an_ssh_secret(
 
     let allowed_signers = home.path().join("allowed-signers");
     fs::write(&allowed_signers, format!("test@example.com {public_key}\n")).unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .arg("-C")
         .arg(&repository)
         .args([
@@ -1593,15 +1592,16 @@ async fn resumes_after_request_ack_and_replays_an_unacknowledged_completion() {
 async fn signal_before_response_sends_an_aborted_completion() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
         let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
         send_json(&mut socket, request.ack("request")).await;
         ready_sender.send(()).unwrap();
-        release_receiver
-            .recv_timeout(Duration::from_secs(5))
+        tokio::time::timeout(Duration::from_secs(5), release_receiver)
+            .await
+            .unwrap()
             .unwrap();
 
         let plaintext = request.receive_completion(&mut socket).await;
@@ -1618,7 +1618,10 @@ async fn signal_before_response_sends_an_aborted_completion() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready_receiver)
+        .await
+        .unwrap()
+        .unwrap();
     interrupt(&child);
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1816,8 +1819,8 @@ async fn check_aborted_response(
 async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec() {
     let home = TestHome::active();
     let device_private_key = home.device_private_key.clone();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
     let (relay_url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
         let (mut request, _) = receive_request(&mut socket, &device_private_key).await;
@@ -1834,8 +1837,9 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
         let plaintext = request.receive_completion(&mut socket).await;
         assert_eq!(plaintext["result"], "APPROVED");
         ready_sender.send(()).unwrap();
-        release_receiver
-            .recv_timeout(Duration::from_secs(5))
+        tokio::time::timeout(Duration::from_secs(5), release_receiver)
+            .await
+            .unwrap()
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         send_json(&mut socket, request.ack("completion")).await;
@@ -1849,7 +1853,10 @@ async fn signal_after_response_keeps_the_approved_completion_and_does_not_exec()
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready_receiver)
+        .await
+        .unwrap()
+        .unwrap();
     interrupt(&child);
     release_sender.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
