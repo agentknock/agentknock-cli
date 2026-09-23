@@ -1160,19 +1160,13 @@ fn signing_key_matches(requested: &str, expected: &str) -> io::Result<bool> {
 }
 
 fn validate_signing_key(requested: &str, expected: &str) -> io::Result<()> {
-    let requested = public_key_identity(requested).ok_or_else(|| {
-        io::Error::new(
+    if public_key_identity(requested).is_none() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Git requested an invalid SSH public key",
-        )
-    })?;
-    let expected = public_key_identity(expected).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the device returned an invalid SSH public key",
-        )
-    })?;
-    if requested != expected {
+        ));
+    }
+    if !signing_key_matches(requested, expected)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Git requested a different SSH signing key",
