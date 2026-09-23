@@ -20,8 +20,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use support::{
-    TestHome, accept, encrypt_response, open_completion, open_request, receive_json, send_json,
-    websocket_server,
+    TestHome, accept, encrypt_response, isolated_command, open_completion, open_request,
+    receive_json, send_json, websocket_server,
 };
 
 #[cfg(target_os = "linux")]
@@ -655,7 +655,7 @@ fn start_service() -> Child {
 
 fn service_command() -> Command {
     let executable = Path::new(env!("CARGO_BIN_EXE_agentknock"));
-    let mut command = Command::new(Path::new(".").join(executable.file_name().unwrap()));
+    let mut command = isolated_command(Path::new(".").join(executable.file_name().unwrap()));
     command
         .current_dir(executable.parent().unwrap())
         .arg("__invocation-service")
