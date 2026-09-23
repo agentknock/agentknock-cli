@@ -338,18 +338,18 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
 
     let remote = home.path().join("remote.git");
     let repository = home.path().join("git-worktree");
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["init", "--bare", "--quiet"])
         .arg(&remote));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["init", "--quiet", "--initial-branch=main"])
         .arg(&repository));
     fs::write(repository.join("example.txt"), "example\n").unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["-C"])
         .arg(&repository)
         .args(["add", "example.txt"]));
-    run(Command::new("git").args(["-C"]).arg(&repository).args([
+    run(isolated_command("git").args(["-C"]).arg(&repository).args([
         "-c",
         "user.name=Agentknock Test",
         "-c",
@@ -362,7 +362,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         "Initial commit",
     ]));
     let remote_url = format!("ssh://{user}@127.0.0.1:{port}{}", remote.display());
-    run(Command::new("git").args(["-C"]).arg(&repository).args([
+    run(isolated_command("git").args(["-C"]).arg(&repository).args([
         "remote",
         "add",
         "origin",
@@ -388,7 +388,7 @@ async fn uses_an_ssh_secret(key_type: &str, key_options: &[&str], test: SshComma
         child_stderr(&mut sshd.0),
     );
     server.await.unwrap();
-    let pushed = Command::new("git")
+    let pushed = isolated_command("git")
         .args(["--git-dir"])
         .arg(&remote)
         .args(["rev-parse", "refs/heads/main"])
@@ -433,10 +433,10 @@ async fn signs_a_git_commit_with_an_ssh_secret(
     let temporary_directory = home.path().join("temporary files");
     fs::create_dir(&repository).unwrap();
     fs::create_dir(&temporary_directory).unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["init", "--quiet", "--initial-branch=main"])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args([
             "remote",
             "add",
@@ -445,10 +445,10 @@ async fn signs_a_git_commit_with_an_ssh_secret(
         ])
         .current_dir(&repository));
     fs::write(repository.join("example.txt"), "example\n").unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["add", "example.txt"])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args([
             "-c",
             "user.name=Agentknock Test",
@@ -462,15 +462,15 @@ async fn signs_a_git_commit_with_an_ssh_secret(
             "Base commit",
         ])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
         .current_dir(&repository));
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["branch", "--set-upstream-to=origin/main", "main"])
         .current_dir(&repository));
     fs::write(repository.join("example.txt"), "changed\n").unwrap();
     fs::write(repository.join("new.txt"), "new\n").unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .args(["add", "example.txt", "new.txt"])
         .current_dir(&repository));
 
@@ -621,7 +621,7 @@ async fn signs_a_git_commit_with_an_ssh_secret(
 
     let allowed_signers = home.path().join("allowed-signers");
     fs::write(&allowed_signers, format!("test@example.com {public_key}\n")).unwrap();
-    run(Command::new("git")
+    run(isolated_command("git")
         .arg("-C")
         .arg(&repository)
         .args([

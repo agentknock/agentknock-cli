@@ -66,6 +66,25 @@ const PROXY_VARIABLES: [&str; 8] = [
     "NO_PROXY",
 ];
 
+// Set by Git for hooks and `rebase --exec`, and would select the developer's repository.
+const GIT_REPOSITORY_VARIABLES: [&str; 15] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
 pub struct TestHome {
     directory: tempfile::TempDir,
     pub device_private_key: <Kem as KemTrait>::PrivateKey,
@@ -146,11 +165,12 @@ impl TestHome {
     }
 }
 
-/// Builds a command that ignores the developer's Agentknock home and proxies.
+/// Builds a command that ignores the developer's Agentknock home, proxies, and
+/// Git repository.
 pub fn isolated_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env_remove("AGENTKNOCK_HOME");
-    for variable in PROXY_VARIABLES {
+    for variable in PROXY_VARIABLES.into_iter().chain(GIT_REPOSITORY_VARIABLES) {
         command.env_remove(variable);
     }
     command
