@@ -183,13 +183,13 @@ pub(crate) fn seal_pairing(
         secret: BASE64_STANDARD.encode(secret_ciphertext),
         ciphertext: BASE64_STANDARD.encode(ciphertext),
     };
-    let pairing = PendingPairing::new(
-        response.device_id,
+    let pairing = PendingPairing {
+        device_id: response.device_id,
         client_id,
         client_token,
-        client_psk.to_vec(),
-        response.device_key,
-    );
+        client_psk: client_psk.to_vec(),
+        device_key: response.device_key,
+    };
 
     Ok((completion, pairing, sas))
 }

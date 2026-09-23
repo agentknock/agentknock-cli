@@ -45,12 +45,15 @@ pub(crate) struct AddressId(u128);
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct CanonicalUlid(Ulid);
 
+#[derive(Serialize)]
 pub(crate) struct PendingPairing {
-    device_id: CanonicalUlid,
-    client_id: CanonicalUlid,
-    client_token: String,
-    client_psk: Vec<u8>,
-    device_key: Vec<u8>,
+    pub(crate) device_id: CanonicalUlid,
+    pub(crate) client_id: CanonicalUlid,
+    pub(crate) client_token: String,
+    #[serde(serialize_with = "serialize_base64")]
+    pub(crate) client_psk: Vec<u8>,
+    #[serde(serialize_with = "serialize_base64")]
+    pub(crate) device_key: Vec<u8>,
 }
 
 pub(crate) enum StoredPairingStatus {
@@ -122,24 +125,6 @@ impl CanonicalUlid {
 
     pub(crate) fn to_bytes(self) -> [u8; 16] {
         self.0.to_bytes()
-    }
-}
-
-impl PendingPairing {
-    pub(crate) fn new(
-        device_id: CanonicalUlid,
-        client_id: CanonicalUlid,
-        client_token: String,
-        client_psk: Vec<u8>,
-        device_key: Vec<u8>,
-    ) -> Self {
-        Self {
-            device_id,
-            client_id,
-            client_token,
-            client_psk,
-            device_key,
-        }
     }
 }
 
@@ -325,11 +310,7 @@ pub(crate) fn write_pending_pairing(
         path,
         &PendingPairingFile {
             pending: true,
-            device_id: pairing.device_id,
-            client_id: pairing.client_id,
-            client_token: &pairing.client_token,
-            client_psk: &pairing.client_psk,
-            device_key: &pairing.device_key,
+            pairing,
             rotated_at,
         },
     )?;
@@ -650,13 +631,8 @@ where
 #[derive(Serialize)]
 struct PendingPairingFile<'a> {
     pending: bool,
-    device_id: CanonicalUlid,
-    client_id: CanonicalUlid,
-    client_token: &'a str,
-    #[serde(serialize_with = "serialize_base64")]
-    client_psk: &'a [u8],
-    #[serde(serialize_with = "serialize_base64")]
-    device_key: &'a [u8],
+    #[serde(flatten)]
+    pairing: &'a PendingPairing,
     rotated_at: u64,
 }
 
