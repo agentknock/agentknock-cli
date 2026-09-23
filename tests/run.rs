@@ -1762,6 +1762,49 @@ async fn relay_rejection_still_attempts_an_aborted_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answers_each_relay_ping_once() {
+    let home = TestHome::active();
+    let device_private_key = home.device_private_key.clone();
+    let (relay_url, server) = websocket_server(move |listener| async move {
+        let (_, mut socket) = accept(&listener).await;
+        let (request, _) = receive_request(&mut socket, &device_private_key).await;
+        socket.send(Message::ping(b"probe".to_vec())).await.unwrap();
+        send_json(
+            &mut socket,
+            request.response(&approved_environment("test", serde_json::Map::new())),
+        )
+        .await;
+        let mut pongs = 0;
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            if message.is_pong() {
+                pongs += 1;
+                continue;
+            }
+            let frame: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
+            if frame["type"] == "message" && frame["kind"] == "completion" {
+                send_json(&mut socket, request.ack("completion")).await;
+                break;
+            }
+        }
+        assert_eq!(pongs, 1);
+    })
+    .await;
+
+    let output = home
+        .relay_command(relay_url)
+        .args(["-s", "test", "--quiet", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_invocation_response_sends_an_aborted_completion() {
     check_aborted_response(
         json!({"result": "UNKNOWN_RESULT"}),
