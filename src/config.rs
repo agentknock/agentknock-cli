@@ -150,37 +150,6 @@ impl fmt::Display for CanonicalUlid {
     }
 }
 
-impl<'de> Deserialize<'de> for AddressId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let encoded = String::deserialize(deserializer)?;
-        if encoded.len() != 32
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(serde::de::Error::custom(
-                "expected a 32-character lowercase hexadecimal identifier",
-            ));
-        }
-
-        u128::from_str_radix(&encoded, 16)
-            .map(AddressId)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-impl Serialize for AddressId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.collect_str(self)
-    }
-}
-
 impl<'de> Deserialize<'de> for CanonicalUlid {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

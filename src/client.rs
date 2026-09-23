@@ -7,7 +7,10 @@ use std::{
 
 use serde::Serialize;
 
-use crate::config::{ConfigurationError, StoredPairingStatus, read_pairing_status};
+use crate::{
+    RequestError,
+    config::{ConfigurationError, StoredPairingStatus, read_pairing_status},
+};
 
 /// Identifies the application that uses the Agentknock library.
 ///
@@ -197,11 +200,11 @@ impl Client {
         self.home.join("pairing.json")
     }
 
-    pub(crate) fn encode<T>(&self, contents: &T) -> Result<Vec<u8>, serde_json::Error>
+    pub(crate) fn encode<T>(&self, contents: &T) -> Result<Vec<u8>, RequestError>
     where
         T: Serialize,
     {
-        crate::protocol::encode(&self.application_info, contents)
+        crate::protocol::encode(&self.application_info, contents).map_err(RequestError::other)
     }
 }
 

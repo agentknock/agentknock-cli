@@ -1,22 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
     future::Future,
     io,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use ulid::Ulid;
 
-use crate::{
-    Client, RequestProgress,
-    config::ConfigurationError,
-    protocol::Method,
-    secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
-    websocket,
-};
+use crate::{Client, RequestError, RequestProgress, protocol::Method};
 
 const INVOCATION_TOKEN_LENGTH: usize = 32;
 
@@ -247,110 +239,6 @@ impl SecretUseInvocation {
     }
 }
 
-/// An error during an operation that communicates with the relay or device.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum RequestError {
-    /// Local pairing state couldn't be read or updated safely.
-    #[error(transparent)]
-    Configuration(#[from] ConfigurationError),
-
-    /// Consecutive transport or relay failures exhausted the retry policy.
-    ///
-    /// Valid relay traffic resets the consecutive-failure count.
-    #[error("relay remained unavailable after {failures} consecutive failures")]
-    RelayUnavailable {
-        /// The number of consecutive failures observed.
-        failures: usize,
-    },
-
-    /// An error report wasn't authenticated by the device.
-    ///
-    /// Callers must not treat this as a trusted device decision or use it to
-    /// change cryptographic state.
-    #[error("received unauthenticated error {code}: {message:?}")]
-    Unauthenticated {
-        /// A machine-readable error code supplied by the relay.
-        code: String,
-        /// Human-readable diagnostic text supplied by the relay.
-        message: String,
-    },
-
-    /// The relay reports that the paired client is inactive.
-    #[error("paired client is inactive: {message}")]
-    ClientInactive {
-        /// Human-readable context supplied by the relay.
-        message: String,
-    },
-
-    /// The device returned an authenticated protocol error.
-    #[error("device rejected the request with {code}: {message}")]
-    DeviceRejected {
-        /// A machine-readable error code supplied by the device.
-        code: String,
-        /// Human-readable diagnostic text supplied by the device.
-        message: String,
-    },
-
-    /// The operation failed without a more specific public error category.
-    #[error(transparent)]
-    Other(#[from] io::Error),
-
-    /// The device denied an authorization request.
-    #[error("request denied ({reason}): {message}")]
-    Denied {
-        /// The device's denial category.
-        reason: DenialReason,
-        /// Human-readable context supplied by the device.
-        message: String,
-    },
-
-    /// The device rejected a pending pairing during activation.
-    #[error("pairing was rejected")]
-    PairingRejected,
-
-    /// The cancellation future resolved before the operation returned its result.
-    #[error("request was interrupted")]
-    Interrupted,
-}
-
-impl RequestError {
-    pub(crate) fn other<E>(error: E) -> Self
-    where
-        E: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        Self::Other(io::Error::other(error))
-    }
-}
-
-/// The reason that the device denied an authorization request.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum DenialReason {
-    /// A user explicitly denied the request.
-    UserDenied,
-
-    /// Device policy denied the request.
-    PolicyDenied,
-
-    /// The device considered the request malformed or unsupported.
-    InvalidRequest,
-
-    /// The device denied the request for another reason.
-    Other,
-}
-
-impl fmt::Display for DenialReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::UserDenied => "USER_DENIED",
-            Self::PolicyDenied => "POLICY_DENIED",
-            Self::InvalidRequest => "INVALID_REQUEST",
-            Self::Other => "OTHER",
-        })
-    }
-}
-
 impl Client {
     /// Requests selected secrets for an invocation.
     ///
@@ -487,7 +375,7 @@ impl Client {
 }
 
 fn secret_use_output_from_secrets(
-    secrets: BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>,
+    secrets: BTreeMap<String, ApprovedSecret>,
     requested_secrets: &BTreeMap<String, SecretUseOptions>,
     invocation: SecretUseInvocation,
 ) -> io::Result<SecretUseOutput> {
@@ -501,12 +389,9 @@ fn secret_use_output_from_secrets(
             requested_secrets.keys().collect::<Vec<_>>()
         )));
     }
-    for (name, secret) in secrets {
-        let options = requested_secrets
-            .get(&name)
-            .expect("the received secret set was checked");
-        match secret.contents {
-            SecretContentsMessage::Environment { variables } => {
+    for ((name, secret), options) in secrets.into_iter().zip(requested_secrets.values()) {
+        match secret {
+            ApprovedSecret::Environment { variables } => {
                 let environment_options = &options.environment;
                 validate_returned_variables(&name, &variables, environment_options)?;
                 for (source_name, variable) in variables {
@@ -529,7 +414,7 @@ fn secret_use_output_from_secrets(
                     environment.insert(final_name, variable.value);
                 }
             }
-            SecretContentsMessage::Ssh { public_key } => {
+            ApprovedSecret::Ssh { public_key } => {
                 if !options.environment.is_empty() {
                     return Err(io::Error::other(format!(
                         "approved SSH secret {name:?} has environment-variable options"
@@ -559,31 +444,25 @@ fn secret_use_output_from_secrets(
 
 fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::Result<()> {
     if secrets.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(invalid_input(
             "an invocation must request at least one secret",
         ));
     }
     let mut has_stdin = false;
     for (secret, options) in secrets {
         if secret.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a requested secret has an empty name",
-            ));
+            return Err(invalid_input("a requested secret has an empty name"));
         }
         let options = &options.environment;
         if options.only.as_ref().is_some_and(BTreeSet::is_empty) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("secret {secret:?} has an empty only set"),
-            ));
+            return Err(invalid_input(format!(
+                "secret {secret:?} has an empty only set"
+            )));
         }
         if options.only.is_some() && !options.omit.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("secret {secret:?} uses both only and omit"),
-            ));
+            return Err(invalid_input(format!(
+                "secret {secret:?} uses both only and omit"
+            )));
         }
         for name in options
             .only
@@ -599,37 +478,27 @@ fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::
         if let Some(only) = &options.only {
             for source in options.rename.keys().chain(options.stdin.iter()) {
                 if !only.contains(source) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "environment variable {source:?} is configured for secret {secret:?} but isn't selected by only"
-                        ),
-                    ));
+                    return Err(invalid_input(format!(
+                        "environment variable {source:?} is configured for secret {secret:?} but isn't selected by only"
+                    )));
                 }
             }
         }
         for source in options.rename.keys().chain(options.stdin.iter()) {
             if options.omit.contains(source) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "environment variable {source:?} is both used and omitted for secret {secret:?}"
-                    ),
-                ));
+                return Err(invalid_input(format!(
+                    "environment variable {source:?} is both used and omitted for secret {secret:?}"
+                )));
             }
         }
         if let Some(source) = &options.stdin {
             if options.rename.contains_key(source) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "environment variable {source:?} is both renamed and sent to standard input for secret {secret:?}"
-                    ),
-                ));
+                return Err(invalid_input(format!(
+                    "environment variable {source:?} is both renamed and sent to standard input for secret {secret:?}"
+                )));
             }
             if has_stdin {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(invalid_input(
                     "an invocation can send only one environment variable to standard input",
                 ));
             }
@@ -639,12 +508,15 @@ fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::
     Ok(())
 }
 
+fn invalid_input(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
 fn validate_environment_name(name: &str) -> io::Result<()> {
     if name.is_empty() || name.contains('=') || name.contains('\0') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid environment variable name {name:?}"),
-        ));
+        return Err(invalid_input(format!(
+            "invalid environment variable name {name:?}"
+        )));
     }
     Ok(())
 }
@@ -680,26 +552,6 @@ fn validate_returned_variables(
         }
     }
     Ok(())
-}
-
-impl From<websocket::Error> for RequestError {
-    fn from(error: websocket::Error) -> Self {
-        match error {
-            websocket::Error::RetriesExhausted { failures, .. } => {
-                Self::RelayUnavailable { failures }
-            }
-            websocket::Error::Unauthenticated { code, message } => {
-                Self::Unauthenticated { code, message }
-            }
-            websocket::Error::RelayRejected { code, message } if code == "CLIENT_INACTIVE" => {
-                Self::ClientInactive { message }
-            }
-            websocket::Error::ClientInactive { reason, .. } => {
-                Self::ClientInactive { message: reason }
-            }
-            error => Self::other(error),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -796,7 +648,23 @@ impl From<StreamKind> for StreamKindMessage {
 
 #[derive(Deserialize)]
 struct ApprovedInvocation {
-    secrets: Option<BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>>,
+    secrets: Option<BTreeMap<String, ApprovedSecret>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApprovedSecret {
+    Environment {
+        variables: BTreeMap<String, EnvironmentVariableMessage>,
+    },
+    Ssh {
+        public_key: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct EnvironmentVariableMessage {
+    value: String,
 }
 
 #[cfg(test)]
@@ -1077,33 +945,25 @@ mod tests {
         );
     }
 
-    fn environment_secret<const N: usize>(
-        variables: [(&str, &str); N],
-    ) -> SecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
-        SecretMessage {
-            description: None,
-            contents: SecretContentsMessage::Environment {
-                variables: variables
-                    .into_iter()
-                    .map(|(name, value)| {
-                        (
-                            name.into(),
-                            EnvironmentVariableMessage {
-                                value: value.into(),
-                            },
-                        )
-                    })
-                    .collect(),
-            },
+    fn environment_secret<const N: usize>(variables: [(&str, &str); N]) -> ApprovedSecret {
+        ApprovedSecret::Environment {
+            variables: variables
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name.into(),
+                        EnvironmentVariableMessage {
+                            value: value.into(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
-    fn ssh_secret(public_key: &str) -> SecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
-        SecretMessage {
-            description: None,
-            contents: SecretContentsMessage::Ssh {
-                public_key: public_key.into(),
-            },
+    fn ssh_secret(public_key: &str) -> ApprovedSecret {
+        ApprovedSecret::Ssh {
+            public_key: public_key.into(),
         }
     }
 

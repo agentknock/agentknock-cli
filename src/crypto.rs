@@ -80,9 +80,7 @@ impl Session {
             KdfSizedBytes::default().len(),
         )?;
         let ciphertext = BASE64_STANDARD.decode(response.ciphertext)?;
-        let mut salt = Vec::with_capacity(self.encapped_key.len() + public_nonce.len());
-        salt.extend_from_slice(&self.encapped_key);
-        salt.extend_from_slice(&public_nonce);
+        let salt = [self.encapped_key.as_slice(), &public_nonce].concat();
 
         let mut exported_secret = KdfSizedBytes::default();
         self.sender_context
@@ -169,16 +167,13 @@ pub(crate) fn seal_pairing(
         &response.device_random,
         KdfSizedBytes::default().len(),
     )?;
-    let mut sas_info = Vec::with_capacity(
-        SAS_DERIVATION_INFO.len()
-            + device_id_bytes.len()
-            + client_id_bytes.len()
-            + response.device_key.len(),
-    );
-    sas_info.extend_from_slice(SAS_DERIVATION_INFO);
-    sas_info.extend_from_slice(&device_id_bytes);
-    sas_info.extend_from_slice(&client_id_bytes);
-    sas_info.extend_from_slice(&response.device_key);
+    let sas_info = [
+        SAS_DERIVATION_INFO,
+        &device_id_bytes,
+        &client_id_bytes,
+        &response.device_key,
+    ]
+    .concat();
     let hkdf = Hkdf::<Sha256>::new(Some(&response.device_random), client_secret);
     let mut sas = [0; 8];
     hkdf.expand(&sas_info, &mut sas)?;

@@ -6,8 +6,8 @@ use ulid::Ulid;
 use crate::{
     Client, DenialReason, RequestError, RequestProgress,
     config::{clear_rotation_key, read_pairing_from},
-    crypto::{self, Session},
-    protocol::{self, Response},
+    crypto::Session,
+    protocol::{self, AbortReason, Outcome, Response, seal_aborted},
     websocket::{self, RelayExchange},
 };
 
@@ -26,11 +26,9 @@ impl Client {
         self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
-        let plaintext = self.encode(payload).map_err(RequestError::other)?;
-        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
-        let request = session
-            .seal_request(&plaintext)
-            .map_err(RequestError::other)?;
+        let plaintext = self.encode(payload)?;
+        let mut session = Session::new(&pairing, &request_id)?;
+        let request = session.seal_request(&plaintext)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
         progress(RequestProgress::WaitingForDelivery);
@@ -73,12 +71,12 @@ impl Client {
         progress(RequestProgress::Completing);
         let response = session
             .open_response(response)
-            .map_err(RequestError::other)
+            .map_err(RequestError::from)
             .and_then(|plaintext| {
                 if let Some(rotation_key) = pairing.rotation_key() {
                     clear_rotation_key(&pairing_path, rotation_key)?;
                 }
-                protocol::decode_response::<Decision<R>>(&plaintext).map_err(RequestError::other)
+                protocol::decode_response::<Decision<R>>(&plaintext)
             });
         let result = match response {
             Ok(Response::Error(error)) => {
@@ -87,10 +85,7 @@ impl Client {
                 {
                     let _ = relay.complete_briefly(&completion).await;
                 }
-                return Err(RequestError::DeviceRejected {
-                    code: error.code,
-                    message: error.message,
-                });
+                return Err(error.into());
             }
             Ok(Response::Message(Decision::Approved { data })) => {
                 validate(data).map_err(RequestError::from)
@@ -114,10 +109,8 @@ impl Client {
                 message: error.to_string(),
             },
         };
-        let plaintext = self.encode(&outcome).map_err(RequestError::other)?;
-        let completion = session
-            .seal_completion(&plaintext)
-            .map_err(RequestError::other)?;
+        let plaintext = self.encode(&outcome)?;
+        let completion = session.seal_completion(&plaintext)?;
         tokio::select! {
             biased;
             _ = cancellation.as_mut() => {
@@ -143,16 +136,6 @@ fn abort_reason(error: &websocket::Error) -> AbortReason {
     }
 }
 
-fn seal_aborted(
-    client: &Client,
-    session: &mut Session,
-    reason: AbortReason,
-    message: String,
-) -> Option<crypto::Completion> {
-    let plaintext = client.encode(&Outcome::Aborted { reason, message }).ok()?;
-    session.seal_completion(&plaintext).ok()
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
 enum Decision<T> {
@@ -170,30 +153,6 @@ enum Decision<T> {
         #[serde(rename = "message")]
         _message: String,
     },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
-enum Outcome {
-    Approved,
-    Denied {
-        reason: DenialReason,
-        message: String,
-    },
-    Aborted {
-        reason: AbortReason,
-        message: String,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum AbortReason {
-    Cancelled,
-    TimedOut,
-    InvalidResponse,
-    ClientError,
-    Other,
 }
 
 #[cfg(test)]
@@ -242,29 +201,6 @@ mod tests {
                     ..
                 }
             ));
-        }
-    }
-
-    #[test]
-    fn completion_contains_only_the_outcome() {
-        for (outcome, expected) in [
-            (Outcome::Approved, json!({"result": "APPROVED"})),
-            (
-                Outcome::Denied {
-                    reason: DenialReason::PolicyDenied,
-                    message: "Not permitted.".into(),
-                },
-                json!({"result": "DENIED", "reason": "POLICY_DENIED", "message": "Not permitted."}),
-            ),
-            (
-                Outcome::Aborted {
-                    reason: AbortReason::InvalidResponse,
-                    message: "Invalid response.".into(),
-                },
-                json!({"result": "ABORTED", "reason": "INVALID_RESPONSE", "message": "Invalid response."}),
-            ),
-        ] {
-            assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
         }
     }
 }
