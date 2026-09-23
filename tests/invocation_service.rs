@@ -20,8 +20,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use support::{
-    ChildGuard, TestHome, accept, encrypt_response, isolated_command, open_completion,
-    open_request, receive_json, run, send_json, wait_for_path, websocket_server,
+    ChildGuard, TestHome, accept, isolated_command, open_completion, receive_json, receive_request,
+    run, send_json, wait_for_path, websocket_server,
 };
 
 #[cfg(target_os = "linux")]
@@ -848,25 +848,20 @@ async fn check_failed_signature(
     let private_key = home.device_private_key.clone();
     let (url, server) = websocket_server(move |listener| async move {
         let (_, mut socket) = accept(&listener).await;
-        let request = receive_json(&mut socket).await;
-        let (mut context, key, plaintext) = open_request(&private_key, request["request_id"].as_str().unwrap(), &request["payload"]);
+        let (mut request, plaintext) = receive_request(&mut socket, &private_key).await;
         assert_eq!(plaintext["method"], kind.method());
-        let mut response = encrypt_response(&context, &key, &response);
-        if corrupt { response["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into(); }
-        send_json(&mut socket, json!({
-            "type": "message", "client_id": request["client_id"], "request_id": request["request_id"],
-            "kind": "response", "payload": response,
-        })).await;
+        let mut response = request.response(&response);
+        if corrupt {
+            response["payload"]["ciphertext"] = BASE64_STANDARD.encode([0; 32]).into();
+        }
+        send_json(&mut socket, response).await;
         assert_eq!(receive_json(&mut socket).await["kind"], "response");
-        let completion = receive_json(&mut socket).await;
-        assert_eq!(completion["kind"], "completion");
-        let completion = open_completion(&mut context, &completion["payload"]);
+        let completion = request.receive_completion(&mut socket).await;
         assert_eq!(completion["result"], result);
         assert_eq!(completion["reason"], reason);
-        send_json(&mut socket, json!({
-            "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "completion",
-        })).await;
-    }).await;
+        send_json(&mut socket, request.ack("completion")).await;
+    })
+    .await;
     let (mut service, directory) = signature_service(&home, &url, std::process::id());
     assert!(!request_signature(&directory, kind));
     server.await.unwrap();
@@ -913,27 +908,23 @@ async fn owner_exit_allows_abort_completion_and_retry() {
         let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
         let (url, server) = websocket_server(move |listener| async move {
             let (_, mut socket) = accept(&listener).await;
-            let request = receive_json(&mut socket).await;
-            let (mut context, _, plaintext) = open_request(&private_key, request["request_id"].as_str().unwrap(), &request["payload"]);
+            let (mut request, plaintext) = receive_request(&mut socket, &private_key).await;
             assert_eq!(plaintext["method"], kind.method());
             ready_tx.send(()).unwrap();
             exited_rx.await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            send_json(&mut socket, json!({
-                "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "request",
-            })).await;
+            send_json(&mut socket, request.ack("request")).await;
             let completion = receive_json(&mut socket).await;
-            let plaintext = open_completion(&mut context, &completion["payload"]);
+            let plaintext = open_completion(&mut request.context, &completion["payload"]);
             assert_eq!(plaintext["result"], "ABORTED");
             assert_eq!(plaintext["reason"], "CANCELLED");
             drop(socket); // Force a retry before the completion is acknowledged.
             let (_, mut socket) = accept(&listener).await;
             assert_eq!(receive_json(&mut socket).await["type"], "resume");
             assert_eq!(receive_json(&mut socket).await, completion);
-            send_json(&mut socket, json!({
-                "type": "ack", "client_id": request["client_id"], "request_id": request["request_id"], "kind": "completion",
-            })).await;
-        }).await;
+            send_json(&mut socket, request.ack("completion")).await;
+        })
+        .await;
         let mut owner = ChildGuard(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "signing_owner_probe", "--nocapture"])
