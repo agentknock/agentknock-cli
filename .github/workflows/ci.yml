@@ -94,8 +94,9 @@ jobs:
       - name: Check minimum Rust version on macOS
         if: runner.os == 'macOS'
         run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          cargo +1.89.0 check --locked --all-targets --all-features
+          rust_version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$rust_version" --profile minimal
+          cargo "+$rust_version" check --locked --all-targets --all-features
 
   msrv:
     name: Check (Rust 1.89)
@@ -107,12 +108,18 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        run: rustup toolchain install 1.89.0 --profile minimal
+        id: rust
+        run: |
+          rust_version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$rust_version" --profile minimal
+          printf 'version=%s\n' "$rust_version" >> "$GITHUB_OUTPUT"
 
       - *cargo-cache
 
       - name: Check all targets
-        run: cargo +1.89.0 check --locked --all-targets --all-features
+        env:
+          RUST_VERSION: ${{ steps.rust.outputs.version }}
+        run: cargo "+$RUST_VERSION" check --locked --all-targets --all-features
 
   musl:
     name: Distribution (${{ matrix.architecture }} Linux)
