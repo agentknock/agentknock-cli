@@ -224,7 +224,8 @@ fn exposes_the_selected_key_through_ssh_auth_sock() {
                 "secret": "test-ssh",
                 "public_key": PUBLIC_KEY,
             },
-            "upstream_agent_socket": BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
+            "upstream_agent_socket":
+                BASE64_STANDARD.encode(unavailable_agent.as_os_str().as_bytes()),
             "ssh_agent": true,
             "git_signing": true,
             "ssh_passthrough": true,
@@ -311,7 +312,9 @@ fn does_not_create_git_signing_endpoints_when_disabled() {
 fn git_signing_context_uses_path_and_is_optional() {
     // The helper's parent is this test process, not Git. Only the Git in the
     // supplied PATH can provide the fixture's repository context.
-    let git_script = "#!/bin/sh\n[ \"$*\" = 'rev-parse --path-format=absolute --show-toplevel' ] || exit 1\nprintf '%s\\n' \"$PWD\"\n";
+    let git_script = "#!/bin/sh\n\
+        [ \"$*\" = 'rev-parse --path-format=absolute --show-toplevel' ] || exit 1\n\
+        printf '%s\\n' \"$PWD\"\n";
     for script in [Some(git_script), Some("#!/bin/sh\nexit 1\n"), None] {
         let directory = tempfile::tempdir().unwrap();
         let git_path = directory.path().join("git");
