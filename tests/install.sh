@@ -89,7 +89,7 @@ case "$url" in
 		;;
 	*/agentknock-*.tar.gz.sha256)
 		archive_name=agentknock-$TEST_TARGET.tar.gz
-		printf '%s  %s\n' "$TEST_HASH" "$archive_name" > "$output"
+		printf '%s  %s\n' "$TEST_HASH" "${TEST_CHECKSUM_NAME:-$archive_name}" > "$output"
 		;;
 	*)
 		exit 1
@@ -102,13 +102,21 @@ chmod 0755 "$fake_bin/uname" "$fake_bin/curl"
 run_installer() {
 	home=$1
 	output=$2
-	HOME=$home PATH=$fake_bin:$PATH sh "$repository_root/install.sh" > "$output" 2>&1
+	shift 2
+	HOME=$home PATH=$fake_bin:$PATH sh "$repository_root/install.sh" "$@" > "$output" 2>&1
 }
 
-run_installer_from_stdin() {
-	home=$1
-	output=$2
-	HOME=$home PATH=$fake_bin:$PATH sh < "$repository_root/install.sh" > "$output" 2>&1
+# Runs the installer with the given arguments and expects it to fail with message.
+expect_failure() {
+	message=$1
+	shift
+	home=$test_dir/failure-home
+	rm -rf "$home"
+	if run_installer "$home" "$test_dir/failure-output" "$@"; then
+		fail "the installer succeeded instead of failing with: $message"
+	fi
+	assert_contains "$test_dir/failure-output" "$message"
+	[ ! -e "$home/.local/bin/agentknock" ] || fail "a failed installation installed a binary"
 }
 
 export TEST_ARCHIVE="$test_dir/release.tar.gz"
@@ -123,7 +131,7 @@ HOME=$home PATH=$fake_bin:$PATH sh "$test_dir/truncated-install.sh"
 home=$test_dir/x86-home
 export TEST_ARCHITECTURE=x86_64
 export TEST_TARGET=x86_64-unknown-linux-musl
-run_installer_from_stdin "$home" "$test_dir/x86-output"
+HOME=$home PATH=$fake_bin:$PATH sh < "$repository_root/install.sh" > "$test_dir/x86-output" 2>&1
 cmp "$fixture_dir/agentknock" "$home/.local/bin/agentknock" || \
 	fail 'the x86-64 binary was not installed intact'
 case "$host_os" in
@@ -162,5 +170,29 @@ fi
 [ "$(cat "$home/.local/bin/agentknock")" = 'existing binary' ] || \
 	fail 'a checksum failure changed the existing installation'
 assert_contains "$test_dir/checksum-output" 'does not match'
+
+export TEST_HASH="$fixture_hash"
+
+expect_failure 'this installer does not accept arguments' unexpected-argument
+
+export TEST_OS=FreeBSD
+expect_failure 'unsupported operating system: FreeBSD'
+export TEST_OS=Linux TEST_ARCHITECTURE=riscv64
+expect_failure 'unsupported Linux architecture: riscv64'
+unset TEST_OS
+export TEST_ARCHITECTURE=x86_64
+
+release_prefix=https://github.com/agentknock/agentknock-cli/releases/tag
+export TEST_RELEASE_URL=https://example.com/agentknock/agentknock-cli/releases/tag/v1.2.3
+expect_failure 'GitHub returned an unexpected release URL'
+export TEST_RELEASE_URL=$release_prefix/v1.2
+expect_failure 'GitHub returned an invalid release tag: v1.2'
+export TEST_RELEASE_URL="$release_prefix/v1.2.3;true"
+expect_failure 'GitHub returned an invalid release tag: v1.2.3;true'
+unset TEST_RELEASE_URL
+
+export TEST_CHECKSUM_NAME=agentknock-aarch64-unknown-linux-musl.tar.gz
+expect_failure 'the release checksum names an unexpected file'
+unset TEST_CHECKSUM_NAME
 
 printf 'install.sh tests passed\n'
