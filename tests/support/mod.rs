@@ -307,34 +307,6 @@ pub fn assert_authenticated_request(request: &http::Request<()>) {
     );
 }
 
-pub fn open_request(
-    device_private_key: &<Kem as KemTrait>::PrivateKey,
-    request_id: &str,
-    request: &Value,
-) -> (ReceiverContext, Vec<u8>, Value) {
-    let key = BASE64_STANDARD
-        .decode(request["key"].as_str().unwrap())
-        .unwrap();
-    let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&key).unwrap();
-    let request_id = request_id.parse::<Ulid>().unwrap();
-    let device_id = DEVICE_ID.parse::<Ulid>().unwrap().to_bytes();
-    let client_id = CLIENT_ID.parse::<Ulid>().unwrap().to_bytes();
-    let info = [PROTOCOL_VERSION_INFO, device_id, request_id.to_bytes()].concat();
-    let psk = PskBundle::new(&CLIENT_PSK, &client_id).unwrap();
-    let mut context = setup_receiver::<Aead, Kdf, Kem>(
-        &OpModeR::Psk(psk),
-        device_private_key,
-        &encapped_key,
-        &info,
-    )
-    .unwrap();
-    let ciphertext = BASE64_STANDARD
-        .decode(request["ciphertext"].as_str().unwrap())
-        .unwrap();
-    let plaintext = context.open(&ciphertext, b"").unwrap();
-    (context, key, serde_json::from_slice(&plaintext).unwrap())
-}
-
 pub fn encrypt_response(context: &ReceiverContext, encapped_key: &[u8], response: &Value) -> Value {
     let public_nonce = [0x77; 32];
     let mut salt = Vec::with_capacity(encapped_key.len() + public_nonce.len());
@@ -380,17 +352,49 @@ impl ReceivedRequest {
         device_private_key: &<Kem as KemTrait>::PrivateKey,
         frame: &Value,
     ) -> (Self, Value) {
-        let client_id = frame["client_id"].as_str().unwrap().to_owned();
+        Self::open_as(device_private_key, CLIENT_ID, &CLIENT_PSK, frame)
+    }
+
+    /// Opens a request frame from the given client and returns its plaintext.
+    pub fn open_as(
+        device_private_key: &<Kem as KemTrait>::PrivateKey,
+        client_id: &str,
+        client_psk: &[u8],
+        frame: &Value,
+    ) -> (Self, Value) {
+        assert_eq!(frame["client_id"], client_id);
         let request_id = frame["request_id"].as_str().unwrap().to_owned();
-        let (context, key, plaintext) =
-            open_request(device_private_key, &request_id, &frame["payload"]);
+        let payload = &frame["payload"];
+        let key = BASE64_STANDARD
+            .decode(payload["key"].as_str().unwrap())
+            .unwrap();
+        let encapped_key = <Kem as KemTrait>::EncappedKey::from_bytes(&key).unwrap();
+        let info = [
+            PROTOCOL_VERSION_INFO,
+            DEVICE_ID.parse::<Ulid>().unwrap().to_bytes(),
+            request_id.parse::<Ulid>().unwrap().to_bytes(),
+        ]
+        .concat();
+        let psk_id = client_id.parse::<Ulid>().unwrap().to_bytes();
+        let psk = PskBundle::new(client_psk, &psk_id).unwrap();
+        let mut context = setup_receiver::<Aead, Kdf, Kem>(
+            &OpModeR::Psk(psk),
+            device_private_key,
+            &encapped_key,
+            &info,
+        )
+        .unwrap();
+        let ciphertext = BASE64_STANDARD
+            .decode(payload["ciphertext"].as_str().unwrap())
+            .unwrap();
+        let plaintext = context.open(&ciphertext, b"").unwrap();
         let request = Self {
-            client_id,
+            client_id: client_id.to_owned(),
             request_id,
             context,
             key,
         };
-        (request, plaintext)
+        (request, serde_json::from_slice(&plaintext).unwrap())
     }
 
     pub fn ack(&self, kind: &str) -> Value {
