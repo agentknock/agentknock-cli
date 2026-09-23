@@ -3,14 +3,13 @@ use std::{collections::BTreeMap, future::Future, io};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroize as _;
 
 use crate::{
     Client, RequestError, RequestProgress,
     config::{ConfigurationError, clear_rotation_key, read_pairing_from},
-    crypto::Session,
+    exchange::{reject_device_error, seal_request},
     protocol::{self, EmptyMessage, Method, MethodRequest, Response},
-    websocket::RelayExchange,
 };
 
 /// Metadata for a secret available from the paired device.
@@ -176,12 +175,10 @@ impl Client {
         let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
-        let plaintext = self.encode(&MethodRequest {
+        let payload = MethodRequest {
             method: Method::SecretList,
-        })?;
-        let mut session = Session::new(&pairing, &request_id)?;
-        let request = session.seal_request(&plaintext)?;
-        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
+        };
+        let (mut session, request, mut relay) = seal_request(self, &pairing, request_id, &payload)?;
 
         progress(RequestProgress::WaitingForDelivery);
         let response = tokio::select! {
@@ -199,27 +196,14 @@ impl Client {
         let response: ListResponse = match protocol::decode_response(&plaintext)? {
             Response::Message(response) => response,
             Response::Error(error) => {
-                if let Some(completion) =
-                    protocol::seal_error_completion(self, &mut session, &error)
-                {
-                    let _ = relay.complete_briefly(&completion).await;
-                }
-                return Err(error.into());
+                return Err(reject_device_error(self, &mut session, &mut relay, error).await);
             }
         };
         let plaintext = self.encode(&EmptyMessage {})?;
         let completion = session.seal_completion(&plaintext)?;
-        let interrupted = tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => true,
-            result = relay.complete(&completion) => {
-                result?;
-                false
-            }
-        };
-        if interrupted {
-            let _ = relay.complete_briefly(&completion).await;
-        }
+        relay
+            .complete_or_cancel(&completion, cancellation.as_mut())
+            .await?;
         progress(RequestProgress::Completed);
 
         response
@@ -272,12 +256,8 @@ impl Client {
             mode: mode.into(),
             secret: UploadSecretMessage::from(secret),
         };
-        let plaintext = Zeroizing::new(self.encode(&request_payload)?);
-        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::from)?;
-        let request = session
-            .seal_request(&plaintext)
-            .map_err(RequestError::from)?;
-        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
+        let (mut session, request, mut relay) =
+            seal_request(self, &pairing, request_id, &request_payload)?;
 
         progress(RequestProgress::WaitingForDelivery);
         let response = tokio::select! {
@@ -299,12 +279,9 @@ impl Client {
         let response: UploadResult = match protocol::decode_response(&plaintext)? {
             Response::Message(response) => response,
             Response::Error(error) => {
-                if let Some(completion) =
-                    protocol::seal_error_completion(self, &mut session, &error)
-                {
-                    let _ = relay.complete_briefly(&completion).await;
-                }
-                return Err(RequestError::from(error).into());
+                return Err(reject_device_error(self, &mut session, &mut relay, error)
+                    .await
+                    .into());
             }
         };
         let completion = self.encode(&response)?;

@@ -2,14 +2,44 @@ use std::{future::Future, io};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ulid::Ulid;
+use zeroize::Zeroizing;
 
 use crate::{
     Client, DenialReason, RequestError, RequestProgress,
-    config::{clear_rotation_key, read_pairing_from},
-    crypto::Session,
-    protocol::{self, AbortReason, Outcome, Response, seal_aborted},
+    config::{Pairing, clear_rotation_key, read_pairing_from},
+    crypto::{self, Session},
+    protocol::{self, AbortReason, DeviceError, Outcome, Response, seal_aborted},
     websocket::{self, RelayExchange},
 };
+
+/// Seals an authenticated request and prepares the relay exchange that carries it.
+pub(crate) fn seal_request(
+    client: &Client,
+    pairing: &Pairing,
+    request_id: Ulid,
+    payload: &impl Serialize,
+) -> Result<(Session, crypto::Request, RelayExchange), RequestError> {
+    let plaintext = Zeroizing::new(client.encode(payload)?);
+    let mut session = Session::new(pairing, &request_id)?;
+    let request = session.seal_request(&plaintext)?;
+    let relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
+    Ok((session, request, relay))
+}
+
+/// Ends the exchange after an authenticated device error.
+pub(crate) async fn reject_device_error(
+    client: &Client,
+    session: &mut Session,
+    relay: &mut RelayExchange,
+    error: DeviceError,
+) -> RequestError {
+    if let Some(completion) =
+        seal_aborted(client, session, AbortReason::ClientError, error.to_string())
+    {
+        let _ = relay.complete_briefly(&completion).await;
+    }
+    error.into()
+}
 
 impl Client {
     // Invocation and signing requests share approval and cancellation semantics.
@@ -26,10 +56,7 @@ impl Client {
         self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
-        let plaintext = self.encode(payload)?;
-        let mut session = Session::new(&pairing, &request_id)?;
-        let request = session.seal_request(&plaintext)?;
-        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
+        let (mut session, request, mut relay) = seal_request(self, &pairing, request_id, payload)?;
 
         progress(RequestProgress::WaitingForDelivery);
         let response = match tokio::select! {
@@ -80,12 +107,7 @@ impl Client {
             });
         let result = match response {
             Ok(Response::Error(error)) => {
-                if let Some(completion) =
-                    protocol::seal_error_completion(self, &mut session, &error)
-                {
-                    let _ = relay.complete_briefly(&completion).await;
-                }
-                return Err(error.into());
+                return Err(reject_device_error(self, &mut session, &mut relay, error).await);
             }
             Ok(Response::Message(Decision::Approved { data })) => {
                 validate(data).map_err(RequestError::from)
@@ -111,18 +133,14 @@ impl Client {
         };
         let plaintext = self.encode(&outcome)?;
         let completion = session.seal_completion(&plaintext)?;
-        tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => {
-                let _ = relay.complete_briefly(&completion).await;
-                Err(RequestError::Interrupted)
-            }
-            handoff = relay.complete(&completion) => {
-                handoff?;
-                progress(RequestProgress::Completed);
-                result
-            }
+        if relay
+            .complete_or_cancel(&completion, cancellation.as_mut())
+            .await?
+        {
+            return Err(RequestError::Interrupted);
         }
+        progress(RequestProgress::Completed);
+        result
     }
 }
 

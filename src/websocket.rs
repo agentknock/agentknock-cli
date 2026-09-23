@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
 
 #[cfg(all(feature = "integration-tests", debug_assertions))]
 use std::{
@@ -290,6 +290,25 @@ impl RelayExchange {
         )
         .await
         .map_err(|_| Error::CompletionTimedOut)?
+    }
+
+    /// Hands off a completion unless `cancellation` resolves first, in which
+    /// case only a brief handoff follows. Returns whether it was canceled.
+    pub(crate) async fn complete_or_cancel<C>(
+        &mut self,
+        completion: &C,
+        cancellation: Pin<&mut impl Future<Output = ()>>,
+    ) -> Result<bool, Error>
+    where
+        C: Serialize + ?Sized,
+    {
+        tokio::select! {
+            biased;
+            () = cancellation => {}
+            result = self.complete(completion) => return result.map(|()| false),
+        }
+        let _ = self.complete_briefly(completion).await;
+        Ok(true)
     }
 
     async fn complete_with_policy<C>(

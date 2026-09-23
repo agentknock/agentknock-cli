@@ -20,9 +20,10 @@ use crate::{
         remove_pairing as remove_pairing_file, write_pending_pairing,
     },
     crypto::{
-        self, PROTOCOL_VERSION, PairingResponse, Session, derive_address_id,
-        derive_pairing_commitment, derive_psk_rotation, generate_client_secret, seal_pairing,
+        self, PROTOCOL_VERSION, PairingResponse, derive_address_id, derive_pairing_commitment,
+        derive_psk_rotation, generate_client_secret, seal_pairing,
     },
+    exchange::{reject_device_error, seal_request},
     protocol::{self, EmptyMessage, Method, MethodRequest, Response},
     websocket::RelayExchange,
 };
@@ -184,12 +185,10 @@ impl Client {
         let pairing_path = self.pairing_path();
         let pairing = read_pending_pairing(&pairing_path)?;
         let request_id = Ulid::generate();
-        let plaintext = self.encode(&MethodRequest {
+        let payload = MethodRequest {
             method: Method::PairingFinish,
-        })?;
-        let mut session = Session::new(&pairing, &request_id)?;
-        let request = session.seal_request(&plaintext)?;
-        let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
+        };
+        let (mut session, request, mut relay) = seal_request(self, &pairing, request_id, &payload)?;
         progress(RequestProgress::WaitingForDelivery);
         let response = tokio::select! {
             biased;
@@ -203,12 +202,7 @@ impl Client {
         let result: FinishPairingResult = match protocol::decode_response(&plaintext)? {
             Response::Message(result) => result,
             Response::Error(error) => {
-                if let Some(completion) =
-                    protocol::seal_error_completion(self, &mut session, &error)
-                {
-                    let _ = relay.complete_briefly(&completion).await;
-                }
-                return Err(error.into());
+                return Err(reject_device_error(self, &mut session, &mut relay, error).await);
             }
         };
         if result == FinishPairingResult::Rejected {
@@ -218,17 +212,9 @@ impl Client {
         let plaintext = self.encode(&FinishPairingResult::Accepted)?;
         let completion = session.seal_completion(&plaintext)?;
         finish_pending_pairing(&pairing_path, &pairing.client_id())?;
-        let interrupted = tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => true,
-            result = relay.complete(&completion) => {
-                result?;
-                false
-            }
-        };
-        if interrupted {
-            let _ = relay.complete_briefly(&completion).await;
-        }
+        relay
+            .complete_or_cancel(&completion, cancellation.as_mut())
+            .await?;
         progress(RequestProgress::Completed);
 
         Ok(())
@@ -319,12 +305,10 @@ where
     P: FnMut(RequestProgress),
 {
     let request_id = Ulid::generate();
-    let plaintext = client.encode(&MethodRequest {
+    let payload = MethodRequest {
         method: Method::PairingRemove,
-    })?;
-    let mut session = Session::new(pairing, &request_id)?;
-    let request = session.seal_request(&plaintext)?;
-    let mut relay = RelayExchange::authenticated(client, pairing, &request_id.to_string())?;
+    };
+    let (mut session, request, mut relay) = seal_request(client, pairing, request_id, &payload)?;
     progress(RequestProgress::WaitingForDelivery);
     let response = tokio::select! {
         biased;
@@ -338,11 +322,7 @@ where
     match protocol::decode_response::<EmptyMessage>(&plaintext)? {
         Response::Message(_) => {}
         Response::Error(error) => {
-            if let Some(completion) = protocol::seal_error_completion(client, &mut session, &error)
-            {
-                let _ = relay.complete_briefly(&completion).await;
-            }
-            return Err(error.into());
+            return Err(reject_device_error(client, &mut session, &mut relay, error).await);
         }
     }
     let plaintext = client.encode(&EmptyMessage {})?;

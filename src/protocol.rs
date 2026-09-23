@@ -70,14 +70,6 @@ where
         .map_err(RequestError::other)
 }
 
-pub(crate) fn seal_error_completion(
-    client: &Client,
-    session: &mut Session,
-    error: &DeviceError,
-) -> Option<crypto::Completion> {
-    seal_aborted(client, session, AbortReason::ClientError, error.to_string())
-}
-
 pub(crate) fn seal_aborted(
     client: &Client,
     session: &mut Session,
