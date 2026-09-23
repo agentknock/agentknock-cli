@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 
 use std::{
+    ffi::OsStr,
     fs,
     fs::OpenOptions,
     future::Future,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -50,6 +52,17 @@ pub const CLIENT_PSK: [u8; 32] = [0x42; 32];
 pub const CLIENT_TOKEN: [u8; 32] = [0x24; 32];
 pub const PROTOCOL_VERSION_INFO: [u8; 16] = *b"agentknock-v1\0\0\0";
 const RESPONSE_EXPORT_CONTEXT: &[u8] = b"agentknock-v1 response";
+// Agentknock honors these even for the loopback test relay.
+const PROXY_VARIABLES: [&str; 8] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
 
 pub struct TestHome {
     directory: tempfile::TempDir,
@@ -117,6 +130,28 @@ impl TestHome {
     pub fn pairing_path(&self) -> PathBuf {
         self.directory.path().join(".agentknock/pairing.json")
     }
+
+    pub fn command(&self) -> Command {
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_agentknock"));
+        command.env("HOME", self.path());
+        command
+    }
+
+    pub fn relay_command(&self, relay_url: impl AsRef<OsStr>) -> Command {
+        let mut command = self.command();
+        command.env("AGENTKNOCK_TEST_RELAY_URL", relay_url);
+        command
+    }
+}
+
+/// Builds a command that ignores the developer's Agentknock home and proxies.
+pub fn isolated_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env_remove("AGENTKNOCK_HOME");
+    for variable in PROXY_VARIABLES {
+        command.env_remove(variable);
+    }
+    command
 }
 
 pub async fn websocket_server<F, Fut, T>(handler: F) -> (String, JoinHandle<T>)

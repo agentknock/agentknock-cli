@@ -115,16 +115,9 @@ async fn lists_secret_metadata_without_secret_values() {
     .await;
     let (proxy_url, proxy) = http_connect_proxy().await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .env("HOME", home.path())
-        .env_remove("AGENTKNOCK_HOME")
-        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+    let output = home
+        .relay_command(relay_url)
         .env("ALL_PROXY", proxy_url)
-        .env_remove("all_proxy")
-        .env_remove("HTTP_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("NO_PROXY")
-        .env_remove("no_proxy")
         .args(["secret", "list"])
         .output()
         .unwrap();
@@ -166,12 +159,7 @@ async fn lists_secret_metadata_without_secret_values() {
 #[test]
 fn reports_when_no_pairing_exists() {
     let home = TestHome::empty();
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .env("HOME", home.path())
-        .env_remove("AGENTKNOCK_HOME")
-        .args(["secret", "list"])
-        .output()
-        .unwrap();
+    let output = home.command().args(["secret", "list"]).output().unwrap();
     assert!(!output.status.success());
     assert!(
         String::from_utf8(output.stderr)
@@ -183,15 +171,9 @@ fn reports_when_no_pairing_exists() {
 #[test]
 fn reports_an_invalid_https_proxy() {
     let home = TestHome::active();
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .env("HOME", home.path())
-        .env_remove("AGENTKNOCK_HOME")
+    let output = home
+        .command()
         .env("HTTPS_PROXY", "not a proxy URL")
-        .env_remove("https_proxy")
-        .env_remove("ALL_PROXY")
-        .env_remove("all_proxy")
-        .env_remove("NO_PROXY")
-        .env_remove("no_proxy")
         .args(["secret", "list"])
         .output()
         .unwrap();
@@ -215,10 +197,8 @@ async fn reports_inactive_client_without_suggesting_recovery() {
     })
     .await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .env("HOME", home.path())
-        .env_remove("AGENTKNOCK_HOME")
-        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+    let output = home
+        .relay_command(relay_url)
         .args(["secret", "list"])
         .output()
         .unwrap();
@@ -254,10 +234,8 @@ async fn signal_cancels_a_waiting_secret_list_request() {
     })
     .await;
 
-    let child = Command::new(env!("CARGO_BIN_EXE_agentknock"))
-        .env("HOME", home.path())
-        .env_remove("AGENTKNOCK_HOME")
-        .env("AGENTKNOCK_TEST_RELAY_URL", relay_url)
+    let child = home
+        .relay_command(relay_url)
         .args(["secret", "list"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
