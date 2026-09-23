@@ -3,7 +3,7 @@ use std::{fmt, io};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{config::ConfigurationError, websocket};
+use crate::{config::ConfigurationError, crypto, protocol::DeviceError, websocket};
 
 /// An error during an operation that communicates with the relay or device.
 #[derive(Debug, Error)]
@@ -125,6 +125,21 @@ impl From<websocket::Error> for RequestError {
                 Self::ClientInactive { message: reason }
             }
             error => Self::other(error),
+        }
+    }
+}
+
+impl From<crypto::Error> for RequestError {
+    fn from(error: crypto::Error) -> Self {
+        Self::other(error)
+    }
+}
+
+impl From<DeviceError> for RequestError {
+    fn from(error: DeviceError) -> Self {
+        Self::DeviceRejected {
+            code: error.code,
+            message: error.message,
         }
     }
 }

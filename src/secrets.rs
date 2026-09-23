@@ -176,15 +176,11 @@ impl Client {
         let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
         let request_id = Ulid::generate();
-        let plaintext = self
-            .encode(&MethodRequest {
-                method: Method::SecretList,
-            })
-            .map_err(RequestError::other)?;
-        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
-        let request = session
-            .seal_request(&plaintext)
-            .map_err(RequestError::other)?;
+        let plaintext = self.encode(&MethodRequest {
+            method: Method::SecretList,
+        })?;
+        let mut session = Session::new(&pairing, &request_id)?;
+        let request = session.seal_request(&plaintext)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
         progress(RequestProgress::WaitingForDelivery);
@@ -196,31 +192,23 @@ impl Client {
             }) => response?,
         };
         progress(RequestProgress::Completing);
-        let plaintext = session
-            .open_response(response)
-            .map_err(RequestError::other)?;
+        let plaintext = session.open_response(response)?;
         if let Some(rotation_key) = pairing.rotation_key() {
             clear_rotation_key(&pairing_path, rotation_key)?;
         }
-        let response: ListResponse =
-            match protocol::decode_response(&plaintext).map_err(RequestError::other)? {
-                Response::Message(response) => response,
-                Response::Error(error) => {
-                    if let Some(completion) =
-                        protocol::seal_error_completion(self, &mut session, &error)
-                    {
-                        let _ = relay.complete_briefly(&completion).await;
-                    }
-                    return Err(RequestError::DeviceRejected {
-                        code: error.code,
-                        message: error.message,
-                    });
+        let response: ListResponse = match protocol::decode_response(&plaintext)? {
+            Response::Message(response) => response,
+            Response::Error(error) => {
+                if let Some(completion) =
+                    protocol::seal_error_completion(self, &mut session, &error)
+                {
+                    let _ = relay.complete_briefly(&completion).await;
                 }
-            };
-        let plaintext = self.encode(&EmptyMessage {}).map_err(RequestError::other)?;
-        let completion = session
-            .seal_completion(&plaintext)
-            .map_err(RequestError::other)?;
+                return Err(error.into());
+            }
+        };
+        let plaintext = self.encode(&EmptyMessage {})?;
+        let completion = session.seal_completion(&plaintext)?;
         let interrupted = tokio::select! {
             biased;
             _ = cancellation.as_mut() => true,
@@ -284,11 +272,11 @@ impl Client {
             mode: mode.into(),
             secret: UploadSecretMessage::from(secret),
         };
-        let plaintext = Zeroizing::new(self.encode(&request_payload).map_err(RequestError::other)?);
-        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
+        let plaintext = Zeroizing::new(self.encode(&request_payload)?);
+        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::from)?;
         let request = session
             .seal_request(&plaintext)
-            .map_err(RequestError::other)?;
+            .map_err(RequestError::from)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
         progress(RequestProgress::WaitingForDelivery);
@@ -304,30 +292,25 @@ impl Client {
         progress(RequestProgress::Completing);
         let plaintext = session
             .open_response(response)
-            .map_err(RequestError::other)?;
+            .map_err(RequestError::from)?;
         if let Some(rotation_key) = pairing.rotation_key() {
             clear_rotation_key(&pairing_path, rotation_key)?;
         }
-        let response: UploadResult =
-            match protocol::decode_response(&plaintext).map_err(RequestError::other)? {
-                Response::Message(response) => response,
-                Response::Error(error) => {
-                    if let Some(completion) =
-                        protocol::seal_error_completion(self, &mut session, &error)
-                    {
-                        let _ = relay.complete_briefly(&completion).await;
-                    }
-                    return Err(RequestError::DeviceRejected {
-                        code: error.code,
-                        message: error.message,
-                    }
-                    .into());
+        let response: UploadResult = match protocol::decode_response(&plaintext)? {
+            Response::Message(response) => response,
+            Response::Error(error) => {
+                if let Some(completion) =
+                    protocol::seal_error_completion(self, &mut session, &error)
+                {
+                    let _ = relay.complete_briefly(&completion).await;
                 }
-            };
-        let completion = self.encode(&response).map_err(RequestError::other)?;
+                return Err(RequestError::from(error).into());
+            }
+        };
+        let completion = self.encode(&response)?;
         let completion = session
             .seal_completion(&completion)
-            .map_err(RequestError::other)?;
+            .map_err(RequestError::from)?;
         tokio::select! {
             biased;
             _ = cancellation.as_mut() => {},

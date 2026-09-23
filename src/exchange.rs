@@ -26,11 +26,9 @@ impl Client {
         self.maybe_rotate_psk()?;
         let pairing_path = self.pairing_path();
         let pairing = read_pairing_from(&pairing_path)?;
-        let plaintext = self.encode(payload).map_err(RequestError::other)?;
-        let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
-        let request = session
-            .seal_request(&plaintext)
-            .map_err(RequestError::other)?;
+        let plaintext = self.encode(payload)?;
+        let mut session = Session::new(&pairing, &request_id)?;
+        let request = session.seal_request(&plaintext)?;
         let mut relay = RelayExchange::authenticated(self, &pairing, &request_id.to_string())?;
 
         progress(RequestProgress::WaitingForDelivery);
@@ -73,12 +71,12 @@ impl Client {
         progress(RequestProgress::Completing);
         let response = session
             .open_response(response)
-            .map_err(RequestError::other)
+            .map_err(RequestError::from)
             .and_then(|plaintext| {
                 if let Some(rotation_key) = pairing.rotation_key() {
                     clear_rotation_key(&pairing_path, rotation_key)?;
                 }
-                protocol::decode_response::<Decision<R>>(&plaintext).map_err(RequestError::other)
+                protocol::decode_response::<Decision<R>>(&plaintext)
             });
         let result = match response {
             Ok(Response::Error(error)) => {
@@ -87,10 +85,7 @@ impl Client {
                 {
                     let _ = relay.complete_briefly(&completion).await;
                 }
-                return Err(RequestError::DeviceRejected {
-                    code: error.code,
-                    message: error.message,
-                });
+                return Err(error.into());
             }
             Ok(Response::Message(Decision::Approved { data })) => {
                 validate(data).map_err(RequestError::from)
@@ -114,10 +109,8 @@ impl Client {
                 message: error.to_string(),
             },
         };
-        let plaintext = self.encode(&outcome).map_err(RequestError::other)?;
-        let completion = session
-            .seal_completion(&plaintext)
-            .map_err(RequestError::other)?;
+        let plaintext = self.encode(&outcome)?;
+        let completion = session.seal_completion(&plaintext)?;
         tokio::select! {
             biased;
             _ = cancellation.as_mut() => {

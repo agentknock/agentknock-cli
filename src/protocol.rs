@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::{ApplicationInfo, Client, DenialReason, crypto, crypto::Session};
+use crate::{ApplicationInfo, Client, DenialReason, RequestError, crypto, crypto::Session};
 
 pub(crate) const LIBRARY_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -50,22 +50,24 @@ where
     })
 }
 
-pub(crate) fn decode_response<T>(plaintext: &[u8]) -> Result<Response<T>, serde_json::Error>
+pub(crate) fn decode_response<T>(plaintext: &[u8]) -> Result<Response<T>, RequestError>
 where
     T: DeserializeOwned,
 {
-    let value: Value = serde_json::from_slice(plaintext)?;
+    let value: Value = serde_json::from_slice(plaintext).map_err(RequestError::other)?;
     if value
         .as_object()
         .is_some_and(|response| response.contains_key("error"))
     {
-        let error = serde_json::from_value::<ErrorResponse>(value)?;
+        let error = serde_json::from_value::<ErrorResponse>(value).map_err(RequestError::other)?;
         return Ok(Response::Error(DeviceError {
             code: error.error,
             message: error.message,
         }));
     }
-    serde_json::from_value(value).map(Response::Message)
+    serde_json::from_value(value)
+        .map(Response::Message)
+        .map_err(RequestError::other)
 }
 
 pub(crate) fn seal_error_completion(
