@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 build = subprocess.run(
     [
@@ -54,6 +55,14 @@ tests = {
     ],
 }
 for target, filters in tests.items():
+    # A filter that matches nothing would otherwise pass silently.
+    listed = subprocess.run(
+        [executables[target], "--list"], check=True, stdout=subprocess.PIPE, text=True,
+    )
+    names = [line.removesuffix(": test") for line in listed.stdout.splitlines()]
+    unmatched = [pattern for pattern in filters if not any(pattern in name for name in names)]
+    if unmatched:
+        sys.exit(f"no {target} tests match {unmatched}")
     subprocess.run(
         sandbox + ["sh", "-c", 'test ! -e /proc && exec "$@"', "without-procfs", executables[target], *filters],
         check=True,
