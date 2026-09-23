@@ -61,7 +61,6 @@ pub(crate) struct RelayExchange {
     request_id: String,
     socket: Option<Socket>,
     request: Option<OutgoingMessage>,
-    response: Option<Value>,
     completion: Option<OutgoingMessage>,
 }
 
@@ -182,7 +181,6 @@ impl RelayExchange {
             request_id: request_id.to_owned(),
             socket: None,
             request: None,
-            response: None,
             completion: None,
         })
     }
@@ -209,21 +207,13 @@ impl RelayExchange {
         )?);
 
         let mut retry = RetryState::new(NORMAL_RETRY_POLICY);
+        let mut response = None;
         loop {
-            let reconnected = self.ensure_connected(&mut retry).await?;
-            if reconnected {
-                if self.request_message().acknowledged {
-                    if !self.send_resume(&mut retry).await? {
-                        continue;
-                    }
-                } else if !self.send_request(&mut retry).await? {
-                    continue;
-                }
+            if self.connect(&mut retry).await?.is_none() {
+                continue;
             }
-
-            let incoming = match self.receive(&mut retry).await? {
-                Some(incoming) => incoming,
-                None => continue,
+            let Some(incoming) = self.receive(&mut retry).await? else {
+                continue;
             };
             match incoming {
                 IncomingFrame::Ack {
@@ -246,22 +236,20 @@ impl RelayExchange {
                 } => {
                     self.request_mut().acknowledged = true;
                     delivered();
-                    if self.response.is_none() {
-                        self.response = Some(payload);
-                    }
+                    response.get_or_insert(payload);
                     if self.send_ack(MessageKind::Response, &mut retry).await? {
-                        return self.decode_response();
+                        return decode_response(response);
                     }
                 }
                 IncomingFrame::State {
                     exchange,
                     request,
-                    response,
+                    response: response_state,
                     ..
                 } => {
                     self.apply_request_state(request, &mut delivered);
-                    if response == MessageState::Delivered {
-                        return self.decode_response();
+                    if response_state == MessageState::Delivered {
+                        return decode_response(response);
                     }
                     if matches!(exchange, ExchangeState::Settled | ExchangeState::Expired) {
                         return Err(Error::MissingResponse);
@@ -332,16 +320,9 @@ impl RelayExchange {
 
         let mut retry = RetryState::new(policy);
         loop {
-            let reconnected = self.ensure_connected(&mut retry).await?;
-            if reconnected {
-                if self.request_message().acknowledged {
-                    if !self.send_resume(&mut retry).await? {
-                        continue;
-                    }
-                } else if !self.send_request(&mut retry).await? {
-                    continue;
-                }
-            }
+            let Some(reconnected) = self.connect(&mut retry).await? else {
+                continue;
+            };
 
             if !self.request_message().acknowledged {
                 let Some(incoming) = self.receive(&mut retry).await? else {
@@ -362,11 +343,9 @@ impl RelayExchange {
                     }
                     IncomingFrame::Message {
                         kind: MessageKind::Response,
-                        payload,
                         ..
                     } => {
                         self.request_mut().acknowledged = true;
-                        self.response.get_or_insert(payload);
                         if !self.send_ack(MessageKind::Response, &mut retry).await? {
                             continue;
                         }
@@ -393,10 +372,8 @@ impl RelayExchange {
                 }
                 IncomingFrame::Message {
                     kind: MessageKind::Response,
-                    payload,
                     ..
                 } => {
-                    self.response.get_or_insert(payload);
                     if !self.send_ack(MessageKind::Response, &mut retry).await? {
                         continue;
                     }
@@ -424,6 +401,24 @@ impl RelayExchange {
             payload,
         })
         .map_err(Error::InvalidJson)
+    }
+
+    /// Connects if needed and, after reconnecting, resends or resumes the request.
+    ///
+    /// Returns whether it reconnected, or `None` if the resend failed.
+    async fn connect(&mut self, retry: &mut RetryState) -> Result<Option<bool>, Error> {
+        let reconnected = self.ensure_connected(retry).await?;
+        if reconnected {
+            let sent = if self.request_message().acknowledged {
+                self.send_resume(retry).await?
+            } else {
+                self.send_request(retry).await?
+            };
+            if !sent {
+                return Ok(None);
+            }
+        }
+        Ok(Some(reconnected))
     }
 
     async fn ensure_connected(&mut self, retry: &mut RetryState) -> Result<bool, Error> {
@@ -651,17 +646,6 @@ impl RelayExchange {
         }
     }
 
-    fn decode_response<R: DeserializeOwned>(&self) -> Result<R, Error> {
-        let response = self.response.clone().ok_or(Error::MissingResponse)?;
-        match serde_json::from_value(response).map_err(Error::InvalidJson)? {
-            ApplicationResponse::Message(response) => Ok(response),
-            ApplicationResponse::Error(error) => Err(Error::Unauthenticated {
-                code: error.error,
-                message: error.message,
-            }),
-        }
-    }
-
     fn request_message(&self) -> &OutgoingMessage {
         self.request.as_ref().expect("request exists")
     }
@@ -676,6 +660,17 @@ impl RelayExchange {
 
     fn completion_mut(&mut self) -> &mut OutgoingMessage {
         self.completion.as_mut().expect("completion exists")
+    }
+}
+
+fn decode_response<R: DeserializeOwned>(response: Option<Value>) -> Result<R, Error> {
+    let response = response.ok_or(Error::MissingResponse)?;
+    match serde_json::from_value(response).map_err(Error::InvalidJson)? {
+        ApplicationResponse::Message(response) => Ok(response),
+        ApplicationResponse::Error(error) => Err(Error::Unauthenticated {
+            code: error.error,
+            message: error.message,
+        }),
     }
 }
 
