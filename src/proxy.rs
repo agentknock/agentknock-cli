@@ -1,4 +1,4 @@
-use std::{env, ffi::OsString, io};
+use std::{env, io};
 
 use http::{HeaderValue, Uri};
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
@@ -29,16 +29,12 @@ struct Setting {
 impl Config {
     pub(crate) fn from_env(destination: &Uri) -> Result<Self, ConfigurationError> {
         let target = proxy_target(destination)?;
-        let specific = match target.scheme_str() {
-            Some("https") => first_setting(&["https_proxy", "HTTPS_PROXY"]),
-            Some("http") => first_setting(&["http_proxy", "HTTP_PROXY"]),
+        let names = match target.scheme_str() {
+            Some("https") => ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"],
+            Some("http") => ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"],
             _ => unreachable!("proxy targets use HTTP schemes"),
-        }?;
-        let setting = match specific {
-            Some(setting) => Some(setting),
-            None => first_setting(&["all_proxy", "ALL_PROXY"])?,
         };
-        let Some(setting) = setting else {
+        let Some(setting) = first_setting(&names)? else {
             return Ok(Self { proxy: None });
         };
 
@@ -108,18 +104,14 @@ fn first_setting(names: &[&'static str]) -> Result<Option<Setting>, Configuratio
         let Some(value) = env::var_os(name) else {
             continue;
         };
-        let value = environment_string(name, value)?;
+        let value = value
+            .into_string()
+            .map_err(|_| ConfigurationError::NonUtf8(name))?;
         if !value.is_empty() {
             return Ok(Some(Setting { name, value }));
         }
     }
     Ok(None)
-}
-
-fn environment_string(name: &'static str, value: OsString) -> Result<String, ConfigurationError> {
-    value
-        .into_string()
-        .map_err(|_| ConfigurationError::NonUtf8(name))
 }
 
 fn proxy_target(destination: &Uri) -> Result<Uri, ConfigurationError> {
@@ -142,11 +134,14 @@ fn proxy_target(destination: &Uri) -> Result<Uri, ConfigurationError> {
 }
 
 async fn connect_tcp(uri: &Uri) -> Result<TcpStream, ConnectionError> {
-    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+    Ok(TcpStream::connect((host(uri)?, port(uri))).await?)
+}
+
+fn port(uri: &Uri) -> u16 {
+    uri.port_u16().unwrap_or(match uri.scheme_str() {
         Some("https" | "wss") => 443,
         _ => 80,
-    });
-    Ok(TcpStream::connect((host(uri)?, port)).await?)
+    })
 }
 
 fn host(uri: &Uri) -> Result<&str, ConnectionError> {
@@ -157,11 +152,7 @@ fn host(uri: &Uri) -> Result<&str, ConnectionError> {
 
 fn connect_authority(uri: &Uri) -> Result<String, ConnectionError> {
     let host = uri.host().ok_or(ConnectionError::MissingHost)?;
-    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
-        Some("wss" | "https") => 443,
-        _ => 80,
-    });
-    Ok(format!("{host}:{port}"))
+    Ok(format!("{host}:{}", port(uri)))
 }
 
 async fn establish_tunnel<S>(
