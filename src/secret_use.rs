@@ -389,10 +389,7 @@ fn secret_use_output_from_secrets(
             requested_secrets.keys().collect::<Vec<_>>()
         )));
     }
-    for (name, secret) in secrets {
-        let options = requested_secrets
-            .get(&name)
-            .expect("the received secret set was checked");
+    for ((name, secret), options) in secrets.into_iter().zip(requested_secrets.values()) {
         match secret {
             ApprovedSecret::Environment { variables } => {
                 let environment_options = &options.environment;
@@ -447,31 +444,25 @@ fn secret_use_output_from_secrets(
 
 fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::Result<()> {
     if secrets.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(invalid_input(
             "an invocation must request at least one secret",
         ));
     }
     let mut has_stdin = false;
     for (secret, options) in secrets {
         if secret.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a requested secret has an empty name",
-            ));
+            return Err(invalid_input("a requested secret has an empty name"));
         }
         let options = &options.environment;
         if options.only.as_ref().is_some_and(BTreeSet::is_empty) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("secret {secret:?} has an empty only set"),
-            ));
+            return Err(invalid_input(format!(
+                "secret {secret:?} has an empty only set"
+            )));
         }
         if options.only.is_some() && !options.omit.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("secret {secret:?} uses both only and omit"),
-            ));
+            return Err(invalid_input(format!(
+                "secret {secret:?} uses both only and omit"
+            )));
         }
         for name in options
             .only
@@ -487,37 +478,27 @@ fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::
         if let Some(only) = &options.only {
             for source in options.rename.keys().chain(options.stdin.iter()) {
                 if !only.contains(source) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "environment variable {source:?} is configured for secret {secret:?} but isn't selected by only"
-                        ),
-                    ));
+                    return Err(invalid_input(format!(
+                        "environment variable {source:?} is configured for secret {secret:?} but isn't selected by only"
+                    )));
                 }
             }
         }
         for source in options.rename.keys().chain(options.stdin.iter()) {
             if options.omit.contains(source) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "environment variable {source:?} is both used and omitted for secret {secret:?}"
-                    ),
-                ));
+                return Err(invalid_input(format!(
+                    "environment variable {source:?} is both used and omitted for secret {secret:?}"
+                )));
             }
         }
         if let Some(source) = &options.stdin {
             if options.rename.contains_key(source) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "environment variable {source:?} is both renamed and sent to standard input for secret {secret:?}"
-                    ),
-                ));
+                return Err(invalid_input(format!(
+                    "environment variable {source:?} is both renamed and sent to standard input for secret {secret:?}"
+                )));
             }
             if has_stdin {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(invalid_input(
                     "an invocation can send only one environment variable to standard input",
                 ));
             }
@@ -527,12 +508,15 @@ fn validate_secret_options(secrets: &BTreeMap<String, SecretUseOptions>) -> io::
     Ok(())
 }
 
+fn invalid_input(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
 fn validate_environment_name(name: &str) -> io::Result<()> {
     if name.is_empty() || name.contains('=') || name.contains('\0') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid environment variable name {name:?}"),
-        ));
+        return Err(invalid_input(format!(
+            "invalid environment variable name {name:?}"
+        )));
     }
     Ok(())
 }
