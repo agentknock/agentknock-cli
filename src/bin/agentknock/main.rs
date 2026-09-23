@@ -498,23 +498,20 @@ struct EnvironmentSecretInput {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
-    Run {
-        secrets: BTreeMap<String, SecretUseOptions>,
-        git_signing: bool,
-        reason: Option<String>,
-        ssh_agent: bool,
-        ssh_passthrough: bool,
-        command: Vec<String>,
-    },
-    StartPairing(String),
-    ShowPairingStatus,
-    FinishPairing,
-    AbortPairing,
-    RemovePairing {
-        force: bool,
-    },
-    ListSecrets,
-    UploadSecret(SecretUploadCommand),
+    Run(RunOperation),
+    Pairing(PairingCommand),
+    Secret(SecretCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RunOperation {
+    secrets: BTreeMap<String, SecretUseOptions>,
+    git_signing: bool,
+    reason: Option<String>,
+    ssh_agent: bool,
+    ssh_passthrough: bool,
+    command: Vec<String>,
+    output: OutputMode,
 }
 
 #[derive(Clone, Copy)]
@@ -681,9 +678,9 @@ fn parse_pairing_address(address: &str) -> Result<String, &'static str> {
 }
 
 impl Cli {
-    fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
+    fn into_operation(self) -> Result<Operation, RunOptionsError> {
         match self.command {
-            None => self.run.into_operation(),
+            None => self.run.into_operation().map(Operation::Run),
             Some(_) if self.run != RunCommand::default() => Err(RunOptionsError::Subcommand),
             Some(command) => command.into_operation(),
         }
@@ -691,49 +688,26 @@ impl Cli {
 }
 
 impl Command {
-    fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
+    fn into_operation(self) -> Result<Operation, RunOptionsError> {
         Ok(match self {
-            Self::Run(command) => return command.into_operation(),
-            Self::Pairing {
-                command: PairingCommand::Start { address },
-            } => (Operation::StartPairing(address), OutputMode::Normal),
-            Self::Pairing {
-                command: PairingCommand::Status,
-            } => (Operation::ShowPairingStatus, OutputMode::Normal),
-            Self::Pairing {
-                command: PairingCommand::Finish,
-            } => (Operation::FinishPairing, OutputMode::Normal),
-            Self::Pairing {
-                command: PairingCommand::Abort,
-            } => (Operation::AbortPairing, OutputMode::Normal),
-            Self::Pairing {
-                command: PairingCommand::Remove { force },
-            } => (Operation::RemovePairing { force }, OutputMode::Normal),
-            Self::Secret {
-                command: SecretCommand::List,
-            } => (Operation::ListSecrets, OutputMode::Normal),
-            Self::Secret {
-                command: SecretCommand::Upload(command),
-            } => (Operation::UploadSecret(command), OutputMode::Normal),
+            Self::Run(command) => Operation::Run(command.into_operation()?),
+            Self::Pairing { command } => Operation::Pairing(command),
+            Self::Secret { command } => Operation::Secret(command),
         })
     }
 }
 
 impl RunCommand {
-    fn into_operation(self) -> Result<(Operation, OutputMode), RunOptionsError> {
-        let output = self.output_mode();
-        let secrets = self.secret_options()?;
-        Ok((
-            Operation::Run {
-                secrets,
-                git_signing: !self.no_git_sign,
-                reason: self.reason,
-                ssh_agent: !self.no_ssh_agent,
-                ssh_passthrough: !self.no_ssh_passthrough,
-                command: self.command,
-            },
-            output,
-        ))
+    fn into_operation(self) -> Result<RunOperation, RunOptionsError> {
+        Ok(RunOperation {
+            secrets: self.secret_options()?,
+            git_signing: !self.no_git_sign,
+            reason: self.reason,
+            ssh_agent: !self.no_ssh_agent,
+            ssh_passthrough: !self.no_ssh_passthrough,
+            command: self.command,
+            output: OutputMode::from_flags(self.quiet, self.verbose),
+        })
     }
 
     fn secret_options(&self) -> Result<BTreeMap<String, SecretUseOptions>, RunOptionsError> {
@@ -793,10 +767,6 @@ impl RunCommand {
 
         validate_run_environment_options(&secrets)?;
         Ok(secrets)
-    }
-
-    fn output_mode(&self) -> OutputMode {
-        OutputMode::from_flags(self.quiet, self.verbose)
     }
 }
 
@@ -893,12 +863,16 @@ fn main() -> ExitCode {
 async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
     let cli = Cli::parse_from(arguments);
     let agentknock_home = cli.agentknock_home.clone();
-    let (operation, output) = match cli.into_operation() {
+    let operation = match cli.into_operation() {
         Ok(operation) => operation,
         Err(error) => {
             print_run_options_error(&error);
             return ExitCode::from(2);
         }
+    };
+    let output = match &operation {
+        Operation::Run(run) => run.output,
+        Operation::Pairing(_) | Operation::Secret(_) => OutputMode::Normal,
     };
     let application = ApplicationInfo::new("agentknock", env!("CARGO_PKG_VERSION"));
     let client = match agentknock_home {
@@ -909,7 +883,7 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
         Ok(client) => client,
         Err(error) => {
             if output != OutputMode::Quiet {
-                if matches!(operation, Operation::Run { .. }) {
+                if matches!(operation, Operation::Run(_)) {
                     print_run_configuration_error(&error);
                 } else {
                     print_plain_error(format_args!(
@@ -921,7 +895,7 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(&client, operation, output).await {
+    match run(&client, operation).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             print_command_error(&error, output);
@@ -930,175 +904,32 @@ async fn run_cli(arguments: Vec<OsString>) -> ExitCode {
     }
 }
 
-async fn run(
-    client: &Client,
-    operation: Operation,
-    output: OutputMode,
-) -> Result<(), CommandError> {
+async fn run(client: &Client, operation: Operation) -> Result<(), CommandError> {
     match operation {
-        Operation::Run {
-            secrets,
-            git_signing,
-            reason,
-            ssh_agent,
-            ssh_passthrough,
-            command,
-        } => {
-            let (program, arguments) = command.split_first().expect("command is required");
-            let selected = SelectedExecutable::select(program).map_err(|source| {
-                CommandError::RunSelection {
-                    program: program.clone(),
-                    source,
-                }
-            })?;
-            let signal_state = SignalState::capture().map_err(CommandError::RunSignal)?;
-            let launcher_chain = launcher_chain();
-            let stdin_source = secrets.iter().find_map(|(secret, options)| {
-                options
-                    .environment
-                    .stdin
-                    .as_deref()
-                    .map(|variable| (secret.as_str(), variable))
-            });
-            let request = SecretUseRequest {
-                secrets: &secrets,
-                operation: SecretUseOperation::Exec {
-                    command: program,
-                    arguments,
-                    working_directory: selected.working_directory(),
-                    executable_path: selected.path(),
-                    executable_hash: selected.hash(),
-                    executable_mode: selected.mode(),
-                    script_contents: selected.script_contents(),
-                    stdin: if stdin_source.is_some() {
-                        StreamKind::Pipe
-                    } else {
-                        standard_stream_kind(0, io::stdin().is_terminal())
-                    },
-                    stdout: standard_stream_kind(1, io::stdout().is_terminal()),
-                    stderr: standard_stream_kind(2, io::stderr().is_terminal()),
-                },
-                reason: reason.as_deref(),
-                launcher_chain: &launcher_chain,
-            };
-            let mut signals = CommandSignals::new().map_err(CommandError::RunSignal)?;
-            // Resolve before approval can outlive the working directory; only
-            // require the path if the response needs an invocation service.
-            let service_executable = invocation_service::executable_path();
-            let secret_use_output =
-                request_run_secrets(client, request, output, &mut signals).await?;
-            let upstream_agent_socket = if ssh_passthrough && (ssh_agent || git_signing) {
-                secret_use_output
-                    .environment_variable("SSH_AUTH_SOCK")
-                    .map(OsString::from)
-                    .or_else(|| env::var_os("SSH_AUTH_SOCK"))
-            } else {
-                None
-            };
-            let service_ssh = if ssh_agent || git_signing {
-                secret_use_output.ssh()
-            } else {
-                None
-            };
-            let mut invocation_service =
-                if service_ssh.is_some() || secret_use_output.stdin_value().is_some() {
-                    Some(
-                        invocation_service::InvocationService::start(
-                            &service_executable.map_err(CommandError::RunInvocationService)?,
-                            client.home(),
-                            secret_use_output.invocation(),
-                            service_ssh,
-                            secret_use_output.stdin_value(),
-                            upstream_agent_socket.as_deref(),
-                            invocation_service::ServiceOptions {
-                                ssh_agent,
-                                git_signing,
-                                ssh_passthrough,
-                                quiet: output == OutputMode::Quiet,
-                                verbose: output == OutputMode::Verbose,
-                            },
-                        )
-                        .map_err(CommandError::RunInvocationService)?,
-                    )
-                } else {
-                    None
-                };
-            let git_config_count = secret_use_output
-                .environment_variable("GIT_CONFIG_COUNT")
-                .map(OsString::from)
-                .or_else(|| env::var_os("GIT_CONFIG_COUNT"));
-            let additional_environment = match &invocation_service {
-                Some(service) => service
-                    .environment(git_config_count.as_deref())
-                    .map_err(CommandError::RunInvocationService)?,
-                None => BTreeMap::new(),
-            };
-            let removed_environment = if ssh_agent {
-                Vec::new()
-            } else {
-                vec![OsString::from("SSH_AUTH_SOCK")]
-            };
-            let blocked_signals = signal_state
-                .block_interrupts()
-                .map_err(CommandError::RunSignal)?;
-            if signals.received()
-                || blocked_signals
-                    .interrupted()
-                    .map_err(CommandError::RunSignal)?
-            {
-                return Err(CommandError::RunInterrupted);
-            }
-            if output == OutputMode::Verbose {
-                print_received_secrets(&secret_use_output, stdin_source);
-                print_message(format_args!("Running command {program:?}."));
-            }
-            let program = program.clone();
-            let stdin = invocation_service
-                .as_mut()
-                .and_then(invocation_service::InvocationService::take_stdin);
-            selected
-                .execute(
-                    arguments,
-                    CommandEnvironment::new(
-                        secret_use_output,
-                        additional_environment,
-                        removed_environment,
-                    ),
-                    stdin,
-                    &signal_state,
-                    blocked_signals,
-                )
-                .map_err(|source| {
-                    if source.kind() == io::ErrorKind::Interrupted {
-                        CommandError::RunInterrupted
-                    } else {
-                        CommandError::RunProcess { program, source }
-                    }
-                })?;
-        }
-        Operation::StartPairing(address) => {
+        Operation::Run(run) => run_command(client, run).await?,
+        Operation::Pairing(PairingCommand::Start { address }) => {
             let sas = start_pairing_for_cli(client, &address)
                 .await
                 .map_err(CommandError::StartPairing)?;
             print_start_pairing_success(&sas);
         }
-        Operation::ShowPairingStatus => {
+        Operation::Pairing(PairingCommand::Status) => {
             let status = client
                 .pairing_status()
                 .map_err(CommandError::PairingStatus)?;
             print_pairing_status(status);
         }
-        Operation::FinishPairing => {
+        Operation::Pairing(PairingCommand::Finish) => {
             finish_pairing_for_cli(client)
                 .await
                 .map_err(CommandError::FinishPairing)?;
             println!("Pairing complete. Agentknock is ready to run commands with secrets.");
         }
-        Operation::AbortPairing => {
+        Operation::Pairing(PairingCommand::Abort) => {
             client.abort_pairing().map_err(CommandError::AbortPairing)?;
             println!("Pending pairing discarded.");
         }
-        Operation::RemovePairing { force } => {
+        Operation::Pairing(PairingCommand::Remove { force }) => {
             if force {
                 client
                     .force_remove_pairing()
@@ -1111,13 +942,13 @@ async fn run(
                 println!("Pairing removed from this client and the device.");
             }
         }
-        Operation::ListSecrets => {
+        Operation::Secret(SecretCommand::List) => {
             let secrets = list_secrets_for_cli(client)
                 .await
                 .map_err(CommandError::ListSecrets)?;
             print_secrets(&secrets);
         }
-        Operation::UploadSecret(command) => {
+        Operation::Secret(SecretCommand::Upload(command)) => {
             let (secret, mode) = read_secret(command).map_err(CommandError::SecretInput)?;
             upload_secret_for_cli(client, &secret, mode)
                 .await
@@ -1129,6 +960,147 @@ async fn run(
     }
 
     Ok(())
+}
+
+async fn run_command(client: &Client, run: RunOperation) -> Result<(), CommandError> {
+    let RunOperation {
+        secrets,
+        git_signing,
+        reason,
+        ssh_agent,
+        ssh_passthrough,
+        command,
+        output,
+    } = run;
+    let (program, arguments) = command.split_first().expect("command is required");
+    let selected =
+        SelectedExecutable::select(program).map_err(|source| CommandError::RunSelection {
+            program: program.clone(),
+            source,
+        })?;
+    let signal_state = SignalState::capture().map_err(CommandError::RunSignal)?;
+    let launcher_chain = launcher_chain();
+    let stdin_source = secrets.iter().find_map(|(secret, options)| {
+        options
+            .environment
+            .stdin
+            .as_deref()
+            .map(|variable| (secret.as_str(), variable))
+    });
+    let request = SecretUseRequest {
+        secrets: &secrets,
+        operation: SecretUseOperation::Exec {
+            command: program,
+            arguments,
+            working_directory: selected.working_directory(),
+            executable_path: selected.path(),
+            executable_hash: selected.hash(),
+            executable_mode: selected.mode(),
+            script_contents: selected.script_contents(),
+            stdin: if stdin_source.is_some() {
+                StreamKind::Pipe
+            } else {
+                standard_stream_kind(0, io::stdin().is_terminal())
+            },
+            stdout: standard_stream_kind(1, io::stdout().is_terminal()),
+            stderr: standard_stream_kind(2, io::stderr().is_terminal()),
+        },
+        reason: reason.as_deref(),
+        launcher_chain: &launcher_chain,
+    };
+    let mut signals = CommandSignals::new().map_err(CommandError::RunSignal)?;
+    // Resolve before approval can outlive the working directory; only
+    // require the path if the response needs an invocation service.
+    let service_executable = invocation_service::executable_path();
+    let secret_use_output = request_run_secrets(client, request, output, &mut signals).await?;
+    let ssh_requested = ssh_agent || git_signing;
+    let upstream_agent_socket = (ssh_passthrough && ssh_requested)
+        .then(|| command_variable(&secret_use_output, "SSH_AUTH_SOCK"))
+        .flatten();
+    let service_ssh = secret_use_output.ssh().filter(|_| ssh_requested);
+    let mut invocation_service =
+        if service_ssh.is_some() || secret_use_output.stdin_value().is_some() {
+            Some(
+                invocation_service::InvocationService::start(
+                    &service_executable.map_err(CommandError::RunInvocationService)?,
+                    client.home(),
+                    secret_use_output.invocation(),
+                    service_ssh,
+                    secret_use_output.stdin_value(),
+                    upstream_agent_socket.as_deref(),
+                    invocation_service::ServiceOptions {
+                        ssh_agent,
+                        git_signing,
+                        ssh_passthrough,
+                        quiet: output == OutputMode::Quiet,
+                        verbose: output == OutputMode::Verbose,
+                    },
+                )
+                .map_err(CommandError::RunInvocationService)?,
+            )
+        } else {
+            None
+        };
+    let git_config_count = command_variable(&secret_use_output, "GIT_CONFIG_COUNT");
+    let additional_environment = match &invocation_service {
+        Some(service) => service
+            .environment(git_config_count.as_deref())
+            .map_err(CommandError::RunInvocationService)?,
+        None => BTreeMap::new(),
+    };
+    let removed_environment = if ssh_agent {
+        Vec::new()
+    } else {
+        vec![OsString::from("SSH_AUTH_SOCK")]
+    };
+    let blocked_signals = signal_state
+        .block_interrupts()
+        .map_err(CommandError::RunSignal)?;
+    if signals.received()
+        || blocked_signals
+            .interrupted()
+            .map_err(CommandError::RunSignal)?
+    {
+        return Err(CommandError::RunInterrupted);
+    }
+    if output == OutputMode::Verbose {
+        print_received_secrets(&secret_use_output, stdin_source);
+        print_message(format_args!("Running command {program:?}."));
+    }
+    let stdin = invocation_service
+        .as_mut()
+        .and_then(invocation_service::InvocationService::take_stdin);
+    selected
+        .execute(
+            arguments,
+            CommandEnvironment::new(
+                secret_use_output,
+                additional_environment,
+                removed_environment,
+            ),
+            stdin,
+            &signal_state,
+            blocked_signals,
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::Interrupted {
+                CommandError::RunInterrupted
+            } else {
+                CommandError::RunProcess {
+                    program: program.clone(),
+                    source,
+                }
+            }
+        })?;
+    Ok(())
+}
+
+/// Returns the value a command receives for `name`: an approved value, or else the inherited one.
+fn command_variable(secret_use_output: &SecretUseOutput, name: &str) -> Option<OsString> {
+    secret_use_output
+        .environment_variable(name)
+        .map(OsString::from)
+        .or_else(|| env::var_os(name))
 }
 
 async fn start_pairing_for_cli(client: &Client, address: &str) -> Result<PairingSas, RequestError> {
@@ -2265,8 +2237,8 @@ mod tests {
     use clap::{Parser, error::ErrorKind};
 
     use super::{
-        Cli, EnvironmentSecretInput, Operation, OutputMode, SecretUploadCommand, VariableFile,
-        progress_message,
+        Cli, EnvironmentSecretInput, Operation, OutputMode, PairingCommand, RunOperation,
+        SecretCommand, SecretUploadCommand, VariableFile, progress_message,
     };
 
     fn secret_options<const N: usize>(names: [&str; N]) -> BTreeMap<String, SecretUseOptions> {
@@ -2314,7 +2286,7 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.agentknock_home.is_none());
-        let (Operation::Run { command, .. }, _) = cli.into_operation().unwrap() else {
+        let Operation::Run(RunOperation { command, .. }) = cli.into_operation().unwrap() else {
             panic!("expected run operation");
         };
         assert_eq!(command, ["tool", "--agentknock-home", "child-home"]);
@@ -2363,17 +2335,18 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (
-                Operation::Run {
-                    secrets: secret_options(["cf-wrangler", "gh-token"]),
-                    git_signing: false,
-                    reason: Some("GitHub token for repository access; Cloudflare token for deployment access".into()),
-                    ssh_agent: false,
-                    ssh_passthrough: false,
-                    command: vec!["./release.sh".into()],
-                },
-                OutputMode::Normal,
-            )
+            Operation::Run(RunOperation {
+                secrets: secret_options(["cf-wrangler", "gh-token"]),
+                git_signing: false,
+                reason: Some(
+                    "GitHub token for repository access; Cloudflare token for deployment access"
+                        .into()
+                ),
+                ssh_agent: false,
+                ssh_passthrough: false,
+                command: vec!["./release.sh".into()],
+                output: OutputMode::Normal,
+            })
         );
     }
 
@@ -2383,17 +2356,15 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (
-                Operation::Run {
-                    secrets: secret_options(["github"]),
-                    git_signing: true,
-                    reason: None,
-                    ssh_agent: true,
-                    ssh_passthrough: true,
-                    command: vec!["true".into()],
-                },
-                OutputMode::Normal,
-            )
+            Operation::Run(RunOperation {
+                secrets: secret_options(["github"]),
+                git_signing: true,
+                reason: None,
+                ssh_agent: true,
+                ssh_passthrough: true,
+                command: vec!["true".into()],
+                output: OutputMode::Normal,
+            })
         );
     }
 
@@ -2426,8 +2397,7 @@ mod tests {
         ])
         .unwrap();
 
-        let (operation, _) = cli.into_operation().unwrap();
-        let Operation::Run { secrets, .. } = operation else {
+        let Operation::Run(RunOperation { secrets, .. }) = cli.into_operation().unwrap() else {
             panic!("expected run operation");
         };
         assert_eq!(
@@ -2507,9 +2477,13 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(normal.into_operation().unwrap().1, OutputMode::Normal);
-        assert_eq!(quiet.into_operation().unwrap().1, OutputMode::Quiet);
-        assert_eq!(verbose.into_operation().unwrap().1, OutputMode::Verbose);
+        let output = |cli: Cli| match cli.into_operation().unwrap() {
+            Operation::Run(run) => run.output,
+            operation => panic!("expected run operation, found {operation:?}"),
+        };
+        assert_eq!(output(normal), OutputMode::Normal);
+        assert_eq!(output(quiet), OutputMode::Quiet);
+        assert_eq!(output(verbose), OutputMode::Verbose);
     }
 
     #[test]
@@ -2554,10 +2528,9 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (
-                Operation::StartPairing("pairing-address-name".into()),
-                OutputMode::Normal,
-            )
+            Operation::Pairing(PairingCommand::Start {
+                address: "pairing-address-name".into()
+            })
         );
     }
 
@@ -2567,7 +2540,7 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (Operation::ShowPairingStatus, OutputMode::Normal)
+            Operation::Pairing(PairingCommand::Status)
         );
     }
 
@@ -2599,7 +2572,7 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (Operation::FinishPairing, OutputMode::Normal)
+            Operation::Pairing(PairingCommand::Finish)
         );
     }
 
@@ -2609,7 +2582,7 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (Operation::AbortPairing, OutputMode::Normal)
+            Operation::Pairing(PairingCommand::Abort)
         );
     }
 
@@ -2619,10 +2592,7 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (
-                Operation::RemovePairing { force: false },
-                OutputMode::Normal
-            )
+            Operation::Pairing(PairingCommand::Remove { force: false })
         );
     }
 
@@ -2632,7 +2602,7 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (Operation::RemovePairing { force: true }, OutputMode::Normal)
+            Operation::Pairing(PairingCommand::Remove { force: true })
         );
     }
 
@@ -2642,7 +2612,7 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (Operation::ListSecrets, OutputMode::Normal)
+            Operation::Secret(SecretCommand::List)
         );
     }
 
@@ -2669,27 +2639,24 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (
-                Operation::UploadSecret(SecretUploadCommand {
-                    name: "github".into(),
-                    description: Some("GitHub API access".into()),
-                    replace: false,
-                    update: true,
-                    from_ssh_key: None,
-                    passphrase_prompt: false,
-                    passphrase_env: None,
-                    environment: EnvironmentSecretInput {
-                        from_env: vec!["GH_TOKEN".into()],
-                        from_file: vec![VariableFile {
-                            name: "GH_HOST".into(),
-                            path: "host".into(),
-                        }],
-                        from_prompt: vec!["GH_SECRET".into()],
-                        from_env_file: vec!["shared.env".into()],
-                    },
-                }),
-                OutputMode::Normal,
-            )
+            Operation::Secret(SecretCommand::Upload(SecretUploadCommand {
+                name: "github".into(),
+                description: Some("GitHub API access".into()),
+                replace: false,
+                update: true,
+                from_ssh_key: None,
+                passphrase_prompt: false,
+                passphrase_env: None,
+                environment: EnvironmentSecretInput {
+                    from_env: vec!["GH_TOKEN".into()],
+                    from_file: vec![VariableFile {
+                        name: "GH_HOST".into(),
+                        path: "host".into(),
+                    }],
+                    from_prompt: vec!["GH_SECRET".into()],
+                    from_env_file: vec!["shared.env".into()],
+                },
+            }))
         );
     }
 
@@ -2708,24 +2675,21 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (
-                Operation::UploadSecret(SecretUploadCommand {
-                    name: "production-ssh".into(),
-                    description: None,
-                    replace: false,
-                    update: false,
-                    from_ssh_key: Some("/tmp/id_ed25519".into()),
-                    passphrase_prompt: true,
-                    passphrase_env: None,
-                    environment: EnvironmentSecretInput {
-                        from_env: Vec::new(),
-                        from_file: Vec::new(),
-                        from_prompt: Vec::new(),
-                        from_env_file: Vec::new(),
-                    },
-                }),
-                OutputMode::Normal,
-            )
+            Operation::Secret(SecretCommand::Upload(SecretUploadCommand {
+                name: "production-ssh".into(),
+                description: None,
+                replace: false,
+                update: false,
+                from_ssh_key: Some("/tmp/id_ed25519".into()),
+                passphrase_prompt: true,
+                passphrase_env: None,
+                environment: EnvironmentSecretInput {
+                    from_env: Vec::new(),
+                    from_file: Vec::new(),
+                    from_prompt: Vec::new(),
+                    from_env_file: Vec::new(),
+                },
+            }))
         );
     }
 
@@ -3019,7 +2983,9 @@ mod tests {
 
         assert_eq!(
             cli.into_operation().unwrap(),
-            (Operation::StartPairing("help".into()), OutputMode::Normal,)
+            Operation::Pairing(PairingCommand::Start {
+                address: "help".into()
+            })
         );
     }
 
