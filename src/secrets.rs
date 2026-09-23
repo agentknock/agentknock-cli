@@ -253,7 +253,7 @@ impl Client {
         let request_id = Ulid::generate();
         let request_payload = UploadRequest {
             method: Method::SecretUpload,
-            mode: mode.into(),
+            mode: mode.wire_name(),
             secret: UploadSecretMessage::from(secret),
         };
         let (mut session, request, mut relay) =
@@ -310,24 +310,16 @@ struct ListResponse {
 #[derive(Serialize)]
 struct UploadRequest<'a> {
     method: Method,
-    mode: SecretUploadModeMessage,
+    mode: &'static str,
     secret: UploadSecretMessage<'a>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum SecretUploadModeMessage {
-    Create,
-    Replace,
-    Update,
-}
-
-impl From<SecretUploadMode> for SecretUploadModeMessage {
-    fn from(mode: SecretUploadMode) -> Self {
-        match mode {
-            SecretUploadMode::Create => Self::Create,
-            SecretUploadMode::Replace => Self::Replace,
-            SecretUploadMode::Update => Self::Update,
+impl SecretUploadMode {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Create => "CREATE",
+            Self::Replace => "REPLACE",
+            Self::Update => "UPDATE",
         }
     }
 }
@@ -448,10 +440,7 @@ mod tests {
             (SecretUploadMode::Replace, "REPLACE"),
             (SecretUploadMode::Update, "UPDATE"),
         ] {
-            assert_eq!(
-                serde_json::to_value(SecretUploadModeMessage::from(mode)).unwrap(),
-                name
-            );
+            assert_eq!(mode.wire_name(), name);
         }
     }
 }
