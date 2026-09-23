@@ -195,11 +195,8 @@ pub fn git_signing_helper_requested(arguments: &[OsString]) -> bool {
 }
 
 pub fn run() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
+    let (runtime, service, stdin_writer) = match start() {
+        Ok(started) => started,
         Err(error) => {
             let _ = write_response(&StartupResponse::Error {
                 message: error.to_string(),
@@ -207,33 +204,6 @@ pub fn run() -> ExitCode {
             close_standard_output();
             return ExitCode::FAILURE;
         }
-    };
-    let prepared = {
-        let _runtime = runtime.enter();
-        prepare()
-    };
-    let mut service = match prepared {
-        Ok(service) => service,
-        Err(error) => {
-            let _ = write_response(&StartupResponse::Error {
-                message: error.to_string(),
-            });
-            close_standard_output();
-            return ExitCode::FAILURE;
-        }
-    };
-    let stdin_writer = match service.stdin.take() {
-        Some(value) => match prepare_stdin_writer(value) {
-            Ok(writer) => Some(writer),
-            Err(error) => {
-                let _ = write_response(&StartupResponse::Error {
-                    message: error.to_string(),
-                });
-                close_standard_output();
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
     };
     if write_response(&StartupResponse::Ready {
         runtime_directory: service.runtime_directory.clone(),
@@ -253,6 +223,24 @@ pub fn run() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
+}
+
+type StartedService = (
+    tokio::runtime::Runtime,
+    PreparedService,
+    Option<mpsc::SyncSender<()>>,
+);
+
+fn start() -> io::Result<StartedService> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut service = {
+        let _runtime = runtime.enter();
+        prepare()?
+    };
+    let stdin_writer = service.stdin.take().map(prepare_stdin_writer).transpose()?;
+    Ok((runtime, service, stdin_writer))
 }
 
 fn prepare_stdin_writer(value: String) -> io::Result<mpsc::SyncSender<()>> {
@@ -615,6 +603,10 @@ async fn serve(service: PreparedService) -> io::Result<()> {
         stdin: _,
         context,
     } = service;
+    // Listeners exist only for an SSH secret; otherwise the service only delivers stdin.
+    let Some(ssh) = &context.ssh else {
+        return wait_for_process(&owner).await;
+    };
     let mut connections = FuturesUnordered::<LocalBoxFuture<'_, ()>>::new();
 
     loop {
@@ -644,18 +636,10 @@ async fn serve(service: PreparedService) -> io::Result<()> {
         let owner = &owner;
         let handler = match connection {
             Connection::Helper(connection) => async move {
-                let ssh = context
-                    .ssh
-                    .as_ref()
-                    .expect("a Git helper listener requires an SSH secret");
                 let _ = handle_connection(connection, context, ssh, owner).await;
             }
             .boxed_local(),
             Connection::Agent(connection) => async move {
-                let ssh = context
-                    .ssh
-                    .as_ref()
-                    .expect("an SSH agent listener requires an SSH secret");
                 let _ = handle_agent_connection(connection, context, ssh, owner).await;
             }
             .boxed_local(),
@@ -739,22 +723,16 @@ async fn handle_connection(
             message,
             repository,
         } => {
-            let result = validate_signing_key(&public_key, &ssh.public_key).and_then(|()| {
-                BASE64_STANDARD
+            let signature = async {
+                validate_signing_key(&public_key, &ssh.public_key)?;
+                let data = BASE64_STANDARD
                     .decode(message)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-            });
-            let result = match result {
-                Ok(data) => {
-                    let repository = repository.map(GitSignRepository::from);
-                    request_git_signature(context, ssh, owner, &data, repository.as_ref())
-                        .await
-                        .map(|signature| HelperResponse::Signature { signature })
-                }
-                Err(error) => Err(error),
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let repository = repository.map(GitSignRepository::from);
+                request_git_signature(context, ssh, owner, &data, repository.as_ref()).await
             };
-            match result {
-                Ok(response) => response,
+            match signature.await {
+                Ok(signature) => HelperResponse::Signature { signature },
                 Err(error) => HelperResponse::Error {
                     message: error.to_string(),
                 },
