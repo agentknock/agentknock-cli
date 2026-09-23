@@ -134,14 +134,35 @@ pub enum SecretUseOperation<'a> {
 }
 
 /// The form of a selected executable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutableMode {
     /// A native executable binary.
     Binary,
 
     /// A script that selects an interpreter with a shebang line.
     Script,
+}
+
+impl ExecutableMode {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Binary => "BINARY",
+            Self::Script => "SCRIPT",
+        }
+    }
+}
+
+impl StreamKind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Terminal => "TERMINAL",
+            Self::NullDevice => "NULL_DEVICE",
+            Self::Pipe => "PIPE",
+            Self::Socket => "SOCKET",
+            Self::RegularFile => "REGULAR_FILE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
 }
 
 /// Secret material and related authorization returned for an invocation.
@@ -342,11 +363,11 @@ impl Client {
                 working_directory,
                 executable_path,
                 executable_hash: executable_hash.map(|hash| BASE64_STANDARD.encode(hash)),
-                executable_mode,
+                executable_mode: executable_mode.wire_name(),
                 script_contents,
-                stdin: stdin.into(),
-                stdout: stdout.into(),
-                stderr: stderr.into(),
+                stdin: stdin.wire_name(),
+                stdout: stdout.wire_name(),
+                stderr: stderr.wire_name(),
             },
         };
         let secrets = secret_options_message(request.secrets);
@@ -613,37 +634,13 @@ enum InvocationOperationMessage<'a> {
         executable_path: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         executable_hash: Option<String>,
-        executable_mode: ExecutableMode,
+        executable_mode: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         script_contents: Option<&'a str>,
-        stdin: StreamKindMessage,
-        stdout: StreamKindMessage,
-        stderr: StreamKindMessage,
+        stdin: &'static str,
+        stdout: &'static str,
+        stderr: &'static str,
     },
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum StreamKindMessage {
-    Terminal,
-    NullDevice,
-    Pipe,
-    Socket,
-    RegularFile,
-    Unknown,
-}
-
-impl From<StreamKind> for StreamKindMessage {
-    fn from(kind: StreamKind) -> Self {
-        match kind {
-            StreamKind::Terminal => Self::Terminal,
-            StreamKind::NullDevice => Self::NullDevice,
-            StreamKind::Pipe => Self::Pipe,
-            StreamKind::Socket => Self::Socket,
-            StreamKind::RegularFile => Self::RegularFile,
-            StreamKind::Unknown => Self::Unknown,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -670,6 +667,22 @@ struct EnvironmentVariableMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_executable_modes_and_stream_kinds_on_the_wire() {
+        assert_eq!(ExecutableMode::Binary.wire_name(), "BINARY");
+        assert_eq!(ExecutableMode::Script.wire_name(), "SCRIPT");
+        for (kind, name) in [
+            (StreamKind::Terminal, "TERMINAL"),
+            (StreamKind::NullDevice, "NULL_DEVICE"),
+            (StreamKind::Pipe, "PIPE"),
+            (StreamKind::Socket, "SOCKET"),
+            (StreamKind::RegularFile, "REGULAR_FILE"),
+            (StreamKind::Unknown, "UNKNOWN"),
+        ] {
+            assert_eq!(kind.wire_name(), name);
+        }
+    }
 
     #[test]
     fn coalesces_equal_environment_values_from_different_secrets() {

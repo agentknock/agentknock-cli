@@ -218,35 +218,26 @@ impl<'a> From<&'a GitSignHead> for GitSignHeadPayload<'a> {
 
 #[derive(Serialize)]
 struct GitSignChangedPathPayload<'a> {
-    status: GitSignChangeStatusPayload,
+    status: &'static str,
     path: &'a str,
 }
 
 impl<'a> From<&'a GitSignChangedPath> for GitSignChangedPathPayload<'a> {
     fn from(path: &'a GitSignChangedPath) -> Self {
         Self {
-            status: path.status.into(),
+            status: path.status.wire_name(),
             path: &path.path,
         }
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum GitSignChangeStatusPayload {
-    Added,
-    Deleted,
-    Modified,
-    TypeChanged,
-}
-
-impl From<GitSignChangeStatus> for GitSignChangeStatusPayload {
-    fn from(status: GitSignChangeStatus) -> Self {
-        match status {
-            GitSignChangeStatus::Added => Self::Added,
-            GitSignChangeStatus::Deleted => Self::Deleted,
-            GitSignChangeStatus::Modified => Self::Modified,
-            GitSignChangeStatus::TypeChanged => Self::TypeChanged,
+impl GitSignChangeStatus {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Added => "ADDED",
+            Self::Deleted => "DELETED",
+            Self::Modified => "MODIFIED",
+            Self::TypeChanged => "TYPE_CHANGED",
         }
     }
 }
@@ -254,4 +245,21 @@ impl From<GitSignChangeStatus> for GitSignChangeStatusPayload {
 #[derive(Deserialize)]
 struct ApprovedSignature {
     signature: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_change_statuses_on_the_wire() {
+        for (status, name) in [
+            (GitSignChangeStatus::Added, "ADDED"),
+            (GitSignChangeStatus::Deleted, "DELETED"),
+            (GitSignChangeStatus::Modified, "MODIFIED"),
+            (GitSignChangeStatus::TypeChanged, "TYPE_CHANGED"),
+        ] {
+            assert_eq!(status.wire_name(), name);
+        }
+    }
 }
