@@ -432,21 +432,6 @@ pub(crate) fn abort_pending_pairing(
 }
 
 pub(crate) fn remove_pairing(pairing_path: &Path) -> Result<(), ConfigurationError> {
-    match pairing_path.try_exists() {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(ConfigurationError::NoPairing {
-                path: pairing_path.to_owned(),
-            });
-        }
-        Err(source) => {
-            return Err(ConfigurationError::Access {
-                path: pairing_path.to_owned(),
-                source,
-            });
-        }
-    }
-
     let directory = DirectoryLock::new(pairing_path)?;
     match fs::remove_file(pairing_path) {
         Ok(()) => directory.sync(),
@@ -543,7 +528,15 @@ fn write_pairing_file(path: &Path, pairing: &impl Serialize) -> Result<(), Confi
 impl DirectoryLock {
     fn new(pairing_path: &Path) -> Result<Self, ConfigurationError> {
         let path = pairing_path.parent().expect("pairing path has a parent");
-        let file = File::open(path).map_err(access_error(path))?;
+        let file = File::open(path).map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                ConfigurationError::NoPairing {
+                    path: pairing_path.to_owned(),
+                }
+            } else {
+                access_error(path)(source)
+            }
+        })?;
         file.lock().map_err(access_error(path))?;
         Ok(Self {
             file,
@@ -736,6 +729,21 @@ mod tests {
         value["rotation_key"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
 
         assert!(serde_json::from_value::<Pairing>(value).is_err());
+    }
+
+    #[test]
+    fn missing_home_has_no_pairing() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("missing").join("pairing.json");
+
+        assert!(matches!(
+            abort_pending_pairing(&path, None),
+            Err(ConfigurationError::NoPairing { .. })
+        ));
+        assert!(matches!(
+            remove_pairing(&path),
+            Err(ConfigurationError::NoPairing { .. })
+        ));
     }
 
     fn pairing_value() -> Value {
