@@ -5,7 +5,7 @@ mod support;
 use std::{
     fs,
     os::unix::{ffi::OsStringExt as _, fs::PermissionsExt as _},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::mpsc,
     time::Duration,
 };
@@ -27,8 +27,8 @@ use ulid::Ulid;
 
 use support::{
     Aead, DEVICE_ID, Kem, PROTOCOL_VERSION_INFO, ReceiverContext, TestHome, accept,
-    assert_authenticated_request, encrypt_response, open_completion, open_request, receive_json,
-    send_json, websocket_server,
+    assert_authenticated_request, encrypt_response, interrupt, open_completion, open_request,
+    receive_json, send_json, websocket_server,
 };
 
 const ADDRESS_ID: &str = "9e6f33bf47382846903dffa0962ea313";
@@ -740,12 +740,4 @@ fn open_authenticated_request(
         .unwrap();
     let plaintext = context.open(&ciphertext, b"").unwrap();
     (context, key, serde_json::from_slice(&plaintext).unwrap())
-}
-
-fn interrupt(child: &std::process::Child) {
-    let status = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success());
 }

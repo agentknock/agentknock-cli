@@ -5,10 +5,12 @@ use std::{
     fs,
     fs::OpenOptions,
     future::Future,
+    io::Read as _,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{
@@ -152,6 +154,62 @@ pub fn isolated_command(program: impl AsRef<OsStr>) -> Command {
         command.env_remove(variable);
     }
     command
+}
+
+pub struct ChildGuard(pub Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+pub fn run(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub fn interrupt(child: &Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+pub fn wait_for_path(path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        if child.try_wait().unwrap().is_some() {
+            panic!(
+                "process exited before creating {}: {}",
+                path.display(),
+                child_stderr(child)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process didn't create {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Stops the child and returns what it wrote to a piped stderr.
+pub fn child_stderr(child: &mut Child) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut input) = child.stderr.take() {
+        let _ = input.read_to_string(&mut stderr);
+    }
+    stderr
 }
 
 pub async fn websocket_server<F, Fut, T>(handler: F) -> (String, JoinHandle<T>)

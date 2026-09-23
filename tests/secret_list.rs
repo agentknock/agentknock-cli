@@ -2,18 +2,14 @@
 
 mod support;
 
-use std::{
-    process::{Command, Stdio},
-    sync::mpsc,
-    time::Duration,
-};
+use std::{process::Stdio, sync::mpsc, time::Duration};
 
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 
 use support::{
     TestHome, accept, assert_authenticated_request, encrypt_response, http_connect_proxy,
-    open_completion, open_request, receive_json, send_json, websocket_server,
+    interrupt, open_completion, open_request, receive_json, send_json, websocket_server,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -254,12 +250,4 @@ async fn signal_cancels_a_waiting_secret_list_request() {
             .contains("canceled the secret list request")
     );
     server.await.unwrap();
-}
-
-fn interrupt(child: &std::process::Child) {
-    let status = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success());
 }
