@@ -686,7 +686,7 @@ async fn handle_agent_connection(
                         if !context.options.quiet {
                             print_message(format!("SSH authentication failed: {error}"));
                         }
-                        crate::ssh_agent::failure_response().to_vec()
+                        crate::ssh_agent::failure_response()
                     }
                 }
             }

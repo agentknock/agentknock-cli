@@ -67,9 +67,9 @@ enum Upstream {
     Unavailable,
 }
 
-struct ListedIdentity {
-    key_blob: Vec<u8>,
-    comment: Vec<u8>,
+struct ListedIdentity<'a> {
+    key_blob: &'a [u8],
+    comment: &'a [u8],
 }
 
 impl SelectedIdentity {
@@ -142,11 +142,11 @@ impl SelectedIdentity {
 
     fn identities_response(&self, upstream: Option<&[u8]>) -> Vec<u8> {
         let mut identities = Vec::new();
-        let mut seen = BTreeSet::from([self.key_blob.clone()]);
+        let mut seen = BTreeSet::from([self.key_blob.as_slice()]);
         if self.key_kind.is_some() {
             identities.push(ListedIdentity {
-                key_blob: self.key_blob.clone(),
-                comment: self.comment.as_bytes().to_vec(),
+                key_blob: &self.key_blob,
+                comment: self.comment.as_bytes(),
             });
         }
         if let Some(upstream) = upstream
@@ -155,7 +155,7 @@ impl SelectedIdentity {
             identities.extend(
                 upstream
                     .into_iter()
-                    .filter(|identity| seen.insert(identity.key_blob.clone())),
+                    .filter(|identity| seen.insert(identity.key_blob)),
             );
         }
         encode_identities_response(&identities)
@@ -207,11 +207,9 @@ impl<'a> AgentConnection<'a> {
             Route::Authenticate { algorithm, message } => {
                 Action::Authenticate { algorithm, message }
             }
-            Route::Forward => Action::Respond(
-                self.forward(packet)
-                    .await
-                    .unwrap_or_else(|| failure_response().to_vec()),
-            ),
+            Route::Forward => {
+                Action::Respond(self.forward(packet).await.unwrap_or_else(failure_response))
+            }
             Route::ExtensionQuery => {
                 let response = self.forward(packet).await;
                 Action::Respond(
@@ -220,7 +218,7 @@ impl<'a> AgentConnection<'a> {
                         .unwrap_or_else(extension_query_response),
                 )
             }
-            Route::Refuse => Action::Respond(failure_response().to_vec()),
+            Route::Refuse => Action::Respond(failure_response()),
         }
     }
 
@@ -278,8 +276,8 @@ pub async fn write_packet(
     connection.flush().await
 }
 
-pub fn failure_response() -> &'static [u8] {
-    &[SSH_AGENT_FAILURE]
+pub fn failure_response() -> Vec<u8> {
+    vec![SSH_AGENT_FAILURE]
 }
 
 fn extension_query_response() -> Vec<u8> {
@@ -314,7 +312,7 @@ fn valid_extension_query_response(packet: &[u8]) -> bool {
     true
 }
 
-fn parse_identities_response(packet: &[u8]) -> io::Result<Vec<ListedIdentity>> {
+fn parse_identities_response(packet: &[u8]) -> io::Result<Vec<ListedIdentity<'_>>> {
     let mut response = Cursor::new(packet);
     if response.byte()? != SSH_AGENT_IDENTITIES_ANSWER {
         return Err(invalid_data("SSH agent returned an unexpected response"));
@@ -323,23 +321,23 @@ fn parse_identities_response(packet: &[u8]) -> io::Result<Vec<ListedIdentity>> {
     let mut identities = Vec::new();
     for _ in 0..count {
         identities.push(ListedIdentity {
-            key_blob: response.string()?.to_vec(),
-            comment: response.string()?.to_vec(),
+            key_blob: response.string()?,
+            comment: response.string()?,
         });
     }
     response.end()?;
     Ok(identities)
 }
 
-fn encode_identities_response(identities: &[ListedIdentity]) -> Vec<u8> {
+fn encode_identities_response(identities: &[ListedIdentity<'_>]) -> Vec<u8> {
     let mut response = vec![SSH_AGENT_IDENTITIES_ANSWER];
     put_u32(
         &mut response,
         u32::try_from(identities.len()).expect("identity count fits in an SSH packet"),
     );
     for identity in identities {
-        put_string(&mut response, &identity.key_blob);
-        put_string(&mut response, &identity.comment);
+        put_string(&mut response, identity.key_blob);
+        put_string(&mut response, identity.comment);
     }
     response
 }
@@ -583,21 +581,21 @@ mod tests {
         let other_key = ssh_string_sequence(&[b"ssh-ed25519", &[2; 32]]);
         let upstream = encode_identities_response(&[
             ListedIdentity {
-                key_blob: other_key.clone(),
-                comment: b"other".to_vec(),
+                key_blob: &other_key,
+                comment: b"other",
             },
             ListedIdentity {
-                key_blob: identity.key_blob.clone(),
-                comment: b"upstream duplicate".to_vec(),
+                key_blob: &identity.key_blob,
+                comment: b"upstream duplicate",
             },
             ListedIdentity {
-                key_blob: other_key.clone(),
-                comment: b"second upstream duplicate".to_vec(),
+                key_blob: &other_key,
+                comment: b"second upstream duplicate",
             },
         ]);
 
-        let merged = parse_identities_response(&identity.identities_response(Some(&upstream)))
-            .expect("parse merged identities");
+        let merged = identity.identities_response(Some(&upstream));
+        let merged = parse_identities_response(&merged).expect("parse merged identities");
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].key_blob, identity.key_blob);
         assert_eq!(merged[0].comment, b"selected");
@@ -616,17 +614,17 @@ mod tests {
         let other_key = ssh_string_sequence(&[b"ssh-ed25519", &[2; 32]]);
         let upstream = encode_identities_response(&[
             ListedIdentity {
-                key_blob: selected_key.clone(),
-                comment: b"duplicate".to_vec(),
+                key_blob: &selected_key,
+                comment: b"duplicate",
             },
             ListedIdentity {
-                key_blob: other_key.clone(),
-                comment: b"other".to_vec(),
+                key_blob: &other_key,
+                comment: b"other",
             },
         ]);
 
-        let merged = parse_identities_response(&identity.identities_response(Some(&upstream)))
-            .expect("parse merged identities");
+        let merged = identity.identities_response(Some(&upstream));
+        let merged = parse_identities_response(&merged).expect("parse merged identities");
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].key_blob, other_key);
         assert!(matches!(
@@ -657,7 +655,7 @@ mod tests {
         assert!(valid_extension_query_response(&response));
         response.push(0);
         assert!(!valid_extension_query_response(&response));
-        assert!(!valid_extension_query_response(failure_response()));
+        assert!(!valid_extension_query_response(&failure_response()));
     }
 
     #[tokio::test]
