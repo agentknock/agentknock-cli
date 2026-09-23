@@ -13,7 +13,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{self, IsTerminal as _, Read as _},
+    io::{self, IsTerminal as _},
     mem,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -1182,14 +1182,10 @@ fn read_secret(
         .environment
         .from_file
         .iter()
-        .filter(|source| source.path == Path::new("-"))
-        .count()
-        + command
-            .environment
-            .from_env_file
-            .iter()
-            .filter(|path| path.as_path() == Path::new("-"))
-            .count();
+        .map(|source| &source.path)
+        .chain(&command.environment.from_env_file)
+        .filter(|path| *path == Path::new("-"))
+        .count();
     if stdin_sources > 1 {
         return Err(SecretInputError::MultipleStdinSources);
     }
@@ -1307,34 +1303,23 @@ fn uses_legacy_pem_private_key_format(encoded: &str) -> bool {
 }
 
 fn read_environment_variable(name: &str) -> Result<String, SecretInputError> {
-    match env::var(name) {
-        Ok(value) => Ok(value),
-        Err(env::VarError::NotPresent) => Err(SecretInputError::MissingEnvironmentVariable {
-            name: name.to_owned(),
-        }),
-        Err(env::VarError::NotUnicode(_)) => Err(SecretInputError::NonUtf8EnvironmentVariable {
-            name: name.to_owned(),
-        }),
-    }
+    let name = name.to_owned();
+    env::var(&name).map_err(|error| match error {
+        env::VarError::NotPresent => SecretInputError::MissingEnvironmentVariable { name },
+        env::VarError::NotUnicode(_) => SecretInputError::NonUtf8EnvironmentVariable { name },
+    })
 }
 
 fn read_secret_source(path: &Path) -> Result<String, SecretInputError> {
-    let source_name = secret_source_name(path);
-    if path == Path::new("-") {
-        let mut contents = String::new();
-        io::stdin()
-            .read_to_string(&mut contents)
-            .map_err(|source| SecretInputError::Read {
-                source_name,
-                source,
-            })?;
-        Ok(contents)
+    let contents = if path == Path::new("-") {
+        io::read_to_string(io::stdin())
     } else {
-        fs::read_to_string(path).map_err(|source| SecretInputError::Read {
-            source_name,
-            source,
-        })
-    }
+        fs::read_to_string(path)
+    };
+    contents.map_err(|source| SecretInputError::Read {
+        source_name: secret_source_name(path),
+        source,
+    })
 }
 
 fn secret_source_name(path: &Path) -> String {
