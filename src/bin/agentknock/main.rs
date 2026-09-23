@@ -14,6 +14,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, IsTerminal as _, Read as _},
+    mem,
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
@@ -1232,7 +1233,7 @@ fn read_secret(
     }
     for path in command.environment.from_env_file {
         let source_name = secret_source_name(&path);
-        let contents = read_secret_source(&path)?;
+        let contents = Zeroizing::new(read_secret_source(&path)?);
         for entry in dotenvy::from_read_iter(contents.as_bytes()) {
             let (name, value) = entry.map_err(|source| SecretInputError::EnvironmentFile {
                 source_name: source_name.clone(),
@@ -1317,7 +1318,7 @@ fn read_ssh_private_key(
         })?;
     private_key
         .to_openssh(LineEnding::LF)
-        .map(|encoded| encoded.to_string())
+        .map(|mut encoded| mem::take(&mut *encoded))
         .map_err(|source| SecretInputError::SshPrivateKey {
             operation: "encode",
             source_name,
@@ -1329,6 +1330,8 @@ fn uses_legacy_pem_private_key_format(encoded: &str) -> bool {
     encoded.starts_with("-----BEGIN RSA PRIVATE KEY-----")
         || encoded.starts_with("-----BEGIN DSA PRIVATE KEY-----")
         || encoded.starts_with("-----BEGIN EC PRIVATE KEY-----")
+        || encoded.starts_with("-----BEGIN PRIVATE KEY-----")
+        || encoded.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----")
 }
 
 fn read_environment_variable(name: &str) -> Result<String, SecretInputError> {
@@ -1864,7 +1867,7 @@ fn print_run_configuration_error(error: &ConfigurationError) {
             ));
             print_message("The command didn't run.");
             print_message("Suggested action: Run:");
-            print_message(format_args!("chmod 600 {path:?}"));
+            print_message(format_args!("chmod 600 {}", shell_word(path)));
         }
         ConfigurationError::HomeNotSet | ConfigurationError::InvalidHome { .. } => {
             print_message(format_args!(
@@ -2115,7 +2118,7 @@ fn print_plain_configuration_action(error: &ConfigurationError) {
     match error {
         ConfigurationError::InsecurePermissions { path, .. } => {
             print_plain_error("Suggested action: Run:");
-            print_plain_error(format_args!("chmod 600 {path:?}"));
+            print_plain_error(format_args!("chmod 600 {}", shell_word(path)));
         }
         ConfigurationError::HomeNotSet | ConfigurationError::InvalidHome { .. } => {
             print_plain_error(
@@ -2127,6 +2130,17 @@ fn print_plain_configuration_action(error: &ConfigurationError) {
         }
         _ => {}
     }
+}
+
+// Quotes a path for a suggested command. A path that isn't UTF-8 or contains control
+// characters can't be shown faithfully on one terminal line.
+fn shell_word(path: &Path) -> String {
+    path.to_str()
+        .filter(|path| !path.chars().any(char::is_control))
+        .map_or_else(
+            || "<PATH>".into(),
+            |path| format!("'{}'", path.replace('\'', r"'\''")),
+        )
 }
 
 fn print_plain_error(message: impl std::fmt::Display) {
@@ -3077,6 +3091,23 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn quotes_paths_for_suggested_commands() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+
+        assert_eq!(
+            super::shell_word(Path::new("/home/a user/it's $HOME")),
+            r"'/home/a user/it'\''s $HOME'"
+        );
+        assert_eq!(
+            super::shell_word(Path::new(OsStr::from_bytes(b"/home/\xff"))),
+            "<PATH>"
+        );
+        for path in ["/home/a\nuser", "/home/\x1b[31muser"] {
+            assert_eq!(super::shell_word(Path::new(path)), "<PATH>");
+        }
     }
 
     #[cfg(unix)]
