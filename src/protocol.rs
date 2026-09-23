@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::{ApplicationInfo, Client, crypto, crypto::Session};
+use crate::{ApplicationInfo, Client, DenialReason, crypto, crypto::Session};
 
 pub(crate) const LIBRARY_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -73,14 +73,16 @@ pub(crate) fn seal_error_completion(
     session: &mut Session,
     error: &DeviceError,
 ) -> Option<crypto::Completion> {
-    let message = error.to_string();
-    let plaintext = client
-        .encode(&ErrorCompletion {
-            result: "ABORTED",
-            reason: "CLIENT_ERROR",
-            message: &message,
-        })
-        .ok()?;
+    seal_aborted(client, session, AbortReason::ClientError, error.to_string())
+}
+
+pub(crate) fn seal_aborted(
+    client: &Client,
+    session: &mut Session,
+    reason: AbortReason,
+    message: String,
+) -> Option<crypto::Completion> {
+    let plaintext = client.encode(&Outcome::Aborted { reason, message }).ok()?;
     session.seal_completion(&plaintext).ok()
 }
 
@@ -112,10 +114,27 @@ struct ErrorResponse {
 }
 
 #[derive(Serialize)]
-struct ErrorCompletion<'a> {
-    result: &'static str,
-    reason: &'static str,
-    message: &'a str,
+#[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum Outcome {
+    Approved,
+    Denied {
+        reason: DenialReason,
+        message: String,
+    },
+    Aborted {
+        reason: AbortReason,
+        message: String,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum AbortReason {
+    Cancelled,
+    TimedOut,
+    InvalidResponse,
+    ClientError,
+    Other,
 }
 
 #[derive(Serialize)]
@@ -137,8 +156,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::json;
 
-    use super::{Response, decode_response, encode};
-    use crate::ApplicationInfo;
+    use super::{AbortReason, Outcome, Response, decode_response, encode};
+    use crate::{ApplicationInfo, DenialReason};
 
     #[derive(Serialize)]
     struct Contents {
@@ -172,6 +191,29 @@ mod tests {
                 "method": "Example",
             })
         );
+    }
+
+    #[test]
+    fn completion_contains_only_the_outcome() {
+        for (outcome, expected) in [
+            (Outcome::Approved, json!({"result": "APPROVED"})),
+            (
+                Outcome::Denied {
+                    reason: DenialReason::PolicyDenied,
+                    message: "Not permitted.".into(),
+                },
+                json!({"result": "DENIED", "reason": "POLICY_DENIED", "message": "Not permitted."}),
+            ),
+            (
+                Outcome::Aborted {
+                    reason: AbortReason::ClientError,
+                    message: "Invalid request.".into(),
+                },
+                json!({"result": "ABORTED", "reason": "CLIENT_ERROR", "message": "Invalid request."}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
+        }
     }
 
     #[test]

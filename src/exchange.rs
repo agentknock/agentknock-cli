@@ -6,8 +6,8 @@ use ulid::Ulid;
 use crate::{
     Client, DenialReason, RequestError, RequestProgress,
     config::{clear_rotation_key, read_pairing_from},
-    crypto::{self, Session},
-    protocol::{self, Response},
+    crypto::Session,
+    protocol::{self, AbortReason, Outcome, Response, seal_aborted},
     websocket::{self, RelayExchange},
 };
 
@@ -143,16 +143,6 @@ fn abort_reason(error: &websocket::Error) -> AbortReason {
     }
 }
 
-fn seal_aborted(
-    client: &Client,
-    session: &mut Session,
-    reason: AbortReason,
-    message: String,
-) -> Option<crypto::Completion> {
-    let plaintext = client.encode(&Outcome::Aborted { reason, message }).ok()?;
-    session.seal_completion(&plaintext).ok()
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
 enum Decision<T> {
@@ -170,30 +160,6 @@ enum Decision<T> {
         #[serde(rename = "message")]
         _message: String,
     },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
-enum Outcome {
-    Approved,
-    Denied {
-        reason: DenialReason,
-        message: String,
-    },
-    Aborted {
-        reason: AbortReason,
-        message: String,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum AbortReason {
-    Cancelled,
-    TimedOut,
-    InvalidResponse,
-    ClientError,
-    Other,
 }
 
 #[cfg(test)]
@@ -242,29 +208,6 @@ mod tests {
                     ..
                 }
             ));
-        }
-    }
-
-    #[test]
-    fn completion_contains_only_the_outcome() {
-        for (outcome, expected) in [
-            (Outcome::Approved, json!({"result": "APPROVED"})),
-            (
-                Outcome::Denied {
-                    reason: DenialReason::PolicyDenied,
-                    message: "Not permitted.".into(),
-                },
-                json!({"result": "DENIED", "reason": "POLICY_DENIED", "message": "Not permitted."}),
-            ),
-            (
-                Outcome::Aborted {
-                    reason: AbortReason::InvalidResponse,
-                    message: "Invalid response.".into(),
-                },
-                json!({"result": "ABORTED", "reason": "INVALID_RESPONSE", "message": "Invalid response."}),
-            ),
-        ] {
-            assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
         }
     }
 }
