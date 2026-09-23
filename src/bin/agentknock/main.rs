@@ -14,6 +14,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, IsTerminal as _, Read as _},
+    mem,
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
@@ -1232,7 +1233,7 @@ fn read_secret(
     }
     for path in command.environment.from_env_file {
         let source_name = secret_source_name(&path);
-        let contents = read_secret_source(&path)?;
+        let contents = Zeroizing::new(read_secret_source(&path)?);
         for entry in dotenvy::from_read_iter(contents.as_bytes()) {
             let (name, value) = entry.map_err(|source| SecretInputError::EnvironmentFile {
                 source_name: source_name.clone(),
@@ -1317,7 +1318,7 @@ fn read_ssh_private_key(
         })?;
     private_key
         .to_openssh(LineEnding::LF)
-        .map(|encoded| encoded.to_string())
+        .map(|mut encoded| mem::take(&mut *encoded))
         .map_err(|source| SecretInputError::SshPrivateKey {
             operation: "encode",
             source_name,

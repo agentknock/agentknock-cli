@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, future::Future, io};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     Client, RequestError, RequestProgress,
@@ -54,6 +55,8 @@ pub enum Secret {
 pub type Secrets = BTreeMap<String, Secret>;
 
 /// A secret to upload to the device.
+///
+/// Secret values are zeroized when the upload is dropped.
 #[derive(Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SecretUpload {
@@ -79,6 +82,16 @@ pub enum SecretUpload {
         /// key is not sent to the device.
         private_key: String,
     },
+}
+
+// Uploaded values can exist only in this process, for example after decrypting a key.
+impl Drop for SecretUpload {
+    fn drop(&mut self) {
+        match self {
+            Self::Environment { variables, .. } => variables.values_mut().for_each(String::zeroize),
+            Self::Ssh { private_key, .. } => private_key.zeroize(),
+        }
+    }
 }
 
 impl SecretUpload {
@@ -271,7 +284,7 @@ impl Client {
             mode: mode.into(),
             secret: UploadSecretMessage::from(secret),
         };
-        let plaintext = self.encode(&request_payload).map_err(RequestError::other)?;
+        let plaintext = Zeroizing::new(self.encode(&request_payload).map_err(RequestError::other)?);
         let mut session = Session::new(&pairing, &request_id).map_err(RequestError::other)?;
         let request = session
             .seal_request(&plaintext)
