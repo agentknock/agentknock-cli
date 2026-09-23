@@ -8,11 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::{
-    Client, RequestError, RequestProgress,
-    protocol::Method,
-    secrets::{EnvironmentVariableMessage, SecretContentsMessage, SecretMessage},
-};
+use crate::{Client, RequestError, RequestProgress, protocol::Method};
 
 const INVOCATION_TOKEN_LENGTH: usize = 32;
 
@@ -379,7 +375,7 @@ impl Client {
 }
 
 fn secret_use_output_from_secrets(
-    secrets: BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>,
+    secrets: BTreeMap<String, ApprovedSecret>,
     requested_secrets: &BTreeMap<String, SecretUseOptions>,
     invocation: SecretUseInvocation,
 ) -> io::Result<SecretUseOutput> {
@@ -397,8 +393,8 @@ fn secret_use_output_from_secrets(
         let options = requested_secrets
             .get(&name)
             .expect("the received secret set was checked");
-        match secret.contents {
-            SecretContentsMessage::Environment { variables } => {
+        match secret {
+            ApprovedSecret::Environment { variables } => {
                 let environment_options = &options.environment;
                 validate_returned_variables(&name, &variables, environment_options)?;
                 for (source_name, variable) in variables {
@@ -421,7 +417,7 @@ fn secret_use_output_from_secrets(
                     environment.insert(final_name, variable.value);
                 }
             }
-            SecretContentsMessage::Ssh { public_key } => {
+            ApprovedSecret::Ssh { public_key } => {
                 if !options.environment.is_empty() {
                     return Err(io::Error::other(format!(
                         "approved SSH secret {name:?} has environment-variable options"
@@ -668,7 +664,23 @@ impl From<StreamKind> for StreamKindMessage {
 
 #[derive(Deserialize)]
 struct ApprovedInvocation {
-    secrets: Option<BTreeMap<String, SecretMessage<BTreeMap<String, EnvironmentVariableMessage>>>>,
+    secrets: Option<BTreeMap<String, ApprovedSecret>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApprovedSecret {
+    Environment {
+        variables: BTreeMap<String, EnvironmentVariableMessage>,
+    },
+    Ssh {
+        public_key: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct EnvironmentVariableMessage {
+    value: String,
 }
 
 #[cfg(test)]
@@ -949,33 +961,25 @@ mod tests {
         );
     }
 
-    fn environment_secret<const N: usize>(
-        variables: [(&str, &str); N],
-    ) -> SecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
-        SecretMessage {
-            description: None,
-            contents: SecretContentsMessage::Environment {
-                variables: variables
-                    .into_iter()
-                    .map(|(name, value)| {
-                        (
-                            name.into(),
-                            EnvironmentVariableMessage {
-                                value: value.into(),
-                            },
-                        )
-                    })
-                    .collect(),
-            },
+    fn environment_secret<const N: usize>(variables: [(&str, &str); N]) -> ApprovedSecret {
+        ApprovedSecret::Environment {
+            variables: variables
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name.into(),
+                        EnvironmentVariableMessage {
+                            value: value.into(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
-    fn ssh_secret(public_key: &str) -> SecretMessage<BTreeMap<String, EnvironmentVariableMessage>> {
-        SecretMessage {
-            description: None,
-            contents: SecretContentsMessage::Ssh {
-                public_key: public_key.into(),
-            },
+    fn ssh_secret(public_key: &str) -> ApprovedSecret {
+        ApprovedSecret::Ssh {
+            public_key: public_key.into(),
         }
     }
 
