@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/agentknock/agentknock-cli/compare/v0.6.1...v0.6.2) - 2026-09-23
+
+### Fixed
+
+- name protocol enums without serde mirrors
+- list SSH agent identities without copying them
+- validate the Git signing key through the key comparison
+- detect standard stream kinds with std metadata
+- read script contents without a byte-by-byte prefix tracker
+- simplify executable selection
+- simplify invocation service startup and dispatch
+- carry invocation service options as one value
+- simplify reading secret upload sources
+- dispatch CLI operations from the parsed commands
+- print prefixed and plain diagnostics through one printer
+- serialize the pending pairing directly
+- report a missing Agentknock home as no pairing
+- lock and sync the pairing directory through one type
+- share pairing file error mapping
+- share relay reconnection between request and completion
+- give relay reads one disconnect path
+- simplify proxy setting lookup
+- share the cancellable completion handoff
+- share sealing and device-error handling across requests
+- build key derivation inputs with concat
+- shorten secret option validation
+- define approved secret messages where they are read
+- remove unused address identifier serialization
+- convert crypto and device errors with ?
+- build every aborted completion the same way
+- share protocol envelope messages
+- move request errors into their own module
+- keep scp-style remotes with @ in the path
+- print a shell-safe chmod suggestion
+- suggest converting PKCS#8 SSH private keys
+- keep uploaded secret values zeroized
+- hand off the abort completion briefly after the request fails
+- stop sending a second pong for each relay ping
+
+### Other
+
+- pin the wire names of public protocol enums
+- package npm launcher test with package-npm
+- isolate integration tests from the caller's Git repository
+- cover installer argument, platform, and release validation
+- fail the procfs check when a test filter matches nothing
+- wait on Tokio channels in async relay tests
+- wrap invocation service lines that rustfmt skips
+- share SSH agent framing helpers
+- use the fake device helpers in the pairing tests
+- use the fake device helpers in the invocation service tests
+- use the fake device helpers in the run command tests
+- use the fake device helpers in the secret upload tests
+- add fake device helpers for relay exchanges
+- share process helpers between integration tests
+- isolate invocation service tests from proxy settings
+- run the run command tests through the hermetic command helper
+- run secret upload tests through the hermetic command helper
+- run pairing tests through the hermetic command helper
+- add a hermetic agentknock command helper
+
 ## [0.6.1](https://github.com/agentknock/agentknock-cli/compare/v0.6.0...v0.6.1) - 2026-09-14
 
 ### Fixed
